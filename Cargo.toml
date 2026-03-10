@@ -12,6 +12,9 @@ name = "inferaived"
 path = "src/lib.rs"
 
 [dependencies]
+bytemuck = "1.25.0"
 half = "2.7.1"
 safetensors = "0.7.0"
 tokenizers = "0.22.2"
+tokio = { version = "1.50.0", features = ["macros", "rt", "rt-multi-thread", "tokio-macros"] }
+wgpu = "28.0.0"

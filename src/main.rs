@@ -1,4 +1,4 @@
-use inferaived::{embedding_lookup::EmbeddingLookupCpu, norm::RmsNormWebgpu};
+use inferaived::{embedding_lookup::EmbeddingLookupCpu, norm::{NormScaleWebgpu, RmsNormWebgpu}};
 use safetensors::SafeTensors;
 use tokenizers::Tokenizer;
 use tokio;
@@ -38,7 +38,7 @@ async fn main() {
     let tensors = SafeTensors::deserialize(&buffer[..]).expect("Failed to deserialize tensors");
     let embeddings = tensors
         .tensor("model.language_model.embed_tokens.weight")
-        .expect("Failed to get tensor");
+        .expect("Failed to get tensor: model.language_model.embed_tokens.weight");
     println!("Tensors: {:?}", tensors.names());
     let tokenizer = Tokenizer::from_file("model/Qwen3.5-0.8B/tokenizer.json")
         .expect("Failed to load tokenizer");
@@ -107,5 +107,7 @@ async fn main() {
     queue.write_buffer(&embeddings, 0, bytemuck::cast_slice(&result));
     let rms_norm = RmsNormWebgpu::new(&device, hidden_size);
     rms_norm.compute(&device, &queue, &embeddings, encoded.get_ids().len());
-
+    let norm_weight0 = tensors.tensor("model.language_model.layers.0.input_layernorm.weight").expect("Failed to get tensor: model.language_model.layers.0.input_layernorm.weight");
+    let norm_scale0 = NormScaleWebgpu::new(&device, &queue, norm_weight0, hidden_size);
+    norm_scale0.compute(&device, &queue, &embeddings, encoded.get_ids().len());
 }

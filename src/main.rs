@@ -1,4 +1,4 @@
-use inferaived::{embedding_lookup::EmbeddingLookupCpu, norm::{NormScaleWebgpu, RmsNormWebgpu}};
+use inferaived::{conv_silu::ConvSiluWebgpu, embedding_lookup::EmbeddingLookupCpu, mul_mat::MulMatWebgpu, norm::{NormScaleWebgpu, RmsNormWebgpu}};
 use safetensors::SafeTensors;
 use tokenizers::Tokenizer;
 use tokio;
@@ -33,6 +33,10 @@ fn features(supported: Features) -> Features {
 async fn main() {
     // Should extract from config file in the future
     let hidden_size = 1024usize;
+    let linear_num_key_heads = 16usize;
+    let linear_key_head_dim = 128usize;
+    let linear_num_value_heads = 16usize;
+    let linear_value_head_dim = 128usize;
     let buffer = std::fs::read("model/Qwen3.5-0.8B/model.safetensors-00001-of-00001.safetensors")
         .expect("Failed to read file");
     let tensors = SafeTensors::deserialize(&buffer[..]).expect("Failed to deserialize tensors");
@@ -110,4 +114,58 @@ async fn main() {
     let norm_weight0 = tensors.tensor("model.language_model.layers.0.input_layernorm.weight").expect("Failed to get tensor: model.language_model.layers.0.input_layernorm.weight");
     let norm_scale0 = NormScaleWebgpu::new(&device, &queue, norm_weight0, hidden_size);
     norm_scale0.compute(&device, &queue, &embeddings, encoded.get_ids().len());
+    let qkv_weight0 = tensors.tensor("model.language_model.layers.0.linear_attn.in_proj_qkv.weight").expect("Failed to get tensor: model.language_model.layers.0.linear_attn.in_proj_qkv.weight");
+    let qkv_weight0_height = qkv_weight0.shape()[0] as usize;
+    let qkv_mul_mat = MulMatWebgpu::new(&device, &queue, qkv_weight0, hidden_size);
+    let qkv_dst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("qkv_dst_buffer"),
+        size: (encoded.get_ids().len() * qkv_weight0_height * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    qkv_mul_mat.execute(&device, &queue, &embeddings, &qkv_dst_buffer, encoded.get_ids().len());
+    let z_weight0 = tensors.tensor("model.language_model.layers.0.linear_attn.in_proj_z.weight").expect("Failed to get tensor: model.language_model.layers.0.linear_attn.in_proj_z.weight");
+    let z_weight0_height = z_weight0.shape()[0] as usize;
+    let z_mul_mat = MulMatWebgpu::new(&device, &queue, z_weight0, hidden_size);
+    let z_dst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("z_dst_buffer"),
+        size: (encoded.get_ids().len() * z_weight0_height * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    z_mul_mat.execute(&device, &queue, &embeddings, &z_dst_buffer, encoded.get_ids().len());
+    let proj_a0 = tensors.tensor("model.language_model.layers.0.linear_attn.in_proj_a.weight").expect("Failed to get tensor: model.language_model.layers.0.linear_attn.in_proj_a.weight");
+    let proj_a0_height = proj_a0.shape()[0] as usize;
+    let proj_a_mul_mat = MulMatWebgpu::new(&device, &queue, proj_a0, hidden_size);
+    let proj_a_dst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("proj_a_dst_buffer"),
+        size: (encoded.get_ids().len() * proj_a0_height * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    proj_a_mul_mat.execute(&device, &queue, &embeddings, &proj_a_dst_buffer, encoded.get_ids().len());
+    let proj_b0 = tensors.tensor("model.language_model.layers.0.linear_attn.in_proj_b.weight").expect("Failed to get tensor: model.language_model.layers.0.linear_attn.in_proj_b.weight");
+    let proj_b0_height = proj_b0.shape()[0] as usize;
+    let proj_b_mul_mat = MulMatWebgpu::new(&device, &queue, proj_b0, hidden_size);
+    let proj_b_dst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("proj_b_dst_buffer"),
+        size: (encoded.get_ids().len() * proj_b0_height * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    proj_b_mul_mat.execute(&device, &queue, &embeddings, &proj_b_dst_buffer, encoded.get_ids().len());
+    let q_dim = linear_num_key_heads * linear_key_head_dim;
+    let k_dim = linear_num_key_heads * linear_key_head_dim;
+    let v_dim = linear_num_value_heads * linear_value_head_dim;
+    let qkv_dim = q_dim + k_dim + v_dim;
+    let conv_weights0 = tensors.tensor("model.language_model.layers.0.linear_attn.conv1d.weight").expect("Failed to get tensor: model.language_model.layers.0.linear_attn.conv1d.weight");
+    let kernel_size = conv_weights0.shape()[2] as usize;
+    let conv_silu = ConvSiluWebgpu::new(&device, &queue, conv_weights0, v_dim, qkv_dim, q_dim + k_dim, kernel_size);
+    let conv_silu_dst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("conv_silu_dst_buffer"),
+        size: (encoded.get_ids().len() * v_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    conv_silu.compute(&device, &queue, &qkv_dst_buffer, &conv_silu_dst_buffer, encoded.get_ids().len());
 }

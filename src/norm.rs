@@ -207,7 +207,7 @@ impl NormScaleWebgpu {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
-        let weight_f32 = norm_weight.data()            .chunks_exact(2)
+        let weight_f32 = norm_weight.data().chunks_exact(2)
             .map(|chunk| {
                 let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
                 half::bf16::from_bits(bits).to_f32()

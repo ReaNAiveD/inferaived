@@ -13,3 +13,11 @@
 - `dispatch_workgroups(ceil(ne0 / wg_size), n_tokens, 1)`
 
 This also eliminates expensive 4D index decoding arithmetic (repeated division/modulo chains).
+
+## Switch to WebGPU native buffer offsets
+
+**Affected shaders**: All shaders currently using manual byte offset calculations to access buffer data (e.g. `norm_scale.wgsl`).
+
+**Problem**: Manual byte offset calculations are error-prone and less efficient than using WebGPU's native buffer binding with offsets.
+
+**Solution**: Use WebGPU's native buffer binding with offsets to directly access the relevant data without manual calculations.

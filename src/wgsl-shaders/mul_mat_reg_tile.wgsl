@@ -38,8 +38,10 @@ var<uniform> params: MulMatParams;
 
 // The number of elements of src0 and src1 per tile.
 // Each thread is responsible for computing a tile of size tile_m x tile_n, and needs to load tile_k elements from src0 and src1.
-override tile_m: u32;
-override tile_n: u32; 
+// tile_m and tile_n are const (not override) because they size per-thread arrays
+// which must be constructible types in WGSL.
+const tile_m: u32 = 4u;
+const tile_n: u32 = 4u;
 override tile_k: u32;
 // The number of threads in the M and N dimensions of the workgroup
 override workgroup_size_m: u32;
@@ -49,6 +51,10 @@ override workgroup_size_n: u32;
 var<workgroup> shmem_src0: array<f32, tile_k * workgroup_size_m * tile_m>;
 // Shared memory for src1 tile: (workgroup_size_n * tile_n) rows × tile_k columns, row-major (tile_k contiguous).
 var<workgroup> shmem_src1: array<f32, tile_k * workgroup_size_n * tile_n>;
+
+// Per-invocation accumulators.
+var<private> acc: array<f32, tile_m * tile_n>;
+var<private> src0_reg: array<f32, tile_m>;
 
 // Initialize the shared memory tile for src0.
 //
@@ -130,7 +136,6 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
     let local_idx_m = local_id.x % workgroup_size_m;
     let local_idx_n = local_id.x / workgroup_size_m;
 
-    var acc: array<f32, tile_m * tile_n>;
     for (var i = 0u; i < tile_m * tile_n; i++) {
         acc[i] = 0.0;
     }
@@ -142,7 +147,6 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
 
         let k_end = min(tile_k, params.k - k_offset);
         for (var inner_k = 0u; inner_k < k_end; inner_k++) {
-            var src0_reg: array<f32, tile_m>;
             // Load tile_m src0 values once
             for (var inner_m = 0u; inner_m < tile_m; inner_m++) {
                 src0_reg[inner_m] = shmem_src0[inner_k + (local_idx_m * tile_m + inner_m) * tile_k];

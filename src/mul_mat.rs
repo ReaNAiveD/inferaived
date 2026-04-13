@@ -27,6 +27,10 @@ pub struct MulMatWebgpu {
 }
 
 impl MulMatWebgpu {
+    // TILE_M and TILE_N are hardcoded as `const` in the WGSL shader (not `override`)
+    // because WGSL only allows override-sized arrays in `var<workgroup>` scope,
+    // and the per-thread accumulator/register arrays require constructible types.
+    // Changing these values here will NOT affect the shader — update the shader consts too.
     pub const TILE_M: usize = 4;
     pub const TILE_N: usize = 4;
     pub const TILE_K: usize = 16;
@@ -97,8 +101,6 @@ impl MulMatWebgpu {
             entry_point: Some("main"),
             compilation_options: wgpu::PipelineCompilationOptions {
                 constants: &[
-                    ("tile_m", Self::TILE_M as f64),
-                    ("tile_n", Self::TILE_N as f64),
                     ("tile_k", Self::TILE_K as f64),
                     ("workgroup_size_m", Self::WORKGROUP_SIZE_M as f64),
                     ("workgroup_size_n", Self::WORKGROUP_SIZE_N as f64),

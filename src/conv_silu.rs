@@ -30,7 +30,6 @@ pub struct ConvSiluWebgpu {
 impl ConvSiluWebgpu {
     pub fn new<'data>(
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
         weights: TensorView<'data>,
         v_dim: usize,       // num_value_heads × value_head_dim (2048)
         qkv_dim: usize,     // q_dim + k_dim + v_dim (6144)

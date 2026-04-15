@@ -4,16 +4,32 @@ use wgpu::util::DeviceExt;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct ConvSiluUniform {
-    offset_src: u32,
-    offset_weights: u32,
-    offset_dst: u32,
-    stride_src1: u32,     // in elements
-    stride_weights1: u32, // in bf16 elements
-    stride_dst1: u32,     // in elements
-    ne0: u32,
-    n_rows: u32,
+pub struct ConvSiluParams {
+    // Channel group dimensions: layout is [Q, K, V] contiguous per token
+    q_dim: u32,
+    k_dim: u32,
+    v_dim: u32,
+
+    seq_len: u32,
     kernel_size: u32,
+
+    // Elements between consecutive tokens (>= q_dim + k_dim + v_dim when padded)
+    stride_src_token: u32,
+    stride_dst_token: u32,
+
+    // Per-group mode: 0 = copy, 1 = conv1d + silu
+    q_mode: u32,
+    k_mode: u32,
+    v_mode: u32,
+}
+
+/// Per-channel-group processing mode for ConvSilu.
+#[derive(Debug, Clone, Copy)]
+pub enum ChannelMode {
+    /// Copy the channel values from src to dst unchanged.
+    Copy = 0,
+    /// Apply depthwise causal conv1d followed by SiLU activation.
+    ConvSilu = 1,
 }
 
 pub struct ConvSiluWebgpu {
@@ -21,20 +37,30 @@ pub struct ConvSiluWebgpu {
     pipeline: wgpu::ComputePipeline,
     weights_buffer: wgpu::Buffer,
     uniform_buffer: wgpu::Buffer,
+
+    // Model dimensions
+    q_dim: usize,
+    k_dim: usize,
+    v_dim: usize,
     kernel_size: usize,
-    v_dim: usize,      // num_value_heads × value_head_dim (2048)
-    qkv_dim: usize,    // q_dim + k_dim + v_dim (6144)
-    v_offset: usize,   // q_dim + k_dim (4096)
+
+    // Per-group modes
+    q_mode: ChannelMode,
+    k_mode: ChannelMode,
+    v_mode: ChannelMode,
 }
 
 impl ConvSiluWebgpu {
     pub fn new<'data>(
         device: &wgpu::Device,
         weights: TensorView<'data>,
-        v_dim: usize,       // num_value_heads × value_head_dim (2048)
-        qkv_dim: usize,     // q_dim + k_dim + v_dim (6144)
-        v_offset: usize,    // q_dim + k_dim (4096)
+        q_dim: usize,
+        k_dim: usize,
+        v_dim: usize,
         kernel_size: usize,
+        q_mode: ChannelMode,
+        k_mode: ChannelMode,
+        v_mode: ChannelMode,
     ) -> Self {
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("conv_silu/shader"),
@@ -107,7 +133,7 @@ impl ConvSiluWebgpu {
         });
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("conv_silu/uniform_buffer"),
-            size: std::mem::size_of::<ConvSiluUniform>() as wgpu::BufferAddress,
+            size: std::mem::size_of::<ConvSiluParams>() as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -116,10 +142,13 @@ impl ConvSiluWebgpu {
             pipeline,
             weights_buffer,
             uniform_buffer,
-            kernel_size,
+            q_dim,
+            k_dim,
             v_dim,
-            qkv_dim,
-            v_offset,
+            kernel_size,
+            q_mode,
+            k_mode,
+            v_mode,
         }
     }
 
@@ -127,25 +156,27 @@ impl ConvSiluWebgpu {
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        qkv_buffer: &wgpu::Buffer,
+        src_buffer: &wgpu::Buffer,
         dst_buffer: &wgpu::Buffer,
-        sequence_length: usize,
+        seq_len: usize,
     ) {
-        let uniform_data = ConvSiluUniform {
-            offset_src: self.v_offset as u32,
-            offset_weights: 0,
-            offset_dst: 0,
-            stride_src1: self.qkv_dim as u32,
-            stride_weights1: self.kernel_size as u32,
-            stride_dst1: self.v_dim as u32,
-            ne0: self.v_dim as u32,
-            n_rows: sequence_length as u32,
+        let num_channels = self.q_dim + self.k_dim + self.v_dim;
+        let params = ConvSiluParams {
+            q_dim: self.q_dim as u32,
+            k_dim: self.k_dim as u32,
+            v_dim: self.v_dim as u32,
+            seq_len: seq_len as u32,
             kernel_size: self.kernel_size as u32,
+            stride_src_token: num_channels as u32,
+            stride_dst_token: num_channels as u32,
+            q_mode: self.q_mode as u32,
+            k_mode: self.k_mode as u32,
+            v_mode: self.v_mode as u32,
         };
         queue.write_buffer(
             &self.uniform_buffer,
             0,
-            bytemuck::cast_slice(&[uniform_data]),
+            bytemuck::cast_slice(&[params]),
         );
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("conv_silu/bind_group"),
@@ -153,7 +184,7 @@ impl ConvSiluWebgpu {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: qkv_buffer.as_entire_binding(),
+                    resource: src_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -180,7 +211,7 @@ impl ConvSiluWebgpu {
             compute_pass.set_pipeline(&self.pipeline);
             compute_pass.set_bind_group(0, &bind_group, &[]);
             let workgroup_size = 256usize;
-            let num_workgroups = (sequence_length * self.v_dim + workgroup_size - 1) / workgroup_size;
+            let num_workgroups = (seq_len * num_channels + workgroup_size - 1) / workgroup_size;
             compute_pass.dispatch_workgroups(num_workgroups as u32, 1, 1);
         }
         queue.submit(Some(encoder.finish()));

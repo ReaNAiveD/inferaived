@@ -5,14 +5,13 @@ struct Params {
     value_head_dim: u32,
     seq_len: u32,
 
-    // QKV source buffer (Q and K share stride, V separate)
+    // QKV source buffer layout
     q_offset: u32,
     k_offset: u32,
-    stride_qk_head: u32,   // = key_head_dim
-    stride_qkv_token: u32, // = num_key_heads * key_head_dim * 2 + num_value_heads * value_head_dim
     v_offset: u32,
-    stride_v_head: u32,    // = value_head_dim (in V source buffer)
-    stride_v_token: u32,
+    stride_qk_head: u32,   // = key_head_dim
+    stride_v_head: u32,    // = value_head_dim (may differ from key_head_dim)
+    stride_qkv_token: u32, // = num_key_heads * key_head_dim * 2 + num_value_heads * value_head_dim
 
     // Projection buffers (per-head scalars)
     proj_a_offset: u32,
@@ -35,18 +34,16 @@ struct Params {
 @group(0) @binding(0)
 var<storage, read> qkv_src: array<f32>;
 @group(0) @binding(1)
-var<storage, read> v_src: array<f32>;
-@group(0) @binding(2)
 var<storage, read> proj_a: array<f32>;
-@group(0) @binding(3)
+@group(0) @binding(2)
 var<storage, read> proj_b: array<f32>;
-@group(0) @binding(4)
+@group(0) @binding(3)
 var<storage, read> ssm_params: array<f32>;  // [0..num_key_heads) for dt bias, [num_key_heads..2*num_key_heads) for A log]
-@group(0) @binding(5)
+@group(0) @binding(4)
 var<storage, read_write> state: array<f32>;
-@group(0) @binding(6)
+@group(0) @binding(5)
 var<storage, read_write> dst: array<f32>;
-@group(0) @binding(7)
+@group(0) @binding(6)
 var<uniform> params: Params;
 
 override workgroup_size: u32;
@@ -65,7 +62,7 @@ fn get_k(in_head_index: u32, head_num: u32, token_idx: u32) -> f32 {
 }
 
 fn get_v(in_head_index: u32, head_num: u32, token_idx: u32) -> f32 {
-    return v_src[params.v_offset + in_head_index + head_num * params.stride_v_head + token_idx * params.stride_v_token];
+    return qkv_src[params.v_offset + in_head_index + head_num * params.stride_v_head + token_idx * params.stride_qkv_token];
 }
 
 fn get_proj_a(head_num: u32, token_idx: u32) -> f32 {

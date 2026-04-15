@@ -4,7 +4,7 @@ use wgpu::util::DeviceExt;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct MambaScanParams {
+pub struct DeltaRuleParams {
     // Model dimensions
     num_key_heads: u32,
     key_head_dim: u32,
@@ -25,7 +25,7 @@ pub struct MambaScanParams {
     proj_b_offset: u32,
     stride_proj_b_token: u32, // = num_key_heads
 
-    // SSM params buffer (dt_bias and A_log packed together)
+    // Gate params buffer (dt_bias and A_log packed together)
     dt_bias_offset: u32,
     a_log_offset: u32,
 
@@ -35,12 +35,14 @@ pub struct MambaScanParams {
 
     // State buffer
     stride_state_head: u32, // = key_head_dim * value_head_dim
+
+    eps: f32,
 }
 
-pub struct MambaScanWebgpu {
+pub struct DeltaRuleWebgpu {
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
-    ssm_params_buffer: wgpu::Buffer,
+    gate_params_buffer: wgpu::Buffer,
     uniform_buffer: wgpu::Buffer,
 
     num_key_heads: u32,
@@ -48,7 +50,7 @@ pub struct MambaScanWebgpu {
     value_head_dim: u32,
 }
 
-impl MambaScanWebgpu {
+impl DeltaRuleWebgpu {
     const WORKGROUP_SIZE: usize = 128;
 
     pub fn new<'data>(
@@ -71,27 +73,28 @@ impl MambaScanWebgpu {
             .collect();
         assert_eq!(dt_bias.len(), num_key_heads as usize);
         assert_eq!(a_log.len(), num_key_heads as usize);
-        let cols_per_thread = (value_head_dim as usize + Self::WORKGROUP_SIZE - 1) / Self::WORKGROUP_SIZE;
+        let cols_per_thread =
+            (value_head_dim as usize + Self::WORKGROUP_SIZE - 1) / Self::WORKGROUP_SIZE;
         assert!(
             cols_per_thread * key_head_dim as usize <= 256,
             "Private state overflow: need {} floats per thread but MAX_KEY_HEAD_DIM=256. \
-             Increase MAX_KEY_HEAD_DIM in mamba_scan.wgsl or increase WORKGROUP_SIZE.",
+             Increase MAX_KEY_HEAD_DIM in delta_rule.wgsl or increase WORKGROUP_SIZE.",
             cols_per_thread * key_head_dim as usize
         );
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("mamba_scan/shader"),
+            label: Some("delta_rule/shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "wgsl-shaders/mamba_scan.wgsl"
+                "wgsl-shaders/delta_rule.wgsl"
             ))),
         });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("mamba_scan/bind_group_layout"),
+            label: Some("delta_rule/bind_group_layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -165,31 +168,31 @@ impl MambaScanWebgpu {
             immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("mamba_scan/pipeline"),
+            label: Some("delta_rule/pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader_module,
-            entry_point: Some("mamba_scan"),
+            entry_point: Some("delta_rule"),
             compilation_options: wgpu::PipelineCompilationOptions {
                 constants: &[("workgroup_size".into(), Self::WORKGROUP_SIZE as f64)],
                 zero_initialize_workgroup_memory: true,
             },
             cache: None,
         });
-        let ssm_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mamba_scan/ssm_params_buffer"),
+        let gate_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("delta_rule/gate_params_buffer"),
             contents: bytemuck::cast_slice(&[dt_bias, a_log].concat()),
             usage: wgpu::BufferUsages::STORAGE,
         });
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mamba_scan/uniform_buffer"),
-            size: std::mem::size_of::<MambaScanParams>() as u64,
+            label: Some("delta_rule/uniform_buffer"),
+            size: std::mem::size_of::<DeltaRuleParams>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         Self {
             bind_group_layout,
             pipeline,
-            ssm_params_buffer,
+            gate_params_buffer,
             uniform_buffer,
             num_key_heads,
             key_head_dim,
@@ -208,7 +211,7 @@ impl MambaScanWebgpu {
         dst_buffer: &wgpu::Buffer,
         seq_len: usize,
     ) {
-        let params = MambaScanParams {
+        let params = DeltaRuleParams {
             num_key_heads: self.num_key_heads,
             key_head_dim: self.key_head_dim,
             value_head_dim: self.value_head_dim,
@@ -229,10 +232,11 @@ impl MambaScanWebgpu {
             stride_dst_token: (self.num_key_heads * self.value_head_dim) as u32,
             stride_dst_head: self.value_head_dim as u32,
             stride_state_head: (self.key_head_dim * self.value_head_dim) as u32,
+            eps: 1e-6,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[params]));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("mamba_scan/bind_group"),
+            label: Some("delta_rule/bind_group"),
             layout: &self.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -249,7 +253,7 @@ impl MambaScanWebgpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: self.ssm_params_buffer.as_entire_binding(),
+                    resource: self.gate_params_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -265,18 +269,18 @@ impl MambaScanWebgpu {
                 },
             ],
         });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("mamba_scan/command_encoder"),
+        let mut command_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("delta_rule/command_encoder"),
         });
         {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("mamba_scan/compute_pass"),
+            let mut cpass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("delta_rule/compute_pass"),
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&self.pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
             cpass.dispatch_workgroups(self.num_key_heads, 1, 1);
         }
-        queue.submit(Some(encoder.finish()));
+        queue.submit(Some(command_encoder.finish()));
     }
 }

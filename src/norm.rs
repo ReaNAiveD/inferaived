@@ -37,7 +37,7 @@ impl RmsNormWebgpu {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -45,6 +45,16 @@ impl RmsNormWebgpu {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -82,7 +92,7 @@ impl RmsNormWebgpu {
         }
     }
 
-    pub fn compute(&self, device: &wgpu::Device, queue: &wgpu::Queue, input_buffer: &Buffer, n_rows: usize) {
+    pub fn compute(&self, device: &wgpu::Device, queue: &wgpu::Queue, input_buffer: &Buffer, dst_buffer: &Buffer, n_rows: usize) {
         let uniform = RmsNormUniform {
             offset_src: 0,
             stride_src1: self.hidden_size as u32,
@@ -105,6 +115,10 @@ impl RmsNormWebgpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
+                    resource: dst_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
                     resource: self.uniform_buffer.as_entire_binding(),
                 },
             ],

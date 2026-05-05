@@ -32,5 +32,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx0 = gid.x % params.ne0;
     let src_offset = params.offset_src + idx3 * params.stride_src3 + idx2 * params.stride_src2 + idx1 * params.stride_src1 + idx0;
     let scale_val = scale[params.offset_scale + (idx0 % params.ne0_scale)];
-    src[src_offset] *= scale_val;
+    src[src_offset] *= (1.0 + scale_val);
 }

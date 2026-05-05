@@ -21,3 +21,7 @@ This also eliminates expensive 4D index decoding arithmetic (repeated division/m
 **Problem**: Manual byte offset calculations are error-prone and less efficient than using WebGPU's native buffer binding with offsets.
 
 **Solution**: Use WebGPU's native buffer binding with offsets to directly access the relevant data without manual calculations.
+
+## Use unified parameter naming
+
+Previously, different shaders have used varying parameter names for similar concepts (e.g. `ne0`, `hidden_size`, `n_tokens`). This can lead to confusion and inconsistency across shaders.

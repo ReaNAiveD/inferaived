@@ -1,10 +1,11 @@
 use inferaived::{
+    binary::ElementwiseAddWebgpu,
     conv_silu::{ChannelMode, ConvSiluWebgpu},
     delta_rule::DeltaRuleWebgpu,
     embedding_lookup::EmbeddingLookupCpu,
     gated_rms_norm::GatedRmsNormWebgpu,
     mul_mat::MulMatWebgpu,
-    norm::{NormScaleWebgpu, RmsNormWebgpu},
+    norm::{NormScaleWebgpu, RmsNormWebgpu}, silu_mul::SiluMulWebgpu,
 };
 use safetensors::SafeTensors;
 use tokenizers::Tokenizer;
@@ -384,4 +385,123 @@ async fn main() {
         &out_proj_dst_buffer,
         encoded.get_ids().len(),
     );
+    let elementwise_add = ElementwiseAddWebgpu::new(&device, hidden_size);
+    elementwise_add.compute(
+        &device,
+        &queue,
+        &embeddings,
+        &out_proj_dst_buffer,
+        encoded.get_ids().len(),
+    );
+    // post_attention_layernorm: RMSNorm + NormScale on the post-attention hidden state
+    let rms_norm = RmsNormWebgpu::new(&device, hidden_size);
+    rms_norm.compute(
+        &device,
+        &queue,
+        &embeddings,
+        &normalized_embedding_buffer,
+        encoded.get_ids().len(),
+    );
+    let post_attn_norm_weight0 = tensors
+        .tensor("model.language_model.layers.0.post_attention_layernorm.weight")
+        .expect("Failed to get tensor: model.language_model.layers.0.post_attention_layernorm.weight");
+    let post_attn_norm_scale0 = NormScaleWebgpu::new(&device, &queue, post_attn_norm_weight0, hidden_size);
+    post_attn_norm_scale0.compute(
+        &device,
+        &queue,
+        &normalized_embedding_buffer,
+        encoded.get_ids().len(),
+    );
+    let mlp_gate_proj_weight0 = tensors
+        .tensor("model.language_model.layers.0.mlp.gate_proj.weight")
+        .expect("Failed to get tensor: model.language_model.layers.0.mlp.gate_proj.weight");
+    print_tensor(
+        "model.language_model.layers.0.mlp.gate_proj.weight",
+        &mlp_gate_proj_weight0,
+    );
+    let mlp_gate_dim = mlp_gate_proj_weight0.shape()[0] as usize;
+    let mlp_gate_proj_mul_mat =
+        MulMatWebgpu::new(&device, &queue, mlp_gate_proj_weight0, hidden_size);
+    let mlp_gate_proj_dst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("mlp_gate_proj_dst_buffer"),
+        size: (encoded.get_ids().len() * mlp_gate_dim * std::mem::size_of::<f32>())
+            as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    mlp_gate_proj_mul_mat.execute(
+        &device,
+        &queue,
+        &normalized_embedding_buffer,
+        &mlp_gate_proj_dst_buffer,
+        encoded.get_ids().len(),
+    );
+    let mlp_up_proj_weight0 = tensors
+        .tensor("model.language_model.layers.0.mlp.up_proj.weight")
+        .expect("Failed to get tensor: model.language_model.layers.0.mlp.up_proj.weight");
+    print_tensor(
+        "model.language_model.layers.0.mlp.up_proj.weight",
+        &mlp_up_proj_weight0,
+    );
+    let mlp_up_proj_dim = mlp_up_proj_weight0.shape()[0] as usize;
+    let mlp_up_proj_mul_mat = MulMatWebgpu::new(&device, &queue, mlp_up_proj_weight0, hidden_size);
+    let mlp_up_proj_dst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("mlp_up_proj_dst_buffer"),
+        size: (encoded.get_ids().len() * mlp_up_proj_dim * std::mem::size_of::<f32>())
+            as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    mlp_up_proj_mul_mat.execute(
+        &device,
+        &queue,
+        &normalized_embedding_buffer,
+        &mlp_up_proj_dst_buffer,
+        encoded.get_ids().len(),
+    );
+    let silu_mul = SiluMulWebgpu::new(&device, mlp_up_proj_dim);
+    silu_mul.compute(
+        &device,
+        &queue,
+        &mlp_up_proj_dst_buffer,
+        &mlp_gate_proj_dst_buffer,
+        encoded.get_ids().len(),
+    );
+    let mlp_down_proj_weight0 = tensors
+        .tensor("model.language_model.layers.0.mlp.down_proj.weight")
+        .expect("Failed to get tensor: model.language_model.layers.0.mlp.down_proj.weight");
+    print_tensor(
+        "model.language_model.layers.0.mlp.down_proj.weight",
+        &mlp_down_proj_weight0,
+    );
+    let mlp_down_mul_mat = MulMatWebgpu::new(&device, &queue, mlp_down_proj_weight0, mlp_gate_dim);
+    let mlp_down_proj_dst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("mlp_down_proj_dst_buffer"),
+        size: (encoded.get_ids().len() * hidden_size * std::mem::size_of::<f32>())
+            as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    mlp_down_mul_mat.execute(
+        &device,
+        &queue,
+        &mlp_up_proj_dst_buffer,
+        &mlp_down_proj_dst_buffer,
+        encoded.get_ids().len(),
+    );
+    // Second residual connection: embeddings += mlp_output
+    elementwise_add.compute(
+        &device,
+        &queue,
+        &embeddings,
+        &mlp_down_proj_dst_buffer,
+        encoded.get_ids().len(),
+    );
+    // embeddings now holds the final output of layer 0
 }

@@ -1,0 +1,45 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "run inferaived (debug log)",
+            "type": "cargo",
+            "command": "run",
+            "args": [
+                "--package",
+                "inferaived",
+                "--bin",
+                "inferaived"
+            ],
+            "env": {
+                "RUST_LOG": "debug"
+            },
+            "group": "build",
+            "problemMatcher": ["$rustc"],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            }
+        },
+        {
+            "label": "run inferaived",
+            "type": "cargo",
+            "command": "run",
+            "args": [
+                "--package",
+                "inferaived",
+                "--bin",
+                "inferaived"
+            ],
+            "env": {
+                "RUST_LOG": "info"
+            },
+            "group": "build",
+            "problemMatcher": ["$rustc"],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            }
+        }
+    ]
+}

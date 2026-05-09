@@ -22,6 +22,9 @@ var<storage, read> src: array<f32>;
 var<storage, read_write> dst: array<f32>;
 
 @group(0) @binding(2)
+var<storage, read> weight: array<f32>;
+
+@group(0) @binding(3)
 var<uniform> params: Params;
 
 override workgroup_size: u32;
@@ -57,6 +60,6 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 
     for (var i: u32 = lid.x; i < params.ne0; i += workgroup_size) {
         let val = src[offset + i];
-        dst[offset + i] = val * scale;
+        dst[offset + i] = val * scale * (1.0 + weight[i]);
     }
 }

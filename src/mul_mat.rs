@@ -139,7 +139,7 @@ impl MulMatWebgpu {
         }
     }
 
-    pub fn execute(&self, device: &wgpu::Device, queue: &wgpu::Queue, mat_src1_buffer: &wgpu::Buffer, mat_dst_buffer: &wgpu::Buffer, n_rows: usize) {
+    pub fn compute(&self, device: &wgpu::Device, queue: &wgpu::Queue, mat_src1_buffer: &wgpu::Buffer, mat_dst_buffer: &wgpu::Buffer, n_rows: usize) {
         let uniform = MulMatUniform {
             offset_src0: 0,
             offset_src1: 0,

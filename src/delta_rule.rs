@@ -45,9 +45,9 @@ pub struct DeltaRuleWebgpu {
     gate_params_buffer: wgpu::Buffer,
     uniform_buffer: wgpu::Buffer,
 
-    num_key_heads: u32,
-    key_head_dim: u32,
-    value_head_dim: u32,
+    num_key_heads: usize,
+    key_head_dim: usize,
+    value_head_dim: usize,
 }
 
 impl DeltaRuleWebgpu {
@@ -57,9 +57,9 @@ impl DeltaRuleWebgpu {
         device: &wgpu::Device,
         dt_bias_tensor: TensorView<'data>,
         a_log_tensor: TensorView<'data>,
-        num_key_heads: u32,
-        key_head_dim: u32,
-        value_head_dim: u32,
+        num_key_heads: usize,
+        key_head_dim: usize,
+        value_head_dim: usize,
     ) -> Self {
         let dt_bias: Vec<f32> = dt_bias_tensor
             .data()
@@ -71,12 +71,12 @@ impl DeltaRuleWebgpu {
             .chunks_exact(4)
             .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
             .collect();
-        assert_eq!(dt_bias.len(), num_key_heads as usize);
-        assert_eq!(a_log.len(), num_key_heads as usize);
+        assert_eq!(dt_bias.len(), num_key_heads);
+        assert_eq!(a_log.len(), num_key_heads);
         let cols_per_thread =
-            (value_head_dim as usize + Self::WORKGROUP_SIZE - 1) / Self::WORKGROUP_SIZE;
+            (value_head_dim + Self::WORKGROUP_SIZE - 1) / Self::WORKGROUP_SIZE;
         assert!(
-            cols_per_thread * key_head_dim as usize <= 256,
+            cols_per_thread * key_head_dim <= 256,
             "Private state overflow: need {} floats per thread but MAX_KEY_HEAD_DIM=256. \
              Increase MAX_KEY_HEAD_DIM in delta_rule.wgsl or increase WORKGROUP_SIZE.",
             cols_per_thread * key_head_dim as usize
@@ -212,21 +212,21 @@ impl DeltaRuleWebgpu {
         seq_len: usize,
     ) {
         let params = DeltaRuleParams {
-            num_key_heads: self.num_key_heads,
-            key_head_dim: self.key_head_dim,
-            value_head_dim: self.value_head_dim,
+            num_key_heads: self.num_key_heads as u32,
+            key_head_dim: self.key_head_dim as u32,
+            value_head_dim: self.value_head_dim as u32,
             seq_len: seq_len as u32,
             q_offset: 0,
-            k_offset: self.key_head_dim * self.num_key_heads,
-            v_offset: self.key_head_dim * self.num_key_heads * 2,
-            stride_qk_head: self.key_head_dim,
-            stride_v_head: self.value_head_dim,
-            stride_qkv_token: self.num_key_heads * self.key_head_dim * 2
-                + self.num_key_heads * self.value_head_dim,
+            k_offset: (self.key_head_dim * self.num_key_heads) as u32,
+            v_offset: (self.key_head_dim * self.num_key_heads * 2) as u32,
+            stride_qk_head: self.key_head_dim as u32,
+            stride_v_head: self.value_head_dim as u32,
+            stride_qkv_token: (self.num_key_heads * self.key_head_dim * 2
+                + self.num_key_heads * self.value_head_dim) as u32,
             proj_a_offset: 0,
-            stride_proj_a_token: self.num_key_heads,
+            stride_proj_a_token: self.num_key_heads as u32,
             proj_b_offset: 0,
-            stride_proj_b_token: self.num_key_heads,
+            stride_proj_b_token: self.num_key_heads as u32,
             dt_bias_offset: 0,
             a_log_offset: self.num_key_heads as u32,
             stride_dst_token: (self.num_key_heads * self.value_head_dim) as u32,
@@ -279,7 +279,7 @@ impl DeltaRuleWebgpu {
             });
             cpass.set_pipeline(&self.pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
-            cpass.dispatch_workgroups(self.num_key_heads, 1, 1);
+            cpass.dispatch_workgroups(self.num_key_heads as u32, 1, 1);
         }
         queue.submit(Some(command_encoder.finish()));
     }

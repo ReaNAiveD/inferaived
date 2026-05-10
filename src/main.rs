@@ -1,6 +1,6 @@
 use inferaived::{
     embedding_lookup::EmbeddingLookupCpu,
-    layer_loop::{LinearLayer, LinearLayerConfig},
+    layer_loop::{LinearAttentionLayer, LinearAttentionConfig},
     log_tensor,
 };
 use safetensors::SafeTensors;
@@ -108,7 +108,7 @@ async fn main() {
     queue.write_buffer(&embeddings, 0, bytemuck::cast_slice(&result));
 
     let seq_len = encoded.get_ids().len();
-    let config = LinearLayerConfig {
+    let config = LinearAttentionConfig {
         linear_num_key_heads,
         linear_num_value_heads,
         linear_key_head_dim,
@@ -116,7 +116,7 @@ async fn main() {
     };
 
     // Layer 0 (linear attention)
-    let layer0 = LinearLayer::new(
+    let layer0 = LinearAttentionLayer::new(
         &device,
         &queue,
         &tensors,

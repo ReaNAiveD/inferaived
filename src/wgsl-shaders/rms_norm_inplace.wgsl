@@ -1,6 +1,6 @@
 struct Params {
-    input_offset: u32,        // in elements
-    input_row_stride: u32,    // in elements
+    hidden_offset: u32,       // in elements
+    hidden_row_stride: u32,   // in elements
 
     hidden_size: u32,
     seq_len: u32,
@@ -9,15 +9,12 @@ struct Params {
 };
 
 @group(0) @binding(0)
-var<storage, read> input: array<f32>;
+var<storage, read_write> hidden: array<f32>;
 
 @group(0) @binding(1)
-var<storage, read_write> output: array<f32>;
-
-@group(0) @binding(2)
 var<storage, read> weight: array<f32>;
 
-@group(0) @binding(3)
+@group(0) @binding(2)
 var<uniform> params: Params;
 
 override workgroup_size: u32;
@@ -28,11 +25,11 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
     if (wg_id.x >= params.seq_len) {
         return;
     }
-    let row_offset = params.input_offset + wg_id.x * params.input_row_stride;
+    let row_offset = params.hidden_offset + wg_id.x * params.hidden_row_stride;
 
     var sum: f32 = 0.0;
     for (var i: u32 = local_id.x; i < params.hidden_size; i += workgroup_size) {
-        let val = input[row_offset + i];
+        let val = hidden[row_offset + i];
         sum += val * val;
     }
     scratch[local_id.x] = sum;
@@ -51,7 +48,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
     let scale = inverseSqrt(scratch[0] / f32(params.hidden_size) + params.eps);
 
     for (var i: u32 = local_id.x; i < params.hidden_size; i += workgroup_size) {
-        let val = input[row_offset + i];
-        output[row_offset + i] = val * scale * (1.0 + weight[i]);
+        let val = hidden[row_offset + i];
+        hidden[row_offset + i] = val * scale * (1.0 + weight[i]);
     }
 }

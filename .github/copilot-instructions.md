@@ -5,3 +5,26 @@ When encountering uncertainty about the implementation details of any specific L
 3. **Consult the original research paper or technical essay** (e.g., on arXiv) when the design rationale or mathematical formulation is unclear.
 
 Always cite or link to the source you relied on so the information can be verified.
+
+## Software Design Principles
+
+These principles synthesize widely-accepted software engineering wisdom (SOLID, Rust API Guidelines, "parse don't validate", "make illegal states unrepresentable") and apply across all code in this project.
+
+- **Single Responsibility.** Each module, type, or function should have one reason to change. When a unit accumulates multiple responsibilities, split it.
+- **Make illegal states unrepresentable.** Encode invariants in the type system so the compiler rejects incorrect usage. Prefer distinct types over runtime flags, enums over booleans, and required parameters over optional ones whose meaning depends on context.
+- **Parse, don't validate.** Convert untrusted input into a strongly-typed representation at the boundary, then operate on the typed form internally. Do not re-check the same invariant at every use site.
+- **High cohesion, low coupling.** Group related data and behavior together. Minimize what each module needs to know about others. Depend on abstractions, not concrete implementations.
+- **APIs should be hard to misuse.** Function signatures, type bounds, and ownership rules should make incorrect calls fail to compile. Surface errors as early as possible — preferably at compile time, otherwise at construction, never silently at runtime.
+- **Optimize for reading, not writing.** Code is read far more often than written. Choose names that describe intent over implementation. Keep functions short enough to understand at a glance.
+
+## GPU Compute Design Principles
+
+These principles synthesize widely-accepted GPU programming wisdom (NVIDIA CUDA Best Practices Guide, ggml/llama.cpp patterns, vLLM kernel design, grid-stride loops) and apply to all WGSL shaders and `wgpu` host code in this project.
+
+- **Decouple kernels from memory layout via strides and offsets.** Shaders should accept stride/offset parameters in a uniform rather than assume tightly-packed contiguous data. This lets one shader operate on full tensors, sub-slices, or interleaved views without duplication. Production engines (vLLM, llama.cpp) all do this.
+- **Match data layout to access pattern.** GPU performance is dominated by memory bandwidth. Adjacent threads should read adjacent memory. When the natural layout fights this, restructure the data at load time rather than fight it at every kernel invocation.
+- **Minimize host↔device transfers.** Each transfer has fixed overhead. Keep intermediate tensors on the GPU; only transfer final results back. Batch small operations into larger dispatches when possible.
+- **Validate intermediate outputs against a reference.** Floating-point parallelism produces non-bitwise-identical but numerically equivalent results. Compare against a CPU/PyTorch reference within a small epsilon, not bit-for-bit equality.
+- **Profile before optimizing.** Don't add complexity (fused kernels, custom layouts, in-place variants) for performance reasons without measurement. Most overhead is hidden behind dispatch latency or memory bandwidth, not arithmetic.
+- **Prefer many small, single-purpose kernels over one large parameterized kernel.** Each kernel should do one well-defined operation. Composability and debuggability outweigh dispatch overhead at modest scales.
+- **One pipeline per shader.** Shaders with different bind group layouts, workgroup sizes, or access patterns are different pipelines and belong in different host structs — even if they compute conceptually similar things (e.g., per-token vs per-head normalization).

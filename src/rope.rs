@@ -1,30 +1,30 @@
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct RopeUniform {
+pub struct RopeParams {
     q_offset: u32,
     k_offset: u32,
-    stride_token: u32,
-    stride_head: u32,
+    token_stride: u32,
+    head_stride: u32,
     head_dim: u32,
     num_heads: u32,
     seq_len: u32,
-    n_dims: u32,
+    num_rotated_dims: u32,
     theta_scale: f32,
-    pos_offset: u32,
+    position_offset: u32,
 }
 
-pub struct RopeWebgpu {
+pub struct RopeInplaceWebgpu {
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
     uniform_buffer: wgpu::Buffer,
     head_dim: usize,
     num_heads: usize,
-    qkv_dim: usize,    // q_dim + k_dim + v_dim (6144)
+    qkv_dim: usize,
     n_dims: usize,
     theta_scale: f32,
 }
 
-impl RopeWebgpu {
+impl RopeInplaceWebgpu {
     pub fn new(
         device: &wgpu::Device,
         head_dim: usize,
@@ -79,7 +79,7 @@ impl RopeWebgpu {
         });
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rope/uniform_buffer"),
-            size: std::mem::size_of::<RopeUniform>() as wgpu::BufferAddress,
+            size: std::mem::size_of::<RopeParams>() as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -105,17 +105,17 @@ impl RopeWebgpu {
         seq_len: usize,
         pos_offset: usize,
     ) {
-        let uniform_data = RopeUniform {
+        let uniform_data = RopeParams {
             q_offset: 0,
             k_offset: (self.head_dim * self.num_heads) as u32,
-            stride_token: self.qkv_dim as u32,
-            stride_head: self.head_dim as u32,
+            token_stride: self.qkv_dim as u32,
+            head_stride: self.head_dim as u32,
             head_dim: self.head_dim as u32,
             num_heads: self.num_heads as u32,
             seq_len: seq_len as u32,
-            n_dims: self.n_dims as u32,
+            num_rotated_dims: self.n_dims as u32,
             theta_scale: self.theta_scale,
-            pos_offset: pos_offset as u32,
+            position_offset: pos_offset as u32,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniform_data]));
          let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {

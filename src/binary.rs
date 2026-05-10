@@ -1,16 +1,16 @@
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
-pub struct ElementwiseAddUniform {
-    stride_src_token: u32,
-    stride_other_token: u32,
-    src_offset: u32,
-    other_offset: u32,
+pub struct ElementwiseAddParams {
+    hidden_offset: u32,
+    hidden_token_stride: u32,
+    addend_offset: u32,
+    addend_token_stride: u32,
 
     hidden_size: u32,
     seq_len: u32,
 }
 
-pub struct ElementwiseAddWebgpu {
+pub struct ElementwiseAddInplaceWebgpu {
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
     uniform_buffer: wgpu::Buffer,
@@ -18,7 +18,7 @@ pub struct ElementwiseAddWebgpu {
     hidden_size: usize,
 }
 
-impl ElementwiseAddWebgpu {
+impl ElementwiseAddInplaceWebgpu {
     pub fn new(device: &wgpu::Device, hidden_size: usize) -> Self {
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("elementwise_add/shader"),
@@ -77,7 +77,7 @@ impl ElementwiseAddWebgpu {
          });
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("elementwise_add/uniform_buffer"),
-            size: std::mem::size_of::<ElementwiseAddUniform>() as u64,
+            size: std::mem::size_of::<ElementwiseAddParams>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -90,11 +90,11 @@ impl ElementwiseAddWebgpu {
     }
 
     pub fn compute(&self, device: &wgpu::Device, queue: &wgpu::Queue, src_buffer: &wgpu::Buffer, other_buffer: &wgpu::Buffer, seq_len: usize) {
-        let uniform = ElementwiseAddUniform {
-            stride_src_token: self.hidden_size as u32,
-            stride_other_token: self.hidden_size as u32,
-            src_offset: 0,
-            other_offset: 0,
+        let uniform = ElementwiseAddParams {
+            hidden_offset: 0,
+            hidden_token_stride: self.hidden_size as u32,
+            addend_offset: 0,
+            addend_token_stride: self.hidden_size as u32,
             hidden_size: self.hidden_size as u32,
             seq_len: seq_len as u32,
         };

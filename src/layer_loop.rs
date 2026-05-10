@@ -1,25 +1,25 @@
 use safetensors::SafeTensors;
 
 use crate::{
-    binary::ElementwiseAddWebgpu,
+    binary::ElementwiseAddInplaceWebgpu,
     conv_silu::{ChannelMode, ConvSiluWebgpu},
     delta_rule::DeltaRuleWebgpu,
-    gated_rms_norm::GatedRmsNormWebgpu,
-    mul_mat::MulMatWebgpu,
-    norm::RmsNormWebgpu,
+    gated_rms_norm::GatedRmsNormInplaceWebgpu,
     log_tensor,
-    silu_mul::SiluMulWebgpu,
+    mul_mat::MulMatWebgpu,
+    norm::{RmsNormInplaceWebgpu, RmsNormWebgpu},
+    silu_mul::SiluMulInplaceWebgpu,
 };
 
 #[derive(Debug, Clone, Copy)]
-pub struct LinearLayerConfig {
+pub struct LinearAttentionConfig {
     pub linear_num_key_heads: usize,
     pub linear_num_value_heads: usize,
     pub linear_key_head_dim: usize,
     pub linear_value_head_dim: usize,
 }
 
-pub struct LinearLayer {
+pub struct LinearAttentionLayer {
     hidden_size: usize,
 
     input_layernorm: RmsNormWebgpu,
@@ -37,29 +37,29 @@ pub struct LinearLayer {
     delta_rule: DeltaRuleWebgpu,
     recurrent_state_buffer: wgpu::Buffer,
     attn_output_buffer: wgpu::Buffer,
-    gated_norm: GatedRmsNormWebgpu,
+    gated_norm: GatedRmsNormInplaceWebgpu,
     out_proj_mat_mul: MulMatWebgpu,
     out_proj_buffer: wgpu::Buffer,
-    attn_residual_add: ElementwiseAddWebgpu,
+    attn_residual_add: ElementwiseAddInplaceWebgpu,
     post_attention_layernorm: RmsNormWebgpu,
     mlp_gate_proj_mul_mat: MulMatWebgpu,
     mlp_gate_proj_buffer: wgpu::Buffer,
     mlp_up_proj_mul_mat: MulMatWebgpu,
     mlp_up_proj_buffer: wgpu::Buffer,
-    mlp_silu_mul: SiluMulWebgpu,
+    mlp_silu_mul: SiluMulInplaceWebgpu,
     mlp_down_proj_mul_mat: MulMatWebgpu,
     mlp_down_proj_buffer: wgpu::Buffer,
-    mlp_residual_add: ElementwiseAddWebgpu,
+    mlp_residual_add: ElementwiseAddInplaceWebgpu,
 }
 
-impl LinearLayer {
+impl LinearAttentionLayer {
     pub fn new<'data>(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         tensor: &SafeTensors<'data>,
         weight_prefix: String,
         hidden_size: usize,
-        config: &LinearLayerConfig,
+        config: &LinearAttentionConfig,
         seq_len: usize,
     ) -> Self {
         let input_layernorm_weight_name = format!("{}.input_layernorm.weight", weight_prefix);
@@ -71,7 +71,7 @@ impl LinearLayer {
         let input_layernorm =
             RmsNormWebgpu::new(device, queue, input_layernorm_weight, hidden_size);
         let normed_embedding_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_layer/normed_embedding_buffer"),
+            label: Some("linear_attention_layer/normed_embedding_buffer"),
             size: (seq_len * hidden_size * std::mem::size_of::<f32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
@@ -86,7 +86,7 @@ impl LinearLayer {
         let qkv_weight_height = qkv_weight.shape()[0] as usize;
         let in_proj_qkv_mul_mat = MulMatWebgpu::new(device, queue, qkv_weight, hidden_size);
         let in_proj_qkv_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_layer/in_proj_qkv_buffer"),
+            label: Some("linear_attention_layer/in_proj_qkv_buffer"),
             size: (seq_len * qkv_weight_height * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
@@ -102,7 +102,7 @@ impl LinearLayer {
         let in_proj_z_weight_height = in_proj_z_weight.shape()[0] as usize;
         let in_proj_z_mul_mat = MulMatWebgpu::new(device, queue, in_proj_z_weight, hidden_size);
         let in_proj_z_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_layer/in_proj_z_buffer"),
+            label: Some("linear_attention_layer/in_proj_z_buffer"),
             size: (seq_len * in_proj_z_weight_height * std::mem::size_of::<f32>())
                 as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::STORAGE
@@ -119,7 +119,7 @@ impl LinearLayer {
         let in_proj_a_weight_height = in_proj_a_weight.shape()[0] as usize;
         let in_proj_a_mul_mat = MulMatWebgpu::new(device, queue, in_proj_a_weight, hidden_size);
         let in_proj_a_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_layer/in_proj_a_buffer"),
+            label: Some("linear_attention_layer/in_proj_a_buffer"),
             size: (seq_len * in_proj_a_weight_height * std::mem::size_of::<f32>())
                 as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::STORAGE
@@ -136,7 +136,7 @@ impl LinearLayer {
         let in_proj_b_weight_height = in_proj_b_weight.shape()[0] as usize;
         let in_proj_b_mul_mat = MulMatWebgpu::new(device, queue, in_proj_b_weight, hidden_size);
         let in_proj_b_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_layer/in_proj_b_buffer"),
+            label: Some("linear_attention_layer/in_proj_b_buffer"),
             size: (seq_len * in_proj_b_weight_height * std::mem::size_of::<f32>())
                 as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::STORAGE
@@ -166,7 +166,7 @@ impl LinearLayer {
             ChannelMode::ConvSilu,
         );
         let conv_qkv_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_layer/conv_qkv_buffer"),
+            label: Some("linear_attention_layer/conv_qkv_buffer"),
             size: (seq_len * qkv_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
@@ -192,7 +192,7 @@ impl LinearLayer {
             config.linear_value_head_dim,
         );
         let recurrent_state_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_layer/recurrent_state_buffer"),
+            label: Some("linear_attention_layer/recurrent_state_buffer"),
             size: (config.linear_num_key_heads
                 * config.linear_key_head_dim
                 * config.linear_value_head_dim
@@ -203,7 +203,7 @@ impl LinearLayer {
             mapped_at_creation: false,
         });
         let attn_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_layer/attn_output_buffer"),
+            label: Some("linear_attention_layer/attn_output_buffer"),
             size: (seq_len * v_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
@@ -215,7 +215,7 @@ impl LinearLayer {
             .tensor(&norm_weight_name)
             .expect(&format!("Failed to get tensor for {}", norm_weight_name));
         log_tensor(&norm_weight_name, &norm_weight);
-        let gated_norm = GatedRmsNormWebgpu::new(
+        let gated_norm = GatedRmsNormInplaceWebgpu::new(
             &device,
             norm_weight,
             config.linear_num_value_heads,
@@ -230,14 +230,14 @@ impl LinearLayer {
         log_tensor(&out_proj_weight_name, &out_proj_weight);
         let out_proj_mat_mul = MulMatWebgpu::new(&device, &queue, out_proj_weight, v_dim);
         let out_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_layer/out_proj_buffer"),
+            label: Some("linear_attention_layer/out_proj_buffer"),
             size: (seq_len * hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let attn_residual_add = ElementwiseAddWebgpu::new(&device, hidden_size);
+        let attn_residual_add = ElementwiseAddInplaceWebgpu::new(&device, hidden_size);
         let post_attention_layernorm_weight_name =
             format!("{}.post_attention_layernorm.weight", weight_prefix);
         let post_attention_layernorm_weight = tensor
@@ -262,7 +262,7 @@ impl LinearLayer {
         let mlp_gate_proj_mul_mat =
             MulMatWebgpu::new(&device, &queue, mlp_gate_proj_weight, hidden_size);
         let mlp_gate_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_layer/mlp_gate_proj_buffer"),
+            label: Some("linear_attention_layer/mlp_gate_proj_buffer"),
             size: (seq_len * mlp_gate_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
@@ -278,14 +278,14 @@ impl LinearLayer {
         let mlp_up_proj_mul_mat =
             MulMatWebgpu::new(&device, &queue, mlp_up_proj_weight, hidden_size);
         let mlp_up_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_layer/mlp_up_proj_buffer"),
+            label: Some("linear_attention_layer/mlp_up_proj_buffer"),
             size: (seq_len * mlp_gate_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let mlp_silu_mul = SiluMulWebgpu::new(&device, mlp_gate_dim);
+        let mlp_silu_mul = SiluMulInplaceWebgpu::new(&device, mlp_gate_dim);
         let mlp_down_proj_weight_name = format!("{}.mlp.down_proj.weight", weight_prefix);
         let mlp_down_proj_weight = tensor.tensor(&mlp_down_proj_weight_name).expect(&format!(
             "Failed to get tensor for {}",
@@ -295,14 +295,14 @@ impl LinearLayer {
         let mlp_down_proj_mul_mat =
             MulMatWebgpu::new(&device, &queue, mlp_down_proj_weight, mlp_gate_dim);
         let mlp_down_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_layer/mlp_down_proj_buffer"),
+            label: Some("linear_attention_layer/mlp_down_proj_buffer"),
             size: (seq_len * hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let mlp_residual_add = ElementwiseAddWebgpu::new(&device, hidden_size);
+        let mlp_residual_add = ElementwiseAddInplaceWebgpu::new(&device, hidden_size);
         Self {
             hidden_size,
             input_layernorm,
@@ -458,5 +458,125 @@ impl LinearLayer {
             &self.mlp_down_proj_buffer,
             seq_len,
         );
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SelfAttentionConfig {
+    pub num_attention_heads: usize,
+    pub head_dim: usize,
+}
+
+pub struct SelfAttentionLayer {
+    hidden_size: usize,
+
+    input_layernorm: RmsNormWebgpu,
+    normed_embedding_buffer: wgpu::Buffer,
+    q_proj_mul_mat: MulMatWebgpu,
+    q_proj_buffer: wgpu::Buffer,
+    k_proj_mul_mat: MulMatWebgpu,
+    k_proj_buffer: wgpu::Buffer,
+    v_proj_mul_mat: MulMatWebgpu,
+    v_proj_buffer: wgpu::Buffer,
+    q_norm: RmsNormInplaceWebgpu,
+    k_norm: RmsNormInplaceWebgpu,
+}
+
+impl SelfAttentionLayer {
+    pub fn new<'data>(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tensor: &SafeTensors<'data>,
+        weight_prefix: String,
+        hidden_size: usize,
+        config: &SelfAttentionConfig,
+        seq_len: usize,
+    ) -> Self {
+        let input_layernorm_weight_name = format!("{}.input_layernorm.weight", weight_prefix);
+        let input_layernorm_weight = tensor.tensor(&input_layernorm_weight_name).expect(&format!(
+            "Failed to get tensor for {}",
+            input_layernorm_weight_name
+        ));
+        log_tensor(&input_layernorm_weight_name, &input_layernorm_weight);
+        let input_layernorm =
+            RmsNormWebgpu::new(device, queue, input_layernorm_weight, hidden_size);
+        let normed_embedding_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("self_attention_layer/normed_embedding_buffer"),
+            size: (seq_len * hidden_size * std::mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let q_proj_weight_name = format!("{}.self_attn.q_proj.weight", weight_prefix);
+        let q_proj_weight = tensor
+            .tensor(&q_proj_weight_name)
+            .expect(&format!("Failed to get tensor for {}", q_proj_weight_name));
+        let q_proj_weight_height = q_proj_weight.shape()[0] as usize;
+        log_tensor(&q_proj_weight_name, &q_proj_weight);
+        let q_proj_mul_mat = MulMatWebgpu::new(device, queue, q_proj_weight, hidden_size);
+        let q_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("self_attention_layer/q_proj_buffer"),
+            size: (seq_len * q_proj_weight_height * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let k_proj_weight_name = format!("{}.self_attn.k_proj.weight", weight_prefix);
+        let k_proj_weight = tensor
+            .tensor(&k_proj_weight_name)
+            .expect(&format!("Failed to get tensor for {}", k_proj_weight_name));
+        let k_proj_weight_height = k_proj_weight.shape()[0] as usize;
+        log_tensor(&k_proj_weight_name, &k_proj_weight);
+        let k_proj_mul_mat = MulMatWebgpu::new(device, queue, k_proj_weight, hidden_size);
+        let k_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("self_attention_layer/k_proj_buffer"),
+            size: (seq_len * k_proj_weight_height * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let v_proj_weight_name = format!("{}.self_attn.v_proj.weight", weight_prefix);
+        let v_proj_weight = tensor
+            .tensor(&v_proj_weight_name)
+            .expect(&format!("Failed to get tensor for {}", v_proj_weight_name));
+        let v_proj_weight_height = v_proj_weight.shape()[0] as usize;
+        log_tensor(&v_proj_weight_name, &v_proj_weight);
+        let v_proj_mul_mat = MulMatWebgpu::new(device, queue, v_proj_weight, hidden_size);
+        let v_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("self_attention_layer/v_proj_buffer"),
+            size: (seq_len * v_proj_weight_height * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let q_norm_weight_name = format!("{}.self_attn.q_norm.weight", weight_prefix);
+        let q_norm_weight = tensor
+            .tensor(&q_norm_weight_name)
+            .expect(&format!("Failed to get tensor for {}", q_norm_weight_name));
+        log_tensor(&q_norm_weight_name, &q_norm_weight);
+        let q_norm = RmsNormInplaceWebgpu::new(device, queue, q_norm_weight, config.head_dim);
+        let k_norm_weight_name = format!("{}.self_attn.k_norm.weight", weight_prefix);
+        let k_norm_weight = tensor
+            .tensor(&k_norm_weight_name)
+            .expect(&format!("Failed to get tensor for {}", k_norm_weight_name));
+        log_tensor(&k_norm_weight_name, &k_norm_weight);
+        let k_norm = RmsNormInplaceWebgpu::new(device, queue, k_norm_weight, config.head_dim);
+        Self {
+            hidden_size,
+            input_layernorm,
+            normed_embedding_buffer,
+            q_proj_mul_mat,
+            q_proj_buffer,
+            k_proj_mul_mat,
+            k_proj_buffer,
+            v_proj_mul_mat,
+            v_proj_buffer,
+            q_norm,
+            k_norm,
+        }
     }
 }

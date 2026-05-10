@@ -2,7 +2,7 @@
 
 ## Switch to multi-dimensional dispatch
 
-**Affected shaders**: All shaders currently using 1D `gid.x` as the sole thread index (e.g. `norm_scale.wgsl`, future shaders).
+**Affected shaders**: All shaders currently using 1D `gid.x` as the sole thread index (e.g. `get_rows.wgsl`, future shaders).
 
 **Problem**: When total elements exceed `u32::MAX` (~4.3B), single-dimension indexing overflows. This can happen with 1M+ context lengths on large hidden sizes (e.g. 1M × 12288 = 12.9B elements).
 
@@ -16,7 +16,7 @@ This also eliminates expensive 4D index decoding arithmetic (repeated division/m
 
 ## Switch to WebGPU native buffer offsets
 
-**Affected shaders**: All shaders currently using manual byte offset calculations to access buffer data (e.g. `norm_scale.wgsl`).
+**Affected shaders**: All shaders currently using manual byte offset calculations to access buffer data.
 
 **Problem**: Manual byte offset calculations are error-prone and less efficient than using WebGPU's native buffer binding with offsets.
 

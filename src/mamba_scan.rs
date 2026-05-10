@@ -15,26 +15,26 @@ pub struct MambaScanParams {
     q_offset: u32,
     k_offset: u32,
     v_offset: u32,
-    stride_qk_head: u32,   // = key_head_dim
-    stride_v_head: u32,    // = value_head_dim (may differ from key_head_dim)
-    stride_qkv_token: u32, // = num_key_heads * key_head_dim * 2 + num_value_heads * value_head_dim
+    qk_head_stride: u32,    // = key_head_dim
+    v_head_stride: u32,     // = value_head_dim (may differ from key_head_dim)
+    qkv_token_stride: u32,  // = num_key_heads * key_head_dim * 2 + num_value_heads * value_head_dim
 
     // Projection buffers (per-head scalars)
     proj_a_offset: u32,
-    stride_proj_a_token: u32, // = num_key_heads
+    proj_a_token_stride: u32, // = num_key_heads
     proj_b_offset: u32,
-    stride_proj_b_token: u32, // = num_key_heads
+    proj_b_token_stride: u32, // = num_key_heads
 
     // SSM params buffer (dt_bias and A_log packed together)
     dt_bias_offset: u32,
     a_log_offset: u32,
 
     // Output buffer
-    stride_dst_token: u32, // = num_key_heads * value_head_dim
-    stride_dst_head: u32,  // = value_head_dim
+    output_token_stride: u32, // = num_key_heads * value_head_dim
+    output_head_stride: u32,  // = value_head_dim
 
     // State buffer
-    stride_state_head: u32, // = key_head_dim * value_head_dim
+    state_head_stride: u32, // = key_head_dim * value_head_dim
 }
 
 pub struct MambaScanWebgpu {
@@ -216,19 +216,19 @@ impl MambaScanWebgpu {
             q_offset: 0,
             k_offset: self.key_head_dim * self.num_key_heads,
             v_offset: self.key_head_dim * self.num_key_heads * 2,
-            stride_qk_head: self.key_head_dim,
-            stride_v_head: self.value_head_dim,
-            stride_qkv_token: self.num_key_heads * self.key_head_dim * 2
+            qk_head_stride: self.key_head_dim,
+            v_head_stride: self.value_head_dim,
+            qkv_token_stride: self.num_key_heads * self.key_head_dim * 2
                 + self.num_key_heads * self.value_head_dim,
             proj_a_offset: 0,
-            stride_proj_a_token: self.num_key_heads,
+            proj_a_token_stride: self.num_key_heads,
             proj_b_offset: 0,
-            stride_proj_b_token: self.num_key_heads,
+            proj_b_token_stride: self.num_key_heads,
             dt_bias_offset: 0,
             a_log_offset: self.num_key_heads as u32,
-            stride_dst_token: (self.num_key_heads * self.value_head_dim) as u32,
-            stride_dst_head: self.value_head_dim as u32,
-            stride_state_head: (self.key_head_dim * self.value_head_dim) as u32,
+            output_token_stride: (self.num_key_heads * self.value_head_dim) as u32,
+            output_head_stride: self.value_head_dim as u32,
+            state_head_stride: (self.key_head_dim * self.value_head_dim) as u32,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[params]));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {

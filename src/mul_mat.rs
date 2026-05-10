@@ -2,19 +2,15 @@ use safetensors::tensor::TensorView;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct MulMatUniform {
-    pub offset_src0: u32,
-    pub offset_src1: u32,
-    pub offset_dst: u32,
+pub struct MulMatParams {
+    pub weight_offset: u32,
+    pub input_offset: u32,
+    pub output_offset: u32,
     pub m: u32,
     pub n: u32,
     pub k: u32,
-    pub stride_src0_1: u32,
-    pub stride_src0_2: u32,
-    pub stride_src0_3: u32,
-    pub stride_src1_1: u32,
-    pub stride_src1_2: u32,
-    pub stride_src1_3: u32,
+    pub weight_row_stride: u32,
+    pub input_row_stride: u32,
 }
 
 pub struct MulMatWebgpu {
@@ -111,7 +107,7 @@ impl MulMatWebgpu {
         });
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mul_mat/uniform_buffer"),
-            size: std::mem::size_of::<MulMatUniform>() as u64,
+            size: std::mem::size_of::<MulMatParams>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -140,19 +136,15 @@ impl MulMatWebgpu {
     }
 
     pub fn compute(&self, device: &wgpu::Device, queue: &wgpu::Queue, mat_src1_buffer: &wgpu::Buffer, mat_dst_buffer: &wgpu::Buffer, n_rows: usize) {
-        let uniform = MulMatUniform {
-            offset_src0: 0,
-            offset_src1: 0,
-            offset_dst: 0,
+        let uniform = MulMatParams {
+            weight_offset: 0,
+            input_offset: 0,
+            output_offset: 0,
             m: self.m_size as u32,
             n: n_rows as u32,
             k: self.hidden_size as u32,
-            stride_src0_1: self.hidden_size as u32,
-            stride_src0_2: self.hidden_size as u32 * self.m_size as u32,
-            stride_src0_3: 0,
-            stride_src1_1: self.hidden_size as u32,
-            stride_src1_2: self.hidden_size as u32 * n_rows as u32,
-            stride_src1_3: 0,
+            weight_row_stride: self.hidden_size as u32,
+            input_row_stride: self.hidden_size as u32,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniform]));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {

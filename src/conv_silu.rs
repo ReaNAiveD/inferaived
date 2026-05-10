@@ -14,13 +14,13 @@ pub struct ConvSiluParams {
     kernel_size: u32,
 
     // Elements between consecutive tokens (>= q_dim + k_dim + v_dim when padded)
-    stride_src_token: u32,
-    stride_dst_token: u32,
+    input_token_stride: u32,
+    output_token_stride: u32,
 
-    // Per-group mode: 0 = copy, 1 = conv1d + silu
-    q_mode: u32,
-    k_mode: u32,
-    v_mode: u32,
+    // Per-group flag: 0 = passthrough copy, 1 = conv1d + silu
+    q_apply_conv: u32,
+    k_apply_conv: u32,
+    v_apply_conv: u32,
 }
 
 /// Per-channel-group processing mode for ConvSilu.
@@ -167,11 +167,11 @@ impl ConvSiluWebgpu {
             v_dim: self.v_dim as u32,
             seq_len: seq_len as u32,
             kernel_size: self.kernel_size as u32,
-            stride_src_token: num_channels as u32,
-            stride_dst_token: num_channels as u32,
-            q_mode: self.q_mode as u32,
-            k_mode: self.k_mode as u32,
-            v_mode: self.v_mode as u32,
+            input_token_stride: num_channels as u32,
+            output_token_stride: num_channels as u32,
+            q_apply_conv: self.q_mode as u32,
+            k_apply_conv: self.k_mode as u32,
+            v_apply_conv: self.v_mode as u32,
         };
         queue.write_buffer(
             &self.uniform_buffer,

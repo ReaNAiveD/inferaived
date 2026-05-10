@@ -1,101 +1,59 @@
-// WGSL's f16 is IEEE 754 half-precision, but Qwen 3.5 uses bf16 (brain float 16 — same exponent range as f32 but only 8 bits of mantissa). These are different formats.
-
-// Source matrix, stored as a flat array<u32> in row-major order.
-// The u32 values are packed pairs of f16 (or bf16) values, so each u32 contains two elements of the logical matrix. The shader will unpack these into f32 in the destination.
-// Logical shape: [num_rows, ne0] (e.g. [vocab_size, hidden_size]).
-// Row `r` starts at src[offset_src + r * stride_src1] and contains ne0 contiguous f16 values.
+// Source matrix: stored as a flat array<u32> in row-major order.
+// Each u32 packs two bf16 values, so each u32 holds two elements of the logical matrix.
+// Logical shape: [num_source_rows, hidden_size] (e.g. [vocab_size, hidden_size]).
+// Row `r` starts at `source[source_offset + r * source_row_stride]`.
+// `source_row_stride` is in u32 units = hidden_size / 2.
 @group(0) @binding(0)
-var<storage, read> src: array<u32>;
-// Index vector, stored as array<i32>.
-// Logical shape: [n_rows] (optionally [idx1, idx2] for batched indexing).
-// Each element is a row index into src, specifying which row to gather.
-// For embedding lookup, these are token IDs from the tokenizer.
+var<storage, read> source: array<u32>;
+// Index vector: array<i32> of length `num_tokens`. Each entry is a row index into `source`.
 @group(0) @binding(1)
-var<storage, read> idx: array<i32>;
-// Destination matrix, stored as a flat array<f32> in row-major order.
-// Logical shape: [n_rows, ne0] (e.g. [n_tokens, hidden_size]).
-// Row `i` of dst receives a copy of src row idx[i].
+var<storage, read> indices: array<i32>;
+// Destination matrix: [num_tokens, hidden_size] in f32, row-major.
+// Row i of `output` receives a copy of source row `indices[i]`.
 @group(0) @binding(2)
-var<storage, read_write> dst: array<f32>;
+var<storage, read_write> output: array<f32>;
 
 struct Params {
-    offset_src: u32, // in elements
-    offset_idx: u32, // in elements
-    offset_dst: u32, // in elements
+    source_offset: u32,       // in u32 elements
+    source_row_stride: u32,   // in u32 elements (= hidden_size / 2)
+    indices_offset: u32,      // in i32 elements
+    output_offset: u32,       // in f32 elements
+    output_row_stride: u32,   // in f32 elements
 
-    // Strides (in elements)
-    stride_src1: u32,
-    stride_src2: u32,
-    stride_src3: u32,
-
-    stride_idx0: u32,
-    stride_idx1: u32,
-    stride_idx2: u32,
-
-    stride_dst1: u32,
-    stride_dst2: u32,
-    stride_dst3: u32,
-
-    // Shape of dst
-    ne0: u32,
-    n_rows: u32,
-    ne2: u32,
-    ne3: u32,
-
-    // Shape of idx
-    idx1: u32,
-    idx2: u32,
+    hidden_size: u32,
+    num_tokens: u32,
 };
 
 @group(0) @binding(3)
 var<uniform> params: Params;
 
-// Copies one f16 element from src to dst, given the base addresses and the offset in elements.
-fn copy_elements(src_base: u32, dst_base: u32, offset: u32) {
-    let packed = src[src_base + offset / 2u];
+// Copies one bf16 element from source to output, given the base addresses and the offset in elements.
+fn copy_element(source_base: u32, output_base: u32, offset: u32) {
+    let packed = source[source_base + offset / 2u];
     if (offset % 2 == 0u) {
         // Even offset: lower 16 bits contain a bf16 value.
         // bf16 is the upper 16 bits of an f32, so shift left by 16.
         let bf16_bits = packed & 0xFFFFu;
-        dst[dst_base + offset] = bitcast<f32>(bf16_bits << 16u);
+        output[output_base + offset] = bitcast<f32>(bf16_bits << 16u);
     } else {
         // Odd offset: upper 16 bits contain a bf16 value.
-        // Already in the upper half, just mask off the lower bits.
         let bf16_bits = packed & 0xFFFF0000u;
-        dst[dst_base + offset] = bitcast<f32>(bf16_bits);
+        output[output_base + offset] = bitcast<f32>(bf16_bits);
     }
 }
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    if (global_id.x >= params.n_rows * params.ne2 * params.ne3) {
+    let token = global_id.x;
+    if (token >= params.num_tokens) {
         return;
     }
-    let idx_dst3 = global_id.x / (params.n_rows * params.ne2);
-    let idx_dst2 = (global_id.x % (params.n_rows * params.ne2)) / params.n_rows;
-    let idx_dst1 = global_id.x % params.n_rows;
 
-    let idx_idx2 = idx_dst3 % params.idx2;
-    let idx_idx1 = idx_dst2 % params.idx1;
-    let idx_idx0 = idx_dst1;
+    let row_idx = u32(indices[params.indices_offset + token]);
+    let source_base = params.source_offset + row_idx * params.source_row_stride;
+    let output_base = params.output_offset + token * params.output_row_stride;
 
-    let idx_idx = params.offset_idx
-        + idx_idx0 * params.stride_idx0
-        + idx_idx1 * params.stride_idx1
-        + idx_idx2 * params.stride_idx2;
-    
-    let idx_val = u32(idx[idx_idx]);
-
-    let idx_src = params.offset_src
-        + idx_val * params.stride_src1
-        + idx_dst2 * params.stride_src2
-        + idx_dst3 * params.stride_src3;
-    let dst_idx = params.offset_dst
-        + idx_dst1 * params.stride_dst1
-        + idx_dst2 * params.stride_dst2
-        + idx_dst3 * params.stride_dst3;
-
-    for (var i: u32 = 0u; i < params.ne0; i = i + 1u) {
-        copy_elements(idx_src, dst_idx, i);
+    for (var i: u32 = 0u; i < params.hidden_size; i = i + 1u) {
+        copy_element(source_base, output_base, i);
     }
 }

@@ -9,32 +9,14 @@ use wgpu::{
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct GetRowsParams {
-    offset_src: u32, // in elements
-    offset_idx: u32, // in elements
-    offset_dst: u32, // in elements
+    source_offset: u32,        // in u32 elements
+    source_row_stride: u32,    // in u32 elements (= hidden_size / 2)
+    indices_offset: u32,       // in i32 elements
+    output_offset: u32,        // in f32 elements
+    output_row_stride: u32,    // in f32 elements
 
-    // Strides (in elements)
-    stride_src1: u32,
-    stride_src2: u32,
-    stride_src3: u32,
-
-    stride_idx0: u32,
-    stride_idx1: u32,
-    stride_idx2: u32,
-
-    stride_dst1: u32,
-    stride_dst2: u32,
-    stride_dst3: u32,
-
-    // Shape of dst
-    ne0: u32,
-    n_rows: u32,
-    ne2: u32,
-    ne3: u32,
-
-    // Shape of idx
-    idx1: u32,
-    idx2: u32,
+    hidden_size: u32,
+    num_tokens: u32,
 }
 
 pub struct EmbeddingLookupWebgpu {
@@ -155,28 +137,17 @@ impl EmbeddingLookupWebgpu {
             contents: bytemuck::cast_slice(input_encoding.get_ids()),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
-        // stride_src1 is in u32 units: each u32 packs two bf16 values,
+        // source_row_stride is in u32 units: each u32 packs two bf16 values,
         // so a row of hidden_size bf16 elements = hidden_size/2 u32s.
         let n_rows = input_encoding.get_ids().len();
         queue.write_buffer(&self.uniform_buffer, 0u64, bytemuck::cast_slice(&[GetRowsParams {
-            offset_src: 0,
-            offset_idx: 0,
-            offset_dst: 0,
-            stride_src1: (self.hidden_size / 2) as u32,
-            stride_src2: ((self.hidden_size / 2) * n_rows) as u32,
-            stride_src3: 0,
-            stride_idx0: 1u32,
-            stride_idx1: n_rows as u32,
-            stride_idx2: 0,
-            stride_dst1: self.hidden_size as u32,
-            stride_dst2: (self.hidden_size * n_rows) as u32,
-            stride_dst3: 0,
-            ne0: self.hidden_size as u32,
-            n_rows: n_rows as u32,
-            ne2: 1,
-            ne3: 1,
-            idx1: n_rows as u32,
-            idx2: 1,
+            source_offset: 0,
+            source_row_stride: (self.hidden_size / 2) as u32,
+            indices_offset: 0,
+            output_offset: 0,
+            output_row_stride: self.hidden_size as u32,
+            hidden_size: self.hidden_size as u32,
+            num_tokens: n_rows as u32,
         }]));
         let mut command_encoder = device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("embedding_lookup/command_encoder"),

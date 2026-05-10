@@ -3,25 +3,25 @@ use wgpu::util::DeviceExt;
 
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
-pub struct GatedRmsNormUniform {
-    num_value_heads: u32,
-    value_head_dim: u32,
+pub struct GatedRmsNormParams {
+    num_heads: u32,
+    head_dim: u32,
     seq_len: u32,
 
-    src_offset: u32,
-    stride_src_token: u32,
-    stride_src_head: u32,
+    hidden_offset: u32,
+    hidden_token_stride: u32,
+    hidden_head_stride: u32,
 
     gate_offset: u32,
-    stride_gate_token: u32,
-    stride_gate_head: u32,
+    gate_token_stride: u32,
+    gate_head_stride: u32,
 
     weight_offset: u32,
 
     eps: f32,
 }
 
-pub struct GatedRmsNormWebgpu {
+pub struct GatedRmsNormInplaceWebgpu {
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
     weight_buffer: wgpu::Buffer,
@@ -32,7 +32,7 @@ pub struct GatedRmsNormWebgpu {
     epsilon: f32,
 }
 
-impl GatedRmsNormWebgpu {
+impl GatedRmsNormInplaceWebgpu {
     pub fn new<'data>(
         device: &wgpu::Device,
         weight_tensor: TensorView<'data>,
@@ -120,7 +120,7 @@ impl GatedRmsNormWebgpu {
         });
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gated_rms_norm/uniform_buffer"),
-            size: std::mem::size_of::<GatedRmsNormUniform>() as u64,
+            size: std::mem::size_of::<GatedRmsNormParams>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -136,16 +136,16 @@ impl GatedRmsNormWebgpu {
     }
 
     pub fn compute(&self, device: &wgpu::Device, queue: &wgpu::Queue, src_buffer: &wgpu::Buffer, gate_buffer: &wgpu::Buffer, seq_len: usize) {
-        let uniform = GatedRmsNormUniform {
-            num_value_heads: self.num_value_heads as u32,
-            value_head_dim: self.value_head_dim as u32,
+        let uniform = GatedRmsNormParams {
+            num_heads: self.num_value_heads as u32,
+            head_dim: self.value_head_dim as u32,
             seq_len: seq_len as u32,
-            src_offset: 0,
-            stride_src_token: self.num_value_heads as u32 * self.value_head_dim as u32,
-            stride_src_head: self.value_head_dim as u32,
+            hidden_offset: 0,
+            hidden_token_stride: self.num_value_heads as u32 * self.value_head_dim as u32,
+            hidden_head_stride: self.value_head_dim as u32,
             gate_offset: 0,
-            stride_gate_token: self.num_value_heads as u32 * self.value_head_dim as u32,
-            stride_gate_head: self.value_head_dim as u32,
+            gate_token_stride: self.num_value_heads as u32 * self.value_head_dim as u32,
+            gate_head_stride: self.value_head_dim as u32,
             weight_offset: 0,
             eps: self.epsilon,
         };

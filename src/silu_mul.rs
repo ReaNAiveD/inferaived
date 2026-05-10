@@ -1,16 +1,16 @@
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
-pub struct SiluMulUniform {
-    src_offset: u32,
-    stride_src_token: u32,
+pub struct SiluMulParams {
+    hidden_offset: u32,
+    hidden_token_stride: u32,
     gate_offset: u32,
-    stride_gate_token: u32,
+    gate_token_stride: u32,
 
     hidden_size: u32,
     seq_len: u32,
 }
 
-pub struct SiluMulWebgpu {
+pub struct SiluMulInplaceWebgpu {
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
     uniform_buffer: wgpu::Buffer,
@@ -18,7 +18,7 @@ pub struct SiluMulWebgpu {
     hidden_size: usize,
 }
 
-impl SiluMulWebgpu {
+impl SiluMulInplaceWebgpu {
     pub fn new(device: &wgpu::Device, hidden_size: usize) -> Self {
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("silu_mul/shader"),
@@ -77,7 +77,7 @@ impl SiluMulWebgpu {
         });
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("silu_mul/uniform_buffer"),
-            size: std::mem::size_of::<SiluMulUniform
+            size: std::mem::size_of::<SiluMulParams
                 >() as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -92,11 +92,11 @@ impl SiluMulWebgpu {
 
     
     pub fn compute(&self, device: &wgpu::Device, queue: &wgpu::Queue, src_buffer: &wgpu::Buffer, gate_buffer: &wgpu::Buffer, seq_len: usize) {
-        let uniform = SiluMulUniform {
-            src_offset: 0,
-            stride_src_token: self.hidden_size as u32,
+        let uniform = SiluMulParams {
+            hidden_offset: 0,
+            hidden_token_stride: self.hidden_size as u32,
             gate_offset: 0,
-            stride_gate_token: self.hidden_size as u32,
+            gate_token_stride: self.hidden_size as u32,
             hidden_size: self.hidden_size as u32,
             seq_len: seq_len as u32,
         };

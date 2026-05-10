@@ -8,6 +8,7 @@ use crate::{
     log_tensor,
     mul_mat::MulMatWebgpu,
     norm::{RmsNormInplaceWebgpu, RmsNormWebgpu},
+    rope::RopeInplaceWebgpu,
     silu_mul::SiluMulInplaceWebgpu,
 };
 
@@ -464,7 +465,10 @@ impl LinearAttentionLayer {
 #[derive(Debug, Clone, Copy)]
 pub struct SelfAttentionConfig {
     pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
     pub head_dim: usize,
+    pub rope_theta: f32,
+    pub partial_rotary_factor: f32,
 }
 
 pub struct SelfAttentionLayer {
@@ -480,6 +484,7 @@ pub struct SelfAttentionLayer {
     v_proj_buffer: wgpu::Buffer,
     q_norm: RmsNormInplaceWebgpu,
     k_norm: RmsNormInplaceWebgpu,
+    rope: RopeInplaceWebgpu,
 }
 
 impl SelfAttentionLayer {
@@ -517,7 +522,8 @@ impl SelfAttentionLayer {
         let q_proj_mul_mat = MulMatWebgpu::new(device, queue, q_proj_weight, hidden_size);
         let q_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("self_attention_layer/q_proj_buffer"),
-            size: (seq_len * q_proj_weight_height * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            size: (seq_len * q_proj_weight_height * std::mem::size_of::<f32>())
+                as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
@@ -532,7 +538,8 @@ impl SelfAttentionLayer {
         let k_proj_mul_mat = MulMatWebgpu::new(device, queue, k_proj_weight, hidden_size);
         let k_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("self_attention_layer/k_proj_buffer"),
-            size: (seq_len * k_proj_weight_height * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            size: (seq_len * k_proj_weight_height * std::mem::size_of::<f32>())
+                as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
@@ -547,7 +554,8 @@ impl SelfAttentionLayer {
         let v_proj_mul_mat = MulMatWebgpu::new(device, queue, v_proj_weight, hidden_size);
         let v_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("self_attention_layer/v_proj_buffer"),
-            size: (seq_len * v_proj_weight_height * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            size: (seq_len * v_proj_weight_height * std::mem::size_of::<f32>())
+                as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
@@ -565,6 +573,14 @@ impl SelfAttentionLayer {
             .expect(&format!("Failed to get tensor for {}", k_norm_weight_name));
         log_tensor(&k_norm_weight_name, &k_norm_weight);
         let k_norm = RmsNormInplaceWebgpu::new(device, queue, k_norm_weight, config.head_dim);
+        let rope = RopeInplaceWebgpu::new(
+            device,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.head_dim,
+            config.rope_theta,
+            config.partial_rotary_factor,
+        );
         Self {
             hidden_size,
             input_layernorm,
@@ -577,6 +593,7 @@ impl SelfAttentionLayer {
             v_proj_buffer,
             q_norm,
             k_norm,
+            rope,
         }
     }
 }

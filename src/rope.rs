@@ -1,14 +1,20 @@
+/// Mirrors `Params` in `wgsl-shaders/rope.wgsl` exactly. Field order and
+/// count must stay in sync with the shader's uniform struct.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RopeParams {
     q_offset: u32,
+    q_token_stride: u32,
+    q_head_stride: u32,
     k_offset: u32,
-    token_stride: u32,
-    head_stride: u32,
-    head_dim: u32,
-    num_heads: u32,
+    k_token_stride: u32,
+    k_head_stride: u32,
+
+    num_q_heads: u32,
+    num_k_heads: u32,
     seq_len: u32,
     num_rotated_dims: u32,
+
     theta_scale: f32,
     position_offset: u32,
 }
@@ -18,18 +24,20 @@ pub struct RopeInplaceWebgpu {
     pipeline: wgpu::ComputePipeline,
     uniform_buffer: wgpu::Buffer,
     head_dim: usize,
-    num_heads: usize,
-    qkv_dim: usize,
-    n_dims: usize,
+    num_q_heads: usize,
+    num_k_heads: usize,
+    num_rotated_dims: usize,
     theta_scale: f32,
 }
 
 impl RopeInplaceWebgpu {
+    const WORKGROUP_SIZE: u32 = 256;
+
     pub fn new(
         device: &wgpu::Device,
+        num_q_heads: usize,
+        num_k_heads: usize,
         head_dim: usize,
-        num_heads: usize,
-        qkv_dim: usize,
         rope_theta: f32,
         partial_rotary_factor: f32,
     ) -> Self {
@@ -54,6 +62,16 @@ impl RopeInplaceWebgpu {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -83,51 +101,63 @@ impl RopeInplaceWebgpu {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let n_dims = (head_dim as f32 * partial_rotary_factor).floor() as usize;
-        let theta_scale = rope_theta.powf(-2f32 / n_dims as f32);
+        let num_rotated_dims = (head_dim as f32 * partial_rotary_factor).floor() as usize;
+        let theta_scale = rope_theta.powf(-2f32 / num_rotated_dims as f32);
         Self {
             bind_group_layout,
             pipeline,
             uniform_buffer,
             head_dim,
-            qkv_dim,
-            num_heads,
-            n_dims,
+            num_q_heads,
+            num_k_heads,
+            num_rotated_dims,
             theta_scale,
         }
     }
 
+    /// Apply RoPE in-place to Q and K.
+    ///
+    /// Both buffers are assumed to be tightly packed `[seq, num_*_heads, head_dim]`
+    /// in row-major layout starting at offset 0.
     pub fn compute(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        src_buffer: &wgpu::Buffer,
+        q_buffer: &wgpu::Buffer,
+        k_buffer: &wgpu::Buffer,
         seq_len: usize,
-        pos_offset: usize,
+        position_offset: usize,
     ) {
+        let head_dim = self.head_dim as u32;
         let uniform_data = RopeParams {
             q_offset: 0,
-            k_offset: (self.head_dim * self.num_heads) as u32,
-            token_stride: self.qkv_dim as u32,
-            head_stride: self.head_dim as u32,
-            head_dim: self.head_dim as u32,
-            num_heads: self.num_heads as u32,
+            q_token_stride: self.num_q_heads as u32 * head_dim,
+            q_head_stride: head_dim,
+            k_offset: 0,
+            k_token_stride: self.num_k_heads as u32 * head_dim,
+            k_head_stride: head_dim,
+            num_q_heads: self.num_q_heads as u32,
+            num_k_heads: self.num_k_heads as u32,
             seq_len: seq_len as u32,
-            num_rotated_dims: self.n_dims as u32,
+            num_rotated_dims: self.num_rotated_dims as u32,
             theta_scale: self.theta_scale,
-            position_offset: pos_offset as u32,
+            position_offset: position_offset as u32,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniform_data]));
-         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rope/bind_group"),
             layout: &self.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: src_buffer.as_entire_binding(),
+                    resource: q_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
+                    resource: k_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
                     resource: self.uniform_buffer.as_entire_binding(),
                 },
             ],
@@ -142,9 +172,11 @@ impl RopeInplaceWebgpu {
             });
             compute_pass.set_pipeline(&self.pipeline);
             compute_pass.set_bind_group(0, &bind_group, &[]);
-            let total_invocations = (self.n_dims / 2) * self.num_heads * seq_len;
-            let workgroup_size = 256usize;
-            let workgroup_count = (total_invocations / workgroup_size) as u32 + 1;
+            let max_heads = self.num_q_heads.max(self.num_k_heads);
+            let total_invocations =
+                ((self.num_rotated_dims / 2) * max_heads * seq_len) as u32;
+            let workgroup_count =
+                (total_invocations + Self::WORKGROUP_SIZE - 1) / Self::WORKGROUP_SIZE;
             compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
         }
         queue.submit(Some(encoder.finish()));

@@ -1,6 +1,6 @@
 use inferaived::{
     embedding_lookup::EmbeddingLookupCpu,
-    layer_loop::{LinearAttentionLayer, LinearAttentionConfig},
+    layer_loop::{LinearAttentionConfig, LinearAttentionLayer, SelfAttentionConfig, SelfAttentionLayer},
     log_tensor,
 };
 use safetensors::SafeTensors;
@@ -108,7 +108,7 @@ async fn main() {
     queue.write_buffer(&embeddings, 0, bytemuck::cast_slice(&result));
 
     let seq_len = encoded.get_ids().len();
-    let config = LinearAttentionConfig {
+    let linear_config = LinearAttentionConfig {
         linear_num_key_heads,
         linear_num_value_heads,
         linear_key_head_dim,
@@ -120,11 +120,28 @@ async fn main() {
         &device,
         &queue,
         &tensors,
-        "model.language_model.layers.0".to_string(),
+        "model.language_model.layers.0",
         hidden_size,
-        &config,
+        &linear_config,
         seq_len,
     );
     layer0.compute(&device, &queue, &embeddings, seq_len);
-    // embeddings now holds the final output of layer 0
+
+    let self_attention_config = SelfAttentionConfig {
+        num_attention_heads: 8,
+        num_key_value_heads: 2,
+        head_dim: 256,
+        rope_theta,
+        partial_rotary_factor,
+    };
+    let layer3 = SelfAttentionLayer::new(
+        &device,
+        &queue,
+        &tensors,
+        "model.language_model.layers.3",
+        hidden_size,
+        &self_attention_config,
+        seq_len,
+    );
+    layer3.compute(&device, &queue, &embeddings, seq_len);
 }

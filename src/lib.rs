@@ -1,3 +1,4 @@
+pub mod attention;
 pub mod binary;
 pub mod conv_silu;
 pub mod delta_rule;
@@ -6,9 +7,12 @@ pub mod gated_rms_norm;
 pub mod layer_loop;
 pub mod norm;
 pub mod mamba_scan;
+pub mod mlp;
 pub mod mul_mat;
 pub mod rope;
+pub mod sigmoid_mul;
 pub mod silu_mul;
+pub mod slice_copy;
 
 use tracing::debug;
 

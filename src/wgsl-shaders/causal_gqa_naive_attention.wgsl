@@ -17,7 +17,7 @@ struct Params {
     output_head_stride: u32,
 
     num_q_heads: u32,
-    num_k_heads: u32,
+    num_kv_heads: u32,
     q_dim: u32,
     v_dim: u32,
     seq_len: u32,
@@ -78,7 +78,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
     }
     let q_token = wg_id.x / params.num_q_heads;
     let q_head = wg_id.x % params.num_q_heads;
-    let num_q_per_kv = params.num_q_heads / params.num_k_heads;
+    let num_q_per_kv = params.num_q_heads / params.num_kv_heads;
     let kv_head = q_head / num_q_per_kv;
     let softmax_scale = inverseSqrt(f32(params.q_dim));
 

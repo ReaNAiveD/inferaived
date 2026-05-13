@@ -221,3 +221,59 @@ impl<'data> EmbeddingLookupCpu<'data> {
         }).collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu_test_utils::*;
+
+    /// CPU reference: for each token index, gather the row from the bf16
+    /// embedding table and convert to f32.
+    fn cpu_embedding_lookup(
+        embeddings_packed: &[u32],
+        indices: &[u32],
+        hidden_size: usize,
+    ) -> Vec<f32> {
+        let row_stride_u32 = hidden_size / 2;
+        let mut out = Vec::with_capacity(indices.len() * hidden_size);
+        for &idx in indices {
+            let base = (idx as usize) * row_stride_u32;
+            for i in 0..hidden_size {
+                out.push(unpack_bf16(&embeddings_packed, base * 2 + i));
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn test_embedding_lookup() {
+        let (device, queue) = gpu_or_skip!();
+        let vocab_size = 8;
+        let hidden_size = 16;
+        let embed_f32: Vec<f32> = (0..vocab_size * hidden_size)
+            .map(|i| (i as f32) * 0.1 - 3.0)
+            .collect();
+        let embed_bf16_bytes: Vec<u8> = embed_f32
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+
+        let indices: Vec<u32> = vec![0, 3, 7, 1];
+
+        let embed_packed = pack_f32_to_bf16_u32(&embed_f32);
+        let expected = cpu_embedding_lookup(&embed_packed, &indices, hidden_size);
+
+        let tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::BF16,
+            vec![vocab_size, hidden_size],
+            &embed_bf16_bytes,
+        )
+        .unwrap();
+        let gpu = EmbeddingLookupWebgpu::new(&device, &queue, tv, hidden_size);
+        let out_buf = create_f32_buffer(&device, indices.len() * hidden_size);
+        gpu.compute(&device, &queue, &indices, &out_buf);
+        let actual = download_f32(&device, &queue, &out_buf, indices.len() * hidden_size);
+
+        assert_approx_eq(&actual, &expected, 1e-5);
+    }
+}

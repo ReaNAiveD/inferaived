@@ -142,3 +142,47 @@ impl SiluMulInplaceWebgpu {
         queue.submit(Some(encoder.finish()));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu_test_utils::*;
+
+    fn silu(x: f32) -> f32 {
+        x / (1.0 + (-x).exp())
+    }
+
+    /// CPU: hidden[t,i] *= silu(gate[t,i])
+    fn cpu_silu_mul(hidden: &mut [f32], gate: &[f32], hidden_size: usize, seq_len: usize) {
+        for t in 0..seq_len {
+            for i in 0..hidden_size {
+                let idx = t * hidden_size + i;
+                hidden[idx] *= silu(gate[idx]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_silu_mul() {
+        let (device, queue) = gpu_or_skip!();
+        let seq_len = 3;
+        let hidden_size = 32;
+        let hidden: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32) * 0.05 - 1.0)
+            .collect();
+        let gate: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32) * -0.03 + 0.5)
+            .collect();
+
+        let mut expected = hidden.clone();
+        cpu_silu_mul(&mut expected, &gate, hidden_size, seq_len);
+
+        let gpu = SiluMulInplaceWebgpu::new(&device, hidden_size);
+        let h_buf = upload_f32(&device, &hidden);
+        let g_buf = upload_f32(&device, &gate);
+        gpu.compute(&device, &queue, &h_buf, &g_buf, seq_len);
+        let actual = download_f32(&device, &queue, &h_buf, seq_len * hidden_size);
+
+        assert_approx_eq(&actual, &expected, 1e-5);
+    }
+}

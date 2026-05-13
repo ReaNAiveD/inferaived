@@ -156,3 +156,73 @@ impl SliceCopyWebgpu {
         queue.submit(Some(encoder.finish()));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu_test_utils::*;
+
+    /// CPU reference: copy [seq_len, num_heads, head_dim] with arbitrary strides
+    fn cpu_slice_copy(
+        src: &[f32],
+        dst: &mut [f32],
+        src_offset: usize,
+        src_token_stride: usize,
+        src_head_stride: usize,
+        dst_offset: usize,
+        dst_token_stride: usize,
+        dst_head_stride: usize,
+        num_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+    ) {
+        for t in 0..seq_len {
+            for h in 0..num_heads {
+                for i in 0..head_dim {
+                    let s = src_offset + t * src_token_stride + h * src_head_stride + i;
+                    let d = dst_offset + t * dst_token_stride + h * dst_head_stride + i;
+                    dst[d] = src[s];
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_slice_copy() {
+        let (device, queue) = gpu_or_skip!();
+        let seq_len = 2;
+        let num_heads = 2;
+        let head_dim = 8;
+        let src_token_stride = 48;
+        let src_head_stride = 16;
+        let dst_token_stride = num_heads * head_dim;
+        let dst_head_stride = head_dim;
+        let src_offset = 4;
+        let dst_offset = 0;
+
+        let src_size = src_offset + seq_len * src_token_stride;
+        let dst_size = seq_len * dst_token_stride;
+
+        let src: Vec<f32> = (0..src_size).map(|i| (i as f32) * 0.1).collect();
+        let mut expected_dst = vec![0.0f32; dst_size];
+        cpu_slice_copy(
+            &src, &mut expected_dst,
+            src_offset, src_token_stride, src_head_stride,
+            dst_offset, dst_token_stride, dst_head_stride,
+            num_heads, head_dim, seq_len,
+        );
+
+        let gpu = SliceCopyWebgpu::new(&device);
+        let s_buf = upload_f32(&device, &src);
+        let d_buf = create_f32_buffer(&device, dst_size);
+        gpu.compute(
+            &device, &queue, &s_buf, &d_buf,
+            src_offset, src_token_stride, src_head_stride,
+            dst_offset, dst_token_stride, dst_head_stride,
+            num_heads, head_dim, seq_len,
+        );
+        let actual = download_f32(&device, &queue, &d_buf, dst_size);
+
+        assert_approx_eq(&actual, &expected_dst, 1e-6);
+    }
+}

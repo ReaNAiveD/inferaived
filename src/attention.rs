@@ -236,3 +236,94 @@ impl CausalGqaNaiveAttentionWebgpu {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu_test_utils::*;
+
+    /// CPU reference for causal grouped-query attention
+    fn cpu_causal_gqa_attention(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        q_dim: usize,
+        v_dim: usize,
+        seq_len: usize,
+    ) -> Vec<f32> {
+        let q_token_stride = num_q_heads * q_dim;
+        let k_token_stride = num_kv_heads * q_dim;
+        let v_token_stride = num_kv_heads * v_dim;
+        let output_token_stride = num_q_heads * v_dim;
+        let num_q_per_kv = num_q_heads / num_kv_heads;
+        let softmax_scale = 1.0 / (q_dim as f32).sqrt();
+
+        let mut output = vec![0.0f32; seq_len * output_token_stride];
+
+        for q_token in 0..seq_len {
+            for q_head in 0..num_q_heads {
+                let kv_head = q_head / num_q_per_kv;
+
+                let mut scores = Vec::with_capacity(q_token + 1);
+                for k_token in 0..=q_token {
+                    let mut dot = 0.0f32;
+                    for d in 0..q_dim {
+                        dot += q[q_token * q_token_stride + q_head * q_dim + d]
+                            * k[k_token * k_token_stride + kv_head * q_dim + d];
+                    }
+                    scores.push(dot * softmax_scale);
+                }
+
+                let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exp_scores: Vec<f32> = scores.iter().map(|&s| (s - max_score).exp()).collect();
+                let sum_exp: f32 = exp_scores.iter().sum();
+
+                for vd in 0..v_dim {
+                    let mut acc = 0.0f32;
+                    for (k_token, &w) in exp_scores.iter().enumerate() {
+                        acc += (w / sum_exp) * v[k_token * v_token_stride + kv_head * v_dim + vd];
+                    }
+                    output[q_token * output_token_stride + q_head * v_dim + vd] = acc;
+                }
+            }
+        }
+        output
+    }
+
+    #[tokio::test]
+    async fn test_causal_gqa_attention() {
+        let (device, queue) = gpu_or_skip!();
+        let seq_len = 4;
+        let num_q_heads = 4;
+        let num_kv_heads = 2;
+        let q_dim = 16;
+        let v_dim = 16;
+
+        let q: Vec<f32> = (0..seq_len * num_q_heads * q_dim)
+            .map(|i| ((i as f32) * 0.05).sin() * 0.3)
+            .collect();
+        let k: Vec<f32> = (0..seq_len * num_kv_heads * q_dim)
+            .map(|i| ((i as f32) * 0.07).cos() * 0.3)
+            .collect();
+        let v: Vec<f32> = (0..seq_len * num_kv_heads * v_dim)
+            .map(|i| ((i as f32) * 0.03).sin() * 0.5)
+            .collect();
+
+        let expected = cpu_causal_gqa_attention(
+            &q, &k, &v,
+            num_q_heads, num_kv_heads, q_dim, v_dim, seq_len,
+        );
+
+        let gpu = CausalGqaNaiveAttentionWebgpu::new(&device, num_q_heads, num_kv_heads, q_dim, v_dim);
+        let q_buf = upload_f32(&device, &q);
+        let k_buf = upload_f32(&device, &k);
+        let v_buf = upload_f32(&device, &v);
+        let out_buf = create_f32_buffer(&device, seq_len * num_q_heads * v_dim);
+        gpu.compute(&device, &queue, &q_buf, &k_buf, &v_buf, &out_buf, seq_len);
+        let actual = download_f32(&device, &queue, &out_buf, seq_len * num_q_heads * v_dim);
+
+        assert_approx_eq(&actual, &expected, 1e-3);
+    }
+}
+

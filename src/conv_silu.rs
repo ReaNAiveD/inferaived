@@ -217,3 +217,122 @@ impl ConvSiluWebgpu {
         queue.submit(Some(encoder.finish()));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu_test_utils::*;
+
+    fn silu(x: f32) -> f32 {
+        x / (1.0 + (-x).exp())
+    }
+
+    /// CPU reference: per-channel causal 1D conv + SiLU
+    fn cpu_conv_silu(
+        input: &[f32],
+        weight_packed: &[u32],
+        q_dim: usize,
+        k_dim: usize,
+        v_dim: usize,
+        seq_len: usize,
+        kernel_size: usize,
+        q_mode: ChannelMode,
+        k_mode: ChannelMode,
+        v_mode: ChannelMode,
+        input_token_stride: usize,
+        output_token_stride: usize,
+    ) -> Vec<f32> {
+        let nc = q_dim + k_dim + v_dim;
+        let mut output = vec![0.0f32; seq_len * output_token_stride];
+        for token in 0..seq_len {
+            for ch in 0..nc {
+                let apply_conv = if ch < q_dim {
+                    matches!(q_mode, ChannelMode::ConvSilu)
+                } else if ch < q_dim + k_dim {
+                    matches!(k_mode, ChannelMode::ConvSilu)
+                } else {
+                    matches!(v_mode, ChannelMode::ConvSilu)
+                };
+
+                let out_idx = token * output_token_stride + ch;
+                if !apply_conv {
+                    output[out_idx] = input[token * input_token_stride + ch];
+                } else {
+                    let mut sum = 0.0f32;
+                    for ki in 0..kernel_size {
+                        let lag = kernel_size - 1 - ki;
+                        let inp = if lag > token {
+                            0.0
+                        } else {
+                            input[(token - lag) * input_token_stride + ch]
+                        };
+                        let w_idx = ch * kernel_size + ki;
+                        let w = unpack_bf16(weight_packed, w_idx);
+                        sum += inp * w;
+                    }
+                    output[out_idx] = silu(sum);
+                }
+            }
+        }
+        output
+    }
+
+    #[tokio::test]
+    async fn test_conv_silu() {
+        let (device, queue) = gpu_or_skip!();
+        let q_dim = 8;
+        let k_dim = 4;
+        let v_dim = 4;
+        let nc = q_dim + k_dim + v_dim;
+        let seq_len = 4;
+        let kernel_size = 4;
+
+        let weight_f32: Vec<f32> = (0..nc * kernel_size)
+            .map(|i| ((i as f32) * 0.13).sin() * 0.5)
+            .collect();
+        let padded_weight = if weight_f32.len() % 2 != 0 {
+            let mut w = weight_f32.clone();
+            w.push(0.0);
+            w
+        } else {
+            weight_f32.clone()
+        };
+        let weight_packed = pack_f32_to_bf16_u32(&padded_weight);
+        let weight_bf16_bytes: Vec<u8> = padded_weight
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+
+        let input: Vec<f32> = (0..seq_len * nc)
+            .map(|i| ((i as f32) * 0.1).sin())
+            .collect();
+
+        let expected = cpu_conv_silu(
+            &input,
+            &weight_packed,
+            q_dim, k_dim, v_dim,
+            seq_len, kernel_size,
+            ChannelMode::ConvSilu,
+            ChannelMode::ConvSilu,
+            ChannelMode::ConvSilu,
+            nc, nc,
+        );
+
+        let tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::BF16,
+            vec![nc, kernel_size],
+            &weight_bf16_bytes,
+        )
+        .unwrap();
+        let gpu = ConvSiluWebgpu::new(
+            &device, tv, q_dim, k_dim, v_dim, kernel_size,
+            ChannelMode::ConvSilu, ChannelMode::ConvSilu, ChannelMode::ConvSilu,
+        );
+        let in_buf = upload_f32(&device, &input);
+        let out_buf = create_f32_buffer(&device, seq_len * nc);
+        gpu.compute(&device, &queue, &in_buf, &out_buf, seq_len);
+        let actual = download_f32(&device, &queue, &out_buf, seq_len * nc);
+
+        assert_approx_eq(&actual, &expected, 1e-2);
+    }
+}

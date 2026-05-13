@@ -1,20 +1,20 @@
-/// Unified GPU test utilities for creating device/queue and transferring data
-/// to/from GPU storage buffers. Tests should use these helpers instead of
-/// mixing wgpu boilerplate into individual test files.
+/// Shared GPU test utilities for creating device/queue and transferring data
+/// to/from GPU storage buffers. Gated behind `#[cfg(test)]` so it is only
+/// compiled during `cargo test`.
 
 /// Create a wgpu `Device` and `Queue` suitable for compute-only testing.
 /// Returns `None` when no compatible adapter is available (e.g. headless CI
 /// without a GPU), so that tests can be skipped gracefully.
 pub async fn create_device_queue() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-    let adapter = instance
+    let adapter = match instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
         })
-        .await;
-    let adapter = match adapter {
+        .await
+    {
         Ok(a) => a,
         Err(e) => {
             eprintln!("GPU adapter request failed: {e}");
@@ -34,10 +34,9 @@ pub async fn create_device_queue() -> Option<(wgpu::Device, wgpu::Queue)> {
 }
 
 /// Convenience macro that skips the test if no GPU is available.
-#[macro_export]
 macro_rules! gpu_or_skip {
     () => {
-        match create_device_queue().await {
+        match $crate::gpu_test_utils::create_device_queue().await {
             Some(dq) => dq,
             None => {
                 eprintln!("No GPU adapter found — skipping test");
@@ -46,28 +45,13 @@ macro_rules! gpu_or_skip {
         }
     };
 }
+pub(crate) use gpu_or_skip;
 
 /// Upload an `f32` slice to a new GPU storage buffer.
-/// The `_queue` parameter is kept for API consistency with the upload/download
-/// pairs — callers always have a `(device, queue)` tuple handy.
-pub fn upload_f32(device: &wgpu::Device, _queue: &wgpu::Queue, data: &[f32]) -> wgpu::Buffer {
+pub fn upload_f32(device: &wgpu::Device, data: &[f32]) -> wgpu::Buffer {
     use wgpu::util::DeviceExt;
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("test/upload_f32"),
-        contents: bytemuck::cast_slice(data),
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_SRC
-            | wgpu::BufferUsages::COPY_DST,
-    })
-}
-
-/// Upload a `u32` slice to a new GPU storage buffer (for packed bf16 weights).
-/// The `_queue` parameter is kept for API consistency with upload_f32 / download_f32.
-#[allow(dead_code)]
-pub fn upload_u32(device: &wgpu::Device, _queue: &wgpu::Queue, data: &[u32]) -> wgpu::Buffer {
-    use wgpu::util::DeviceExt;
-    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("test/upload_u32"),
         contents: bytemuck::cast_slice(data),
         usage: wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::COPY_SRC
@@ -124,7 +108,10 @@ pub fn download_f32(
 /// Pack a slice of `f32` values into packed bf16 u32 pairs (2 bf16 per u32).
 /// The input length must be even.
 pub fn pack_f32_to_bf16_u32(data: &[f32]) -> Vec<u32> {
-    assert!(data.len() % 2 == 0, "pack_f32_to_bf16_u32 requires even length");
+    assert!(
+        data.len() % 2 == 0,
+        "pack_f32_to_bf16_u32 requires even length"
+    );
     data.chunks_exact(2)
         .map(|pair| {
             let lo = half::bf16::from_f32(pair[0]).to_bits() as u32;
@@ -147,7 +134,13 @@ pub fn unpack_bf16(packed: &[u32], index: usize) -> f32 {
 
 /// Assert two f32 slices are approximately equal with given tolerance.
 pub fn assert_approx_eq(actual: &[f32], expected: &[f32], tol: f32) {
-    assert_eq!(actual.len(), expected.len(), "Length mismatch: actual={} expected={}", actual.len(), expected.len());
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "Length mismatch: actual={} expected={}",
+        actual.len(),
+        expected.len()
+    );
     for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
         let diff = (a - e).abs();
         let rel = if e.abs() > 1e-6 { diff / e.abs() } else { diff };

@@ -182,3 +182,105 @@ impl RopeInplaceWebgpu {
         queue.submit(Some(encoder.finish()));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu_test_utils::*;
+
+    /// CPU reference for half-split RoPE
+    fn cpu_rope(
+        q: &mut [f32],
+        k: &mut [f32],
+        num_q_heads: usize,
+        num_k_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        theta_scale: f32,
+        num_rotated_dims: usize,
+        position_offset: usize,
+    ) {
+        let pair_offset = num_rotated_dims / 2;
+        let q_token_stride = num_q_heads * head_dim;
+        let k_token_stride = num_k_heads * head_dim;
+
+        for token in 0..seq_len {
+            for head in 0..std::cmp::max(num_q_heads, num_k_heads) {
+                for pair in 0..pair_offset {
+                    let pos = token + position_offset;
+                    let theta = pos as f32 * theta_scale.powf(pair as f32);
+                    let cos_t = theta.cos();
+                    let sin_t = theta.sin();
+
+                    if head < num_q_heads {
+                        let a_idx = token * q_token_stride + head * head_dim + pair;
+                        let b_idx = token * q_token_stride + head * head_dim + pair + pair_offset;
+                        let a = q[a_idx];
+                        let b = q[b_idx];
+                        q[a_idx] = a * cos_t - b * sin_t;
+                        q[b_idx] = a * sin_t + b * cos_t;
+                    }
+                    if head < num_k_heads {
+                        let a_idx = token * k_token_stride + head * head_dim + pair;
+                        let b_idx = token * k_token_stride + head * head_dim + pair + pair_offset;
+                        let a = k[a_idx];
+                        let b = k[b_idx];
+                        k[a_idx] = a * cos_t - b * sin_t;
+                        k[b_idx] = a * sin_t + b * cos_t;
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rope() {
+        let (device, queue) = gpu_or_skip!();
+        let seq_len = 3;
+        let num_q_heads = 4;
+        let num_k_heads = 2;
+        let head_dim = 16;
+        let rope_theta: f32 = 10000.0;
+        let partial_rotary_factor: f32 = 1.0;
+        let num_rotated_dims = (head_dim as f32 * partial_rotary_factor).floor() as usize;
+        let theta_scale = rope_theta.powf(-2.0 / num_rotated_dims as f32);
+
+        let q: Vec<f32> = (0..seq_len * num_q_heads * head_dim)
+            .map(|i| ((i as f32) * 0.1).sin())
+            .collect();
+        let k: Vec<f32> = (0..seq_len * num_k_heads * head_dim)
+            .map(|i| ((i as f32) * 0.07).cos())
+            .collect();
+
+        let mut expected_q = q.clone();
+        let mut expected_k = k.clone();
+        cpu_rope(
+            &mut expected_q,
+            &mut expected_k,
+            num_q_heads,
+            num_k_heads,
+            head_dim,
+            seq_len,
+            theta_scale,
+            num_rotated_dims,
+            0,
+        );
+
+        let gpu = RopeInplaceWebgpu::new(
+            &device,
+            num_q_heads,
+            num_k_heads,
+            head_dim,
+            rope_theta,
+            partial_rotary_factor,
+        );
+        let q_buf = upload_f32(&device, &q);
+        let k_buf = upload_f32(&device, &k);
+        gpu.compute(&device, &queue, &q_buf, &k_buf, seq_len, 0);
+        let actual_q = download_f32(&device, &queue, &q_buf, seq_len * num_q_heads * head_dim);
+        let actual_k = download_f32(&device, &queue, &k_buf, seq_len * num_k_heads * head_dim);
+
+        assert_approx_eq(&actual_q, &expected_q, 1e-4);
+        assert_approx_eq(&actual_k, &expected_k, 1e-4);
+    }
+}

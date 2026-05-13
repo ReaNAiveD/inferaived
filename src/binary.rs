@@ -132,3 +132,42 @@ impl ElementwiseAddInplaceWebgpu {
         queue.submit(Some(encoder.finish()));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu_test_utils::*;
+
+    /// CPU reference: hidden[t,i] += addend[t,i]
+    fn cpu_elementwise_add(hidden: &mut [f32], addend: &[f32], hidden_size: usize, seq_len: usize) {
+        for t in 0..seq_len {
+            for i in 0..hidden_size {
+                hidden[t * hidden_size + i] += addend[t * hidden_size + i];
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_elementwise_add() {
+        let (device, queue) = gpu_or_skip!();
+        let seq_len = 3;
+        let hidden_size = 16;
+        let hidden: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32) * 0.1)
+            .collect();
+        let addend: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32) * -0.05 + 1.0)
+            .collect();
+
+        let mut expected = hidden.clone();
+        cpu_elementwise_add(&mut expected, &addend, hidden_size, seq_len);
+
+        let gpu = ElementwiseAddInplaceWebgpu::new(&device, hidden_size);
+        let h_buf = upload_f32(&device, &hidden);
+        let a_buf = upload_f32(&device, &addend);
+        gpu.compute(&device, &queue, &h_buf, &a_buf, seq_len);
+        let actual = download_f32(&device, &queue, &h_buf, seq_len * hidden_size);
+
+        assert_approx_eq(&actual, &expected, 1e-5);
+    }
+}

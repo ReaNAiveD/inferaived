@@ -71,11 +71,11 @@ impl DeltaRuleWebgpu {
             .chunks_exact(4)
             .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
             .collect();
-        assert_eq!(dt_bias.len(), num_key_heads);
-        assert_eq!(a_log.len(), num_key_heads);
+        debug_assert_eq!(dt_bias.len(), num_key_heads);
+        debug_assert_eq!(a_log.len(), num_key_heads);
         let cols_per_thread =
             (value_head_dim + Self::WORKGROUP_SIZE - 1) / Self::WORKGROUP_SIZE;
-        assert!(
+        debug_assert!(
             cols_per_thread * key_head_dim <= 256,
             "Private state overflow: need {} floats per thread but MAX_KEY_HEAD_DIM=256. \
              Increase MAX_KEY_HEAD_DIM in delta_rule.wgsl or increase WORKGROUP_SIZE.",

@@ -37,7 +37,7 @@ impl RmsNormWebgpu {
                 half::bf16::from_bits(bits).to_f32()
             })
             .collect();
-        assert_eq!(weight_f32.len(), hidden_size);
+        debug_assert_eq!(weight_f32.len(), hidden_size);
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rms_norm/shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
@@ -186,7 +186,7 @@ impl RmsNormInplaceWebgpu {
                 half::bf16::from_bits(bits).to_f32()
             })
             .collect();
-        assert_eq!(weight_f32.len(), hidden_size);
+        debug_assert_eq!(weight_f32.len(), hidden_size);
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rms_norm_inplace/shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(

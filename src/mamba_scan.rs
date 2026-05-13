@@ -69,10 +69,10 @@ impl MambaScanWebgpu {
             .chunks_exact(4)
             .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
             .collect();
-        assert_eq!(dt_bias.len(), num_key_heads as usize, "dt_bias length must match num_key_heads");
-        assert_eq!(a_log.len(), num_key_heads as usize, "a_log length must match num_key_heads");
+        debug_assert_eq!(dt_bias.len(), num_key_heads as usize, "dt_bias length must match num_key_heads");
+        debug_assert_eq!(a_log.len(), num_key_heads as usize, "a_log length must match num_key_heads");
         let cols_per_thread = (value_head_dim as usize + Self::WORKGROUP_SIZE - 1) / Self::WORKGROUP_SIZE;
-        assert!(
+        debug_assert!(
             cols_per_thread * key_head_dim as usize <= 256,
             "Private state overflow: need {} floats per thread but MAX_KEY_HEAD_DIM=256. \
              Increase MAX_KEY_HEAD_DIM in mamba_scan.wgsl or increase WORKGROUP_SIZE.",

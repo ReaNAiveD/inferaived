@@ -131,15 +131,15 @@ impl EmbeddingLookupWebgpu {
         }
     }
 
-    pub fn lookup<'data>(&self, device: &Device, queue: &Queue, input_encoding: Encoding, dst_buffer: &Buffer) {
+    pub fn compute<'data>(&self, device: &Device, queue: &Queue, input_encoding: &[u32], dst_buffer: &Buffer) {
         let index_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: None,
-            contents: bytemuck::cast_slice(input_encoding.get_ids()),
+            contents: bytemuck::cast_slice(input_encoding),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         // source_row_stride is in u32 units: each u32 packs two bf16 values,
         // so a row of hidden_size bf16 elements = hidden_size/2 u32s.
-        let n_rows = input_encoding.get_ids().len();
+        let n_rows = input_encoding.len();
         queue.write_buffer(&self.uniform_buffer, 0u64, bytemuck::cast_slice(&[GetRowsParams {
             source_offset: 0,
             source_row_stride: (self.hidden_size / 2) as u32,
@@ -190,24 +190,25 @@ impl EmbeddingLookupWebgpu {
 
 pub struct EmbeddingLookupCpu<'data> {
     hidden_size: usize,
-    embeddings: TensorView<'data>
+    embed_tokens: TensorView<'data>
 }
 
 impl<'data> EmbeddingLookupCpu<'data> {
-    pub fn new(embeddings: TensorView<'data>, hidden_size: usize) -> Self {
+    pub fn new(embed_tokens: TensorView<'data>) -> Self {
+        let hidden_size = embed_tokens.shape()[1];
         Self {
             hidden_size,
-            embeddings,
+            embed_tokens,
         }
     }
 
-    pub fn lookup(&self, input_encoding: &Encoding) -> Vec<f32> {
+    pub fn compute(&self, input_encoding: &[u32]) -> Vec<f32> {
         let row_width = self.hidden_size * std::mem::size_of::<bf16>();
-        let embedding_row_num = self.embeddings.data().len() / row_width;
-        input_encoding.get_ids().iter().flat_map(|&idx| {
+        let embedding_row_num = self.embed_tokens.data().len() / row_width;
+        input_encoding.iter().flat_map(|&idx| {
             let start = ((idx as usize) % embedding_row_num) * row_width;
             let end = start + row_width;
-            let row_data = &self.embeddings.data()[start..end];
+            let row_data = &self.embed_tokens.data()[start..end];
             // The safetensors store bf16 values as little-endian
             let row_floats: Vec<f32> = row_data
                 .chunks_exact(2)

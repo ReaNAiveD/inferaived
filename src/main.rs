@@ -1,8 +1,4 @@
-use inferaived::{
-    embedding_lookup::EmbeddingLookupCpu,
-    layer_loop::{LinearAttentionConfig, LinearAttentionLayer, SelfAttentionConfig, SelfAttentionLayer},
-    log_tensor,
-};
+use inferaived::language_model::{LayerType, Qwen35Config, Qwen35Model};
 use safetensors::SafeTensors;
 use tokenizers::Tokenizer;
 use tokio;
@@ -33,32 +29,50 @@ fn features(supported: Features) -> Features {
     required
 }
 
+/// Hardcoded Qwen 3.5 0.8B model config. TODO: load from `config.json`.
+fn qwen35_0_8b_config() -> Qwen35Config {
+    // 24 layers; full attention every 4th layer (indices 3, 7, 11, 15, 19, 23).
+    let layer_types: Vec<LayerType> = (0..24)
+        .map(|i| {
+            if (i + 1) % 4 == 0 {
+                LayerType::Full
+            } else {
+                LayerType::Linear
+            }
+        })
+        .collect();
+    Qwen35Config {
+        hidden_size: 1024,
+        layer_types,
+        num_attention_heads: 8,
+        num_key_value_heads: 2,
+        head_dim: 256,
+        rope_theta: 10_000_000.0,
+        partial_rotary_factor: 0.25,
+        linear_num_key_heads: 16,
+        linear_num_value_heads: 16,
+        linear_key_head_dim: 128,
+        linear_value_head_dim: 128,
+        intermediate_size: 3584,
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    // Should extract from config file in the future
-    let hidden_size = 1024usize;
-    let linear_num_key_heads = 16usize;
-    let linear_key_head_dim = 128usize;
-    let linear_num_value_heads = 16usize;
-    let linear_value_head_dim = 128usize;
-    let rope_theta = 10_000_000f32;
-    let partial_rotary_factor = 0.25f32;
     let buffer = std::fs::read("model/Qwen3.5-0.8B/model.safetensors-00001-of-00001.safetensors")
         .expect("Failed to read file");
     let tensors = SafeTensors::deserialize(&buffer[..]).expect("Failed to deserialize tensors");
-    let embeddings = tensors
-        .tensor("model.language_model.embed_tokens.weight")
-        .expect("Failed to get tensor: model.language_model.embed_tokens.weight");
-    log_tensor("model.language_model.embed_tokens.weight", &embeddings);
     let tokenizer = Tokenizer::from_file("model/Qwen3.5-0.8B/tokenizer.json")
         .expect("Failed to load tokenizer");
+    let prompt = "Hello ";
     let encoded = tokenizer
-        .encode("你好，Hello World", false)
+        .encode(prompt, false)
         .expect("Failed to encode input");
+    info!("Prompt: {:?}", prompt);
     info!("Encoded IDs: {:?}", encoded.get_ids());
 
     let instance = Instance::new(&InstanceDescriptor {
@@ -96,52 +110,19 @@ async fn main() {
         .expect("Failed to request device");
     info!("Device requested successfully");
 
-    // CPU-based embedding lookup (avoids OOM on limited VRAM GPUs)
-    let embedding_lookup = EmbeddingLookupCpu::new(embeddings, hidden_size);
-    let result = embedding_lookup.lookup(&encoded);
-    let embeddings = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("embeddings_buffer"),
-        size: (result.len() * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    queue.write_buffer(&embeddings, 0, bytemuck::cast_slice(&result));
+    let config = qwen35_0_8b_config();
+    let model = Qwen35Model::new(&device, &queue, &tensors, &config);
+    info!("Model constructed");
 
-    let seq_len = encoded.get_ids().len();
-    let linear_config = LinearAttentionConfig {
-        linear_num_key_heads,
-        linear_num_value_heads,
-        linear_key_head_dim,
-        linear_value_head_dim,
-    };
-
-    // Layer 0 (linear attention)
-    let layer0 = LinearAttentionLayer::new(
-        &device,
-        &queue,
-        &tensors,
-        "model.language_model.layers.0",
-        hidden_size,
-        &linear_config,
-        seq_len,
+    let top_candidates = model
+        .compute(&device, &queue, encoded.get_ids(), 5)
+        .await;
+    let next_token_id = top_candidates[0].0 as u32;
+    let next_token_text = tokenizer
+        .decode(&[next_token_id], false)
+        .expect("Failed to decode next token");
+    println!(
+        "Next token id: {}, text: {:?}, top candidates: {:?}",
+        next_token_id, next_token_text, top_candidates
     );
-    layer0.compute(&device, &queue, &embeddings, seq_len);
-
-    let self_attention_config = SelfAttentionConfig {
-        num_attention_heads: 8,
-        num_key_value_heads: 2,
-        head_dim: 256,
-        rope_theta,
-        partial_rotary_factor,
-    };
-    let layer3 = SelfAttentionLayer::new(
-        &device,
-        &queue,
-        &tensors,
-        "model.language_model.layers.3",
-        hidden_size,
-        &self_attention_config,
-        seq_len,
-    );
-    layer3.compute(&device, &queue, &embeddings, seq_len);
 }

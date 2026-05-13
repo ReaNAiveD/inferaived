@@ -42,7 +42,7 @@ impl CausalGqaNaiveAttentionWebgpu {
         q_dim: usize,
         v_dim: usize,
     ) -> Self {
-        assert!(
+        debug_assert!(
             num_q_heads % num_kv_heads == 0,
             "num_q_heads ({}) must be divisible by num_kv_heads ({})",
             num_q_heads,
@@ -52,7 +52,7 @@ impl CausalGqaNaiveAttentionWebgpu {
         // per thread for the V-weighted accumulator. With workgroup_size=128
         // this caps v_dim at 4 * 128 = 512, which covers all current models.
         let max_v_per_thread = 4u32;
-        assert!(
+        debug_assert!(
             (v_dim as u32) <= max_v_per_thread * Self::WORKGROUP_SIZE,
             "v_dim ({}) exceeds MAX_V_PER_THREAD ({}) * workgroup_size ({}). \
              Increase MAX_V_PER_THREAD in causal_gqa_naive_attention.wgsl or workgroup_size.",

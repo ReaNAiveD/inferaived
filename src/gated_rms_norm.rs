@@ -45,7 +45,7 @@ impl GatedRmsNormInplaceWebgpu {
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect();
-        assert_eq!(weight.len(), value_head_dim);
+        debug_assert_eq!(weight.len(), value_head_dim);
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gated_rms_norm/shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(

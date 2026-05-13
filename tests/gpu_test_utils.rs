@@ -16,7 +16,10 @@ pub async fn create_device_queue() -> Option<(wgpu::Device, wgpu::Queue)> {
         .await;
     let adapter = match adapter {
         Ok(a) => a,
-        Err(_) => return None,
+        Err(e) => {
+            eprintln!("GPU adapter request failed: {e}");
+            return None;
+        }
     };
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
@@ -45,6 +48,8 @@ macro_rules! gpu_or_skip {
 }
 
 /// Upload an `f32` slice to a new GPU storage buffer.
+/// The `_queue` parameter is kept for API consistency with the upload/download
+/// pairs — callers always have a `(device, queue)` tuple handy.
 pub fn upload_f32(device: &wgpu::Device, _queue: &wgpu::Queue, data: &[f32]) -> wgpu::Buffer {
     use wgpu::util::DeviceExt;
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -57,6 +62,7 @@ pub fn upload_f32(device: &wgpu::Device, _queue: &wgpu::Queue, data: &[f32]) -> 
 }
 
 /// Upload a `u32` slice to a new GPU storage buffer (for packed bf16 weights).
+/// The `_queue` parameter is kept for API consistency with upload_f32 / download_f32.
 #[allow(dead_code)]
 pub fn upload_u32(device: &wgpu::Device, _queue: &wgpu::Queue, data: &[u32]) -> wgpu::Buffer {
     use wgpu::util::DeviceExt;

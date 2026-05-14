@@ -284,3 +284,149 @@ impl DeltaRuleWebgpu {
         queue.submit(Some(command_encoder.finish()));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu_test_utils::*;
+
+    fn softplus(x: f32) -> f32 {
+        if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
+    }
+    fn sigmoid(x: f32) -> f32 {
+        1.0 / (1.0 + (-x).exp())
+    }
+
+    /// CPU reference for delta_rule SSM
+    fn cpu_delta_rule(
+        qkv: &mut [f32],
+        proj_a: &[f32],
+        proj_b: &[f32],
+        dt_bias: &[f32],
+        a_log: &[f32],
+        state: &mut [f32],
+        num_key_heads: usize,
+        key_head_dim: usize,
+        value_head_dim: usize,
+        seq_len: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        let qk_head_stride = key_head_dim;
+        let v_head_stride = value_head_dim;
+        let qkv_token_stride = num_key_heads * key_head_dim * 2 + num_key_heads * value_head_dim;
+        let q_offset = 0;
+        let k_offset = num_key_heads * key_head_dim;
+        let v_offset = num_key_heads * key_head_dim * 2;
+        let state_head_stride = key_head_dim * value_head_dim;
+        let output_head_stride = value_head_dim;
+        let output_token_stride = num_key_heads * value_head_dim;
+
+        let mut output = vec![0.0f32; seq_len * output_token_stride];
+
+        for head in 0..num_key_heads {
+            let al = a_log[head];
+            let dtb = dt_bias[head];
+
+            for token in 0..seq_len {
+                let beta = sigmoid(proj_b[token * num_key_heads + head]);
+                let g = -al.exp() * softplus(proj_a[token * num_key_heads + head] + dtb);
+                let gamma = g.exp();
+
+                let mut q_sq = 0.0f32;
+                for i in 0..key_head_dim {
+                    let v = qkv[q_offset + i + head * qk_head_stride + token * qkv_token_stride];
+                    q_sq += v * v;
+                }
+                let q_scale = 1.0 / ((q_sq + eps) * key_head_dim as f32).sqrt();
+                for i in 0..key_head_dim {
+                    let idx = q_offset + i + head * qk_head_stride + token * qkv_token_stride;
+                    qkv[idx] *= q_scale;
+                }
+
+                let mut k_sq = 0.0f32;
+                for i in 0..key_head_dim {
+                    let v = qkv[k_offset + i + head * qk_head_stride + token * qkv_token_stride];
+                    k_sq += v * v;
+                }
+                let k_scale = 1.0 / (k_sq + eps).sqrt();
+                for i in 0..key_head_dim {
+                    let idx = k_offset + i + head * qk_head_stride + token * qkv_token_stride;
+                    qkv[idx] *= k_scale;
+                }
+
+                for vi in 0..value_head_dim {
+                    let mut kv_mem = 0.0f32;
+                    for ki in 0..key_head_dim {
+                        let s_idx = head * state_head_stride + ki * value_head_dim + vi;
+                        state[s_idx] *= gamma;
+                        let k_val = qkv[k_offset + ki + head * qk_head_stride + token * qkv_token_stride];
+                        kv_mem += k_val * state[s_idx];
+                    }
+
+                    let v_val = qkv[v_offset + vi + head * v_head_stride + token * qkv_token_stride];
+                    let delta_v = (v_val - kv_mem) * beta;
+
+                    let mut out_acc = 0.0f32;
+                    for ki in 0..key_head_dim {
+                        let s_idx = head * state_head_stride + ki * value_head_dim + vi;
+                        let k_val = qkv[k_offset + ki + head * qk_head_stride + token * qkv_token_stride];
+                        state[s_idx] += k_val * delta_v;
+                        let q_val = qkv[q_offset + ki + head * qk_head_stride + token * qkv_token_stride];
+                        out_acc += q_val * state[s_idx];
+                    }
+                    output[token * output_token_stride + head * output_head_stride + vi] = out_acc;
+                }
+            }
+        }
+        output
+    }
+
+    #[tokio::test]
+    async fn test_delta_rule() {
+        let (device, queue) = gpu_or_skip!();
+        let num_key_heads = 2;
+        let key_head_dim = 8;
+        let value_head_dim = 8;
+        let seq_len = 3;
+        let eps = 1e-6f32;
+
+        let qkv_token_stride = num_key_heads * key_head_dim * 2 + num_key_heads * value_head_dim;
+        let qkv: Vec<f32> = (0..seq_len * qkv_token_stride)
+            .map(|i| ((i as f32) * 0.1).sin() * 0.5)
+            .collect();
+        let proj_a: Vec<f32> = (0..seq_len * num_key_heads)
+            .map(|i| (i as f32) * 0.1 - 0.5)
+            .collect();
+        let proj_b: Vec<f32> = (0..seq_len * num_key_heads)
+            .map(|i| (i as f32) * 0.15)
+            .collect();
+        let dt_bias: Vec<f32> = (0..num_key_heads).map(|i| (i as f32) * 0.1).collect();
+        let a_log: Vec<f32> = (0..num_key_heads).map(|i| -1.0 + (i as f32) * 0.2).collect();
+
+        let state_size = num_key_heads * key_head_dim * value_head_dim;
+
+        let dt_bias_bf16: Vec<u8> = dt_bias.iter().flat_map(|&v| half::bf16::from_f32(v).to_le_bytes()).collect();
+        let a_log_f32_bytes: Vec<u8> = a_log.iter().flat_map(|&v| v.to_le_bytes()).collect();
+        let dt_tv = safetensors::tensor::TensorView::new(safetensors::Dtype::BF16, vec![num_key_heads], &dt_bias_bf16).unwrap();
+        let al_tv = safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![num_key_heads], &a_log_f32_bytes).unwrap();
+
+        let dt_bias_rt: Vec<f32> = dt_bias.iter().map(|&v| half::bf16::from_f32(v).to_f32()).collect();
+        let mut cpu_state = vec![0.0f32; state_size];
+        let mut cpu_qkv = qkv.clone();
+        let expected = cpu_delta_rule(
+            &mut cpu_qkv, &proj_a, &proj_b, &dt_bias_rt, &a_log,
+            &mut cpu_state, num_key_heads, key_head_dim, value_head_dim, seq_len, eps,
+        );
+
+        let gpu = DeltaRuleWebgpu::new(&device, dt_tv, al_tv, num_key_heads, key_head_dim, value_head_dim);
+        let qkv_buf = upload_f32(&device, &qkv);
+        let pa_buf = upload_f32(&device, &proj_a);
+        let pb_buf = upload_f32(&device, &proj_b);
+        let state_buf = upload_f32(&device, &vec![0.0f32; state_size]);
+        let out_buf = create_f32_buffer(&device, seq_len * num_key_heads * value_head_dim);
+        gpu.compute(&device, &queue, &qkv_buf, &pa_buf, &pb_buf, &state_buf, &out_buf, seq_len);
+        let actual = download_f32(&device, &queue, &out_buf, seq_len * num_key_heads * value_head_dim);
+
+        assert_approx_eq(&actual, &expected, 1e-3);
+    }
+}

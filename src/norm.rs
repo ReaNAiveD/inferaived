@@ -318,3 +318,158 @@ impl RmsNormInplaceWebgpu {
         queue.submit(Some(command_encoder.finish()));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu_test_utils::*;
+
+    /// CPU reference: out[t,i] = (input[t,i] / rms) * (1 + weight[i])
+    fn cpu_rms_norm(
+        input: &[f32],
+        weight: &[f32],
+        hidden_size: usize,
+        seq_len: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; seq_len * hidden_size];
+        for t in 0..seq_len {
+            let row = &input[t * hidden_size..(t + 1) * hidden_size];
+            let ss: f32 = row.iter().map(|x| x * x).sum();
+            let scale = 1.0 / (ss / hidden_size as f32 + eps).sqrt();
+            for i in 0..hidden_size {
+                out[t * hidden_size + i] = row[i] * scale * (1.0 + weight[i]);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn test_rms_norm() {
+        let (device, queue) = gpu_or_skip!();
+        let seq_len = 2;
+        let hidden_size = 32;
+        let input: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| ((i as f32) * 0.03).sin())
+            .collect();
+        let weight_f32: Vec<f32> = (0..hidden_size).map(|i| (i as f32) * 0.01).collect();
+
+        let weight_bf16_bytes: Vec<u8> = weight_f32
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+        let tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::BF16,
+            vec![hidden_size],
+            &weight_bf16_bytes,
+        )
+        .unwrap();
+
+        let weight_roundtrip: Vec<f32> = weight_bf16_bytes
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+            .collect();
+        let expected = cpu_rms_norm(&input, &weight_roundtrip, hidden_size, seq_len, 1e-6);
+
+        let gpu = RmsNormWebgpu::new(&device, &queue, tv, hidden_size);
+        let in_buf = upload_f32(&device, &input);
+        let out_buf = create_f32_buffer(&device, seq_len * hidden_size);
+        gpu.compute(&device, &queue, &in_buf, &out_buf, seq_len);
+        let actual = download_f32(&device, &queue, &out_buf, seq_len * hidden_size);
+
+        assert_approx_eq(&actual, &expected, 1e-4);
+    }
+
+    /// CPU reference: hidden[t,i] = (hidden[t,i] / rms) * (1 + weight[i])
+    fn cpu_rms_norm_inplace(
+        hidden: &mut [f32],
+        weight: &[f32],
+        hidden_size: usize,
+        offset: usize,
+        n_rows: usize,
+        row_stride: usize,
+        eps: f32,
+    ) {
+        for t in 0..n_rows {
+            let base = offset + t * row_stride;
+            let ss: f32 = (0..hidden_size).map(|i| hidden[base + i] * hidden[base + i]).sum();
+            let scale = 1.0 / (ss / hidden_size as f32 + eps).sqrt();
+            for i in 0..hidden_size {
+                hidden[base + i] = hidden[base + i] * scale * (1.0 + weight[i]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rms_norm_inplace_basic() {
+        let (device, queue) = gpu_or_skip!();
+        let seq_len = 3;
+        let hidden_size = 32;
+        let data: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| ((i as f32) * 0.07).cos())
+            .collect();
+        let weight_f32: Vec<f32> = (0..hidden_size).map(|i| (i as f32) * -0.005).collect();
+
+        let weight_bf16_bytes: Vec<u8> = weight_f32
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+        let weight_roundtrip: Vec<f32> = weight_bf16_bytes
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+            .collect();
+        let tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::BF16,
+            vec![hidden_size],
+            &weight_bf16_bytes,
+        )
+        .unwrap();
+
+        let mut expected = data.clone();
+        cpu_rms_norm_inplace(&mut expected, &weight_roundtrip, hidden_size, 0, seq_len, hidden_size, 1e-6);
+
+        let gpu = RmsNormInplaceWebgpu::new(&device, &queue, tv, hidden_size);
+        let buf = upload_f32(&device, &data);
+        gpu.compute(&device, &queue, &buf, seq_len);
+        let actual = download_f32(&device, &queue, &buf, seq_len * hidden_size);
+
+        assert_approx_eq(&actual, &expected, 1e-4);
+    }
+
+    #[tokio::test]
+    async fn test_rms_norm_inplace_strided() {
+        let (device, queue) = gpu_or_skip!();
+        let hidden_size = 16;
+        let row_stride = 32;
+        let n_rows = 2;
+        let offset = 4;
+        let total = offset + n_rows * row_stride;
+        let data: Vec<f32> = (0..total).map(|i| ((i as f32) * 0.11).sin()).collect();
+        let weight_f32: Vec<f32> = (0..hidden_size).map(|i| (i as f32) * 0.02).collect();
+
+        let weight_bf16_bytes: Vec<u8> = weight_f32
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+        let weight_roundtrip: Vec<f32> = weight_bf16_bytes
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+            .collect();
+        let tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::BF16,
+            vec![hidden_size],
+            &weight_bf16_bytes,
+        )
+        .unwrap();
+
+        let mut expected = data.clone();
+        cpu_rms_norm_inplace(&mut expected, &weight_roundtrip, hidden_size, offset, n_rows, row_stride, 1e-6);
+
+        let gpu = RmsNormInplaceWebgpu::new(&device, &queue, tv, hidden_size);
+        let buf = upload_f32(&device, &data);
+        gpu.compute_strided(&device, &queue, &buf, offset, n_rows, row_stride);
+        let actual = download_f32(&device, &queue, &buf, total);
+
+        assert_approx_eq(&actual, &expected, 1e-4);
+    }
+}

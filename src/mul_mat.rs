@@ -186,3 +186,70 @@ impl MulMatWebgpu {
         queue.submit(Some(encoder.finish()));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu_test_utils::*;
+
+    /// CPU reference: output[n,m] = sum_k weight[m,k] * input[n,k]
+    fn cpu_mul_mat(
+        weight_packed: &[u32],
+        input: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; n * m];
+        for row_n in 0..n {
+            for col_m in 0..m {
+                let mut acc = 0.0f32;
+                for ki in 0..k {
+                    let w_idx = col_m * k + ki;
+                    let w_val = unpack_bf16(weight_packed, w_idx);
+                    let i_val = input[row_n * k + ki];
+                    acc += w_val * i_val;
+                }
+                out[row_n * m + col_m] = acc;
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn test_mul_mat() {
+        let (device, queue) = gpu_or_skip!();
+        let m = 8;
+        let n = 3;
+        let k = 16;
+
+        let weight_f32: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32) * 0.05).sin())
+            .collect();
+        let weight_packed = pack_f32_to_bf16_u32(&weight_f32);
+        let weight_bf16_bytes: Vec<u8> = weight_f32
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+
+        let input: Vec<f32> = (0..n * k)
+            .map(|i| ((i as f32) * 0.07).cos())
+            .collect();
+
+        let expected = cpu_mul_mat(&weight_packed, &input, m, n, k);
+
+        let tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::BF16,
+            vec![m, k],
+            &weight_bf16_bytes,
+        )
+        .unwrap();
+        let gpu = MulMatWebgpu::new(&device, &queue, tv, k);
+        let in_buf = upload_f32(&device, &input);
+        let out_buf = create_f32_buffer(&device, n * m);
+        gpu.compute(&device, &queue, &in_buf, &out_buf, n);
+        let actual = download_f32(&device, &queue, &out_buf, n * m);
+
+        assert_approx_eq(&actual, &expected, 1e-2);
+    }
+}

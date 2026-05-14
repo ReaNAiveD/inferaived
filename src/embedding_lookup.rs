@@ -1,7 +1,6 @@
 use bytemuck;
 use half::bf16;
 use safetensors::tensor::TensorView;
-use tokenizers::Encoding;
 use wgpu::{
     BindGroupDescriptor, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, Buffer, BufferDescriptor, CommandEncoderDescriptor, ComputePassDescriptor, ComputePipeline, ComputePipelineDescriptor, Device, PipelineCompilationOptions, PipelineLayoutDescriptor, Queue, util::{BufferInitDescriptor, DeviceExt}
 };

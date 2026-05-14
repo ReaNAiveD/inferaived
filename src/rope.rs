@@ -1,5 +1,3 @@
-/// Mirrors `Params` in `wgsl-shaders/rope.wgsl` exactly. Field order and
-/// count must stay in sync with the shader's uniform struct.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RopeParams {

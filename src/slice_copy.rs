@@ -1,4 +1,3 @@
-/// Mirrors `Params` in `wgsl-shaders/slice_copy.wgsl`.
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct SliceCopyParams {

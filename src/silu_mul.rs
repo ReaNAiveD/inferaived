@@ -1,4 +1,3 @@
-/// Mirrors `Params` in `wgsl-shaders/silu_mul.wgsl`.
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct SiluMulParams {

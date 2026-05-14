@@ -15,11 +15,11 @@ pub struct ElementwiseAddInplaceWebgpu {
     pipeline: wgpu::ComputePipeline,
     uniform_buffer: wgpu::Buffer,
 
-    hidden_size: usize,
+    vec_dim: usize,
 }
 
 impl ElementwiseAddInplaceWebgpu {
-    pub fn new(device: &wgpu::Device, hidden_size: usize) -> Self {
+    pub fn new(device: &wgpu::Device, vec_dim: usize) -> Self {
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("elementwise_add/shader"),
             source: wgpu::ShaderSource::Wgsl(
@@ -87,7 +87,7 @@ impl ElementwiseAddInplaceWebgpu {
             bind_group_layout,
             pipeline,
             uniform_buffer,
-            hidden_size,
+            vec_dim,
         }
     }
 
@@ -101,10 +101,10 @@ impl ElementwiseAddInplaceWebgpu {
     ) {
         let uniform = ElementwiseAddParams {
             hidden_offset: 0,
-            hidden_token_stride: self.hidden_size as u32,
+            hidden_token_stride: self.vec_dim as u32,
             addend_offset: 0,
-            addend_token_stride: self.hidden_size as u32,
-            hidden_size: self.hidden_size as u32,
+            addend_token_stride: self.vec_dim as u32,
+            hidden_size: self.vec_dim as u32,
             seq_len: seq_len as u32,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));

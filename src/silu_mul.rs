@@ -15,11 +15,11 @@ pub struct SiluMulInplaceWebgpu {
     pipeline: wgpu::ComputePipeline,
     uniform_buffer: wgpu::Buffer,
 
-    hidden_size: usize,
+    vec_dim: usize,
 }
 
 impl SiluMulInplaceWebgpu {
-    pub fn new(device: &wgpu::Device, hidden_size: usize) -> Self {
+    pub fn new(device: &wgpu::Device, vec_dim: usize) -> Self {
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("silu_mul/shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("wgsl-shaders/silu_mul.wgsl").into()),
@@ -85,11 +85,11 @@ impl SiluMulInplaceWebgpu {
             bind_group_layout,
             pipeline,
             uniform_buffer,
-            hidden_size,
+            vec_dim,
         }
     }
 
-    /// Both buffers are tightly packed `[seq_len, hidden_size]`.
+    /// Both buffers are tightly packed `[seq_len, vec_dim]`.
     pub fn compute(
         &self,
         device: &wgpu::Device,
@@ -100,10 +100,10 @@ impl SiluMulInplaceWebgpu {
     ) {
         let uniform = SiluMulParams {
             hidden_offset: 0,
-            hidden_token_stride: self.hidden_size as u32,
+            hidden_token_stride: self.vec_dim as u32,
             gate_offset: 0,
-            gate_token_stride: self.hidden_size as u32,
-            hidden_size: self.hidden_size as u32,
+            gate_token_stride: self.vec_dim as u32,
+            hidden_size: self.vec_dim as u32,
             seq_len: seq_len as u32,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));

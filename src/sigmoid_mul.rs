@@ -19,11 +19,11 @@ pub struct SigmoidMulInplaceWebgpu {
     pipeline: wgpu::ComputePipeline,
     uniform_buffer: wgpu::Buffer,
 
-    hidden_size: usize,
+    vec_dim: usize,
 }
 
 impl SigmoidMulInplaceWebgpu {
-    pub fn new(device: &wgpu::Device, hidden_size: usize) -> Self {
+    pub fn new(device: &wgpu::Device, vec_dim: usize) -> Self {
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sigmoid_mul/shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("wgsl-shaders/sigmoid_mul.wgsl").into()),
@@ -89,12 +89,12 @@ impl SigmoidMulInplaceWebgpu {
             bind_group_layout,
             pipeline,
             uniform_buffer,
-            hidden_size,
+            vec_dim,
         }
     }
 
-    /// Both buffers are tightly packed `[seq_len, hidden_size]`. Equivalent to
-    /// `compute_strided` with `num_heads = 1, head_dim = hidden_size`.
+    /// Both buffers are tightly packed `[seq_len, vec_dim]`. Equivalent to
+    /// `compute_strided` with `num_heads = 1, head_dim = vec_dim`.
     pub fn compute(
         &self,
         device: &wgpu::Device,
@@ -109,13 +109,13 @@ impl SigmoidMulInplaceWebgpu {
             src_buffer,
             gate_buffer,
             0,
-            self.hidden_size,
-            self.hidden_size,
+            self.vec_dim,
+            self.vec_dim,
             0,
-            self.hidden_size,
-            self.hidden_size,
+            self.vec_dim,
+            self.vec_dim,
             1,
-            self.hidden_size,
+            self.vec_dim,
             seq_len,
         );
     }

@@ -18,8 +18,8 @@ pub struct MulMatWebgpu {
     pipeline: wgpu::ComputePipeline,
     uniform_buffer: wgpu::Buffer,
     mat_src0_buffer: wgpu::Buffer,
-    m_size: usize,
-    hidden_size: usize,
+    m_dim: usize,
+    k_dim: usize,
 }
 
 impl MulMatWebgpu {
@@ -37,8 +37,15 @@ impl MulMatWebgpu {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         mat_src0: TensorView<'data>,
-        hidden_size: usize,
     ) -> Self {
+        debug_assert_eq!(
+            mat_src0.shape().len(),
+            2,
+            "MulMatWebgpu weight must be 2-D, got shape {:?}",
+            mat_src0.shape(),
+        );
+        let m_dim = mat_src0.shape()[0] as usize;
+        let k_dim = mat_src0.shape()[1] as usize;
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("mul_mat/shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
@@ -121,10 +128,6 @@ impl MulMatWebgpu {
             .chunks_exact(4)
             .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect::<Vec<u32>>();
-        if mat_src_u32.len() * 2 % hidden_size != 0 {
-            panic!("The size of matrix src0 must be a multiple of hidden_size");
-        }
-        let m = mat_src_u32.len() * 2 / hidden_size;
         let mat_src0_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mul_mat/mat_src0_buffer"),
             size: (mat_src_u32.len() * std::mem::size_of::<u32>()) as u64,
@@ -137,8 +140,8 @@ impl MulMatWebgpu {
             pipeline,
             uniform_buffer,
             mat_src0_buffer,
-            m_size: m,
-            hidden_size,
+            m_dim,
+            k_dim,
         }
     }
 
@@ -148,17 +151,17 @@ impl MulMatWebgpu {
         queue: &wgpu::Queue,
         mat_src1_buffer: &wgpu::Buffer,
         mat_dst_buffer: &wgpu::Buffer,
-        n_rows: usize,
+        n_dim: usize,
     ) {
         let uniform = MulMatParams {
             weight_offset: 0,
             input_offset: 0,
             output_offset: 0,
-            m: self.m_size as u32,
-            n: n_rows as u32,
-            k: self.hidden_size as u32,
-            weight_row_stride: self.hidden_size as u32,
-            input_row_stride: self.hidden_size as u32,
+            m: self.m_dim as u32,
+            n: n_dim as u32,
+            k: self.k_dim as u32,
+            weight_row_stride: self.k_dim as u32,
+            input_row_stride: self.k_dim as u32,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniform]));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -193,9 +196,9 @@ impl MulMatWebgpu {
             });
             cpass.set_pipeline(&self.pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
-            let wg_num_m = (self.m_size + Self::WORKGROUP_SIZE_M * Self::TILE_M - 1)
+            let wg_num_m = (self.m_dim + Self::WORKGROUP_SIZE_M * Self::TILE_M - 1)
                 / (Self::WORKGROUP_SIZE_M * Self::TILE_M);
-            let wg_num_n = (n_rows + Self::WORKGROUP_SIZE_N * Self::TILE_N - 1)
+            let wg_num_n = (n_dim + Self::WORKGROUP_SIZE_N * Self::TILE_N - 1)
                 / (Self::WORKGROUP_SIZE_N * Self::TILE_N);
             cpass.dispatch_workgroups((wg_num_m * wg_num_n) as u32, 1, 1);
         }
@@ -250,7 +253,7 @@ mod tests {
             &weight_bf16_bytes,
         )
         .unwrap();
-        let gpu = MulMatWebgpu::new(&device, &queue, tv, k);
+        let gpu = MulMatWebgpu::new(&device, &queue, tv);
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, n * m);
         gpu.compute(&device, &queue, &in_buf, &out_buf, n);

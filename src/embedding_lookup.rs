@@ -31,14 +31,18 @@ pub struct EmbeddingLookupWebgpu {
 
 impl EmbeddingLookupWebgpu {
     /// Creates a new GPU-based embedding lookup.
-    /// Note: `stride_src1` is in u32 units (hidden_size / 2) because the shader
-    /// reads packed bf16 pairs as `array<u32>`.
     pub fn new<'data>(
         device: &Device,
         queue: &Queue,
         embeddings: TensorView<'data>,
-        hidden_size: usize,
     ) -> Self {
+        debug_assert_eq!(
+            embeddings.shape().len(),
+            2,
+            "EmbeddingLookupWebgpu embeddings must be 2-D [vocab_size, hidden_size], got shape {:?}",
+            embeddings.shape(),
+        );
+        let hidden_size = embeddings.shape()[1];
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("embedding_lookup/shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
@@ -289,7 +293,7 @@ mod tests {
             &embed_bf16_bytes,
         )
         .unwrap();
-        let gpu = EmbeddingLookupWebgpu::new(&device, &queue, tv, hidden_size);
+        let gpu = EmbeddingLookupWebgpu::new(&device, &queue, tv);
         let out_buf = create_f32_buffer(&device, indices.len() * hidden_size);
         gpu.compute(&device, &queue, &indices, &out_buf);
         let actual = download_f32(&device, &queue, &out_buf, indices.len() * hidden_size);

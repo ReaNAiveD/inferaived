@@ -26,7 +26,7 @@ pub struct RmsNormWebgpu {
     pipeline: ComputePipeline,
     uniform_buffer: Buffer,
     weight_buffer: Buffer,
-    hidden_size: usize,
+    norm_dim: usize,
 }
 
 impl RmsNormWebgpu {
@@ -34,8 +34,14 @@ impl RmsNormWebgpu {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         weight: TensorView<'data>,
-        hidden_size: usize,
     ) -> Self {
+        debug_assert_eq!(
+            weight.shape().len(),
+            1,
+            "RmsNormWebgpu weight must be 1-D, got shape {:?}",
+            weight.shape(),
+        );
+        let norm_dim = weight.shape()[0] as usize;
         let weight_f32: Vec<f32> = weight
             .data()
             .chunks_exact(2)
@@ -44,7 +50,13 @@ impl RmsNormWebgpu {
                 half::bf16::from_bits(bits).to_f32()
             })
             .collect();
-        debug_assert_eq!(weight_f32.len(), hidden_size);
+        debug_assert_eq!(
+            weight_f32.len(),
+            norm_dim,
+            "RmsNormWebgpu weight data length ({} bf16 elements) does not match shape {:?}",
+            weight_f32.len(),
+            weight.shape(),
+        );
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rms_norm/shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
@@ -130,7 +142,7 @@ impl RmsNormWebgpu {
             pipeline,
             uniform_buffer,
             weight_buffer,
-            hidden_size,
+            norm_dim,
         }
     }
 
@@ -144,8 +156,8 @@ impl RmsNormWebgpu {
     ) {
         let uniform = RmsNormParams {
             input_offset: 0,
-            input_row_stride: self.hidden_size as u32,
-            hidden_size: self.hidden_size as u32,
+            input_row_stride: self.norm_dim as u32,
+            hidden_size: self.norm_dim as u32,
             seq_len: n_rows as u32,
             eps: 1e-6,
         };
@@ -192,7 +204,11 @@ pub struct RmsNormInplaceWebgpu {
     pipeline: ComputePipeline,
     uniform_buffer: Buffer,
     weight_buffer: Buffer,
-    hidden_size: usize,
+    /// Length of the per-vector axis being normalized (the "last dim" of each
+    /// row). Inferred from `weight.shape()[0]` at construction — NOT necessarily
+    /// the model's `hidden_size`. The caller is expected to load a weight whose
+    /// shape matches the intended axis (e.g. `head_dim` for q_norm/k_norm).
+    norm_dim: usize,
 }
 
 impl RmsNormInplaceWebgpu {
@@ -200,8 +216,14 @@ impl RmsNormInplaceWebgpu {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         weight: TensorView<'data>,
-        hidden_size: usize,
     ) -> Self {
+        debug_assert_eq!(
+            weight.shape().len(),
+            1,
+            "RmsNormInplaceWebgpu weight must be 1-D, got shape {:?}",
+            weight.shape(),
+        );
+        let norm_dim = weight.shape()[0] as usize;
         let weight_f32: Vec<f32> = weight
             .data()
             .chunks_exact(2)
@@ -210,7 +232,13 @@ impl RmsNormInplaceWebgpu {
                 half::bf16::from_bits(bits).to_f32()
             })
             .collect();
-        debug_assert_eq!(weight_f32.len(), hidden_size);
+        debug_assert_eq!(
+            weight_f32.len(),
+            norm_dim,
+            "RmsNormInplaceWebgpu weight data length ({} bf16 elements) does not match shape {:?}",
+            weight_f32.len(),
+            weight.shape(),
+        );
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rms_norm_inplace/shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
@@ -286,7 +314,7 @@ impl RmsNormInplaceWebgpu {
             pipeline,
             uniform_buffer,
             weight_buffer,
-            hidden_size,
+            norm_dim,
         }
     }
 
@@ -297,7 +325,7 @@ impl RmsNormInplaceWebgpu {
         src_buffer: &Buffer,
         n_rows: usize,
     ) {
-        self.compute_strided(device, queue, src_buffer, 0, n_rows, self.hidden_size);
+        self.compute_strided(device, queue, src_buffer, 0, n_rows, self.norm_dim);
     }
 
     /// Normalize `n_rows` rows that are spaced `row_stride` elements apart,
@@ -314,7 +342,7 @@ impl RmsNormInplaceWebgpu {
         let uniform = RmsNormInplaceParams {
             hidden_offset: offset as u32,
             hidden_row_stride: row_stride as u32,
-            hidden_size: self.hidden_size as u32,
+            hidden_size: self.norm_dim as u32,
             seq_len: n_rows as u32,
             eps: 1e-6,
         };
@@ -404,7 +432,7 @@ mod tests {
             .collect();
         let expected = cpu_rms_norm(&input, &weight_roundtrip, hidden_size, seq_len, 1e-6);
 
-        let gpu = RmsNormWebgpu::new(&device, &queue, tv, hidden_size);
+        let gpu = RmsNormWebgpu::new(&device, &queue, tv);
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, seq_len * hidden_size);
         gpu.compute(&device, &queue, &in_buf, &out_buf, seq_len);
@@ -471,7 +499,7 @@ mod tests {
             1e-6,
         );
 
-        let gpu = RmsNormInplaceWebgpu::new(&device, &queue, tv, hidden_size);
+        let gpu = RmsNormInplaceWebgpu::new(&device, &queue, tv);
         let buf = upload_f32(&device, &data);
         gpu.compute(&device, &queue, &buf, seq_len);
         let actual = download_f32(&device, &queue, &buf, seq_len * hidden_size);
@@ -516,7 +544,7 @@ mod tests {
             1e-6,
         );
 
-        let gpu = RmsNormInplaceWebgpu::new(&device, &queue, tv, hidden_size);
+        let gpu = RmsNormInplaceWebgpu::new(&device, &queue, tv);
         let buf = upload_f32(&device, &data);
         gpu.compute_strided(&device, &queue, &buf, offset, n_rows, row_stride);
         let actual = download_f32(&device, &queue, &buf, total);

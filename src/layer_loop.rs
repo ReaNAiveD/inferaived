@@ -65,7 +65,7 @@ impl LinearAttentionLayer {
         ));
         log_tensor(&input_layernorm_weight_name, &input_layernorm_weight);
         let input_layernorm =
-            RmsNormWebgpu::new(device, queue, input_layernorm_weight, hidden_size);
+            RmsNormWebgpu::new(device, queue, input_layernorm_weight);
         let qkv_weight_name = format!("{}.linear_attn.in_proj_qkv.weight", weight_prefix);
         let qkv_weight = tensor
             .tensor(&qkv_weight_name)
@@ -83,7 +83,7 @@ impl LinearAttentionLayer {
             "{} width does not match hidden_size",
             qkv_weight_name
         );
-        let in_proj_qkv_mul_mat = MulMatWebgpu::new(device, queue, qkv_weight, hidden_size);
+        let in_proj_qkv_mul_mat = MulMatWebgpu::new(device, queue, qkv_weight);
         let in_proj_z_weight_name = format!("{}.linear_attn.in_proj_z.weight", weight_prefix);
         let in_proj_z_weight = tensor.tensor(&in_proj_z_weight_name).expect(&format!(
             "Failed to get tensor for {}",
@@ -102,7 +102,7 @@ impl LinearAttentionLayer {
             "{} width does not match hidden_size",
             in_proj_z_weight_name
         );
-        let in_proj_z_mul_mat = MulMatWebgpu::new(device, queue, in_proj_z_weight, hidden_size);
+        let in_proj_z_mul_mat = MulMatWebgpu::new(device, queue, in_proj_z_weight);
         let in_proj_a_weight_name = format!("{}.linear_attn.in_proj_a.weight", weight_prefix);
         let in_proj_a_weight = tensor.tensor(&in_proj_a_weight_name).expect(&format!(
             "Failed to get tensor for {}",
@@ -121,7 +121,7 @@ impl LinearAttentionLayer {
             "{} width does not match hidden_size",
             in_proj_a_weight_name
         );
-        let in_proj_a_mul_mat = MulMatWebgpu::new(device, queue, in_proj_a_weight, hidden_size);
+        let in_proj_a_mul_mat = MulMatWebgpu::new(device, queue, in_proj_a_weight);
         let in_proj_b_weight_name = format!("{}.linear_attn.in_proj_b.weight", weight_prefix);
         let in_proj_b_weight = tensor.tensor(&in_proj_b_weight_name).expect(&format!(
             "Failed to get tensor for {}",
@@ -140,7 +140,7 @@ impl LinearAttentionLayer {
             "{} width does not match hidden_size",
             in_proj_b_weight_name
         );
-        let in_proj_b_mul_mat = MulMatWebgpu::new(device, queue, in_proj_b_weight, hidden_size);
+        let in_proj_b_mul_mat = MulMatWebgpu::new(device, queue, in_proj_b_weight);
         let conv1d_weight_name = format!("{}.linear_attn.conv1d.weight", weight_prefix);
         let conv1d_weight = tensor
             .tensor(&conv1d_weight_name)
@@ -217,7 +217,7 @@ impl LinearAttentionLayer {
             "{} width does not match v_dim",
             out_proj_weight_name
         );
-        let out_proj_mat_mul = MulMatWebgpu::new(&device, &queue, out_proj_weight, v_dim);
+        let out_proj_mat_mul = MulMatWebgpu::new(&device, &queue, out_proj_weight);
         let attn_residual_add = ElementwiseAddInplaceWebgpu::new(&device, hidden_size);
         let post_attention_layernorm_weight_name =
             format!("{}.post_attention_layernorm.weight", weight_prefix);
@@ -231,7 +231,6 @@ impl LinearAttentionLayer {
             &device,
             &queue,
             post_attention_layernorm_weight,
-            hidden_size,
         );
         let mlp = MultiLayerPerceptron::new(
             device,
@@ -489,7 +488,7 @@ impl SelfAttentionLayer {
         ));
         log_tensor(&input_layernorm_weight_name, &input_layernorm_weight);
         let input_layernorm =
-            RmsNormWebgpu::new(device, queue, input_layernorm_weight, hidden_size);
+            RmsNormWebgpu::new(device, queue, input_layernorm_weight);
         let q_proj_weight_name = format!("{}.self_attn.q_proj.weight", weight_prefix);
         let q_proj_weight = tensor
             .tensor(&q_proj_weight_name)
@@ -507,7 +506,7 @@ impl SelfAttentionLayer {
             "{} width does not match hidden_size",
             q_proj_weight_name
         );
-        let q_proj_mul_mat = MulMatWebgpu::new(device, queue, q_proj_weight, hidden_size);
+        let q_proj_mul_mat = MulMatWebgpu::new(device, queue, q_proj_weight);
         let q_extract = SliceCopyWebgpu::new(device);
         let k_proj_weight_name = format!("{}.self_attn.k_proj.weight", weight_prefix);
         let k_proj_weight = tensor
@@ -526,7 +525,7 @@ impl SelfAttentionLayer {
             "{} width does not match hidden_size",
             k_proj_weight_name
         );
-        let k_proj_mul_mat = MulMatWebgpu::new(device, queue, k_proj_weight, hidden_size);
+        let k_proj_mul_mat = MulMatWebgpu::new(device, queue, k_proj_weight);
         let v_proj_weight_name = format!("{}.self_attn.v_proj.weight", weight_prefix);
         let v_proj_weight = tensor
             .tensor(&v_proj_weight_name)
@@ -544,19 +543,19 @@ impl SelfAttentionLayer {
             "{} width does not match hidden_size",
             v_proj_weight_name
         );
-        let v_proj_mul_mat = MulMatWebgpu::new(device, queue, v_proj_weight, hidden_size);
+        let v_proj_mul_mat = MulMatWebgpu::new(device, queue, v_proj_weight);
         let q_norm_weight_name = format!("{}.self_attn.q_norm.weight", weight_prefix);
         let q_norm_weight = tensor
             .tensor(&q_norm_weight_name)
             .expect(&format!("Failed to get tensor for {}", q_norm_weight_name));
         log_tensor(&q_norm_weight_name, &q_norm_weight);
-        let q_norm = RmsNormInplaceWebgpu::new(device, queue, q_norm_weight, config.head_dim);
+        let q_norm = RmsNormInplaceWebgpu::new(device, queue, q_norm_weight);
         let k_norm_weight_name = format!("{}.self_attn.k_norm.weight", weight_prefix);
         let k_norm_weight = tensor
             .tensor(&k_norm_weight_name)
             .expect(&format!("Failed to get tensor for {}", k_norm_weight_name));
         log_tensor(&k_norm_weight_name, &k_norm_weight);
-        let k_norm = RmsNormInplaceWebgpu::new(device, queue, k_norm_weight, config.head_dim);
+        let k_norm = RmsNormInplaceWebgpu::new(device, queue, k_norm_weight);
         let rope = RopeInplaceWebgpu::new(
             device,
             config.num_attention_heads,
@@ -591,7 +590,7 @@ impl SelfAttentionLayer {
             "{} width does not match num_attention_heads * head_dim",
             o_proj_weight_name
         );
-        let o_proj_mul_mat = MulMatWebgpu::new(device, queue, o_proj_weight, q_dim);
+        let o_proj_mul_mat = MulMatWebgpu::new(device, queue, o_proj_weight);
         let attn_residual_add = ElementwiseAddInplaceWebgpu::new(&device, hidden_size);
         let post_attention_layernorm_weight_name =
             format!("{}.post_attention_layernorm.weight", weight_prefix);
@@ -605,7 +604,6 @@ impl SelfAttentionLayer {
             &device,
             &queue,
             post_attention_layernorm_weight,
-            hidden_size,
         );
         let mlp = MultiLayerPerceptron::new(
             device,

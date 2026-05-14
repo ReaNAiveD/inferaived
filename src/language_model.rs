@@ -97,7 +97,7 @@ impl<'data> Qwen35Model<'data> {
         ));
         log_tensor(final_norm_weight_name, &final_norm_weight);
         let final_norm =
-            RmsNormInplaceWebgpu::new(device, queue, final_norm_weight, config.hidden_size);
+            RmsNormInplaceWebgpu::new(device, queue, final_norm_weight);
         let last_hidden_readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("qwen35_model/last_hidden_readback_buffer"),
             size: (config.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,

@@ -28,8 +28,8 @@ pub struct CausalGqaNaiveAttentionWebgpu {
 
     num_q_heads: usize,
     num_kv_heads: usize,
-    q_dim: usize,
-    v_dim: usize,
+    qk_head_dim: usize,
+    v_head_dim: usize,
 }
 
 impl CausalGqaNaiveAttentionWebgpu {
@@ -39,8 +39,8 @@ impl CausalGqaNaiveAttentionWebgpu {
         device: &wgpu::Device,
         num_q_heads: usize,
         num_kv_heads: usize,
-        q_dim: usize,
-        v_dim: usize,
+        qk_head_dim: usize,
+        v_head_dim: usize,
     ) -> Self {
         debug_assert!(
             num_q_heads % num_kv_heads == 0,
@@ -50,13 +50,13 @@ impl CausalGqaNaiveAttentionWebgpu {
         );
         // The shader keeps a private `array<f32, MAX_V_PER_THREAD>` of size 4
         // per thread for the V-weighted accumulator. With workgroup_size=128
-        // this caps v_dim at 4 * 128 = 512, which covers all current models.
+        // this caps v_head_dim at 4 * 128 = 512, which covers all current models.
         let max_v_per_thread = 4u32;
         debug_assert!(
-            (v_dim as u32) <= max_v_per_thread * Self::WORKGROUP_SIZE,
-            "v_dim ({}) exceeds MAX_V_PER_THREAD ({}) * workgroup_size ({}). \
+            (v_head_dim as u32) <= max_v_per_thread * Self::WORKGROUP_SIZE,
+            "v_head_dim ({}) exceeds MAX_V_PER_THREAD ({}) * workgroup_size ({}). \
              Increase MAX_V_PER_THREAD in causal_gqa_naive_attention.wgsl or workgroup_size.",
-            v_dim,
+            v_head_dim,
             max_v_per_thread,
             Self::WORKGROUP_SIZE,
         );
@@ -149,8 +149,8 @@ impl CausalGqaNaiveAttentionWebgpu {
             uniform_buffer,
             num_q_heads,
             num_kv_heads,
-            q_dim,
-            v_dim,
+            qk_head_dim,
+            v_head_dim,
         }
     }
 
@@ -158,10 +158,10 @@ impl CausalGqaNaiveAttentionWebgpu {
     ///
     /// Buffers are assumed to be tightly packed in row-major layout starting
     /// at offset 0:
-    /// - `q_buffer`: `[seq_len, num_q_heads, q_dim]`
-    /// - `k_buffer`: `[seq_len, num_kv_heads, q_dim]`
-    /// - `v_buffer`: `[seq_len, num_kv_heads, v_dim]`
-    /// - `output_buffer`: `[seq_len, num_q_heads, v_dim]`
+    /// - `q_buffer`: `[seq_len, num_q_heads, qk_head_dim]`
+    /// - `k_buffer`: `[seq_len, num_kv_heads, qk_head_dim]`
+    /// - `v_buffer`: `[seq_len, num_kv_heads, v_head_dim]`
+    /// - `output_buffer`: `[seq_len, num_q_heads, v_head_dim]`
     pub fn compute(
         &self,
         device: &wgpu::Device,
@@ -174,21 +174,21 @@ impl CausalGqaNaiveAttentionWebgpu {
     ) {
         let params = CausalGqaNaiveAttentionParams {
             q_offset: 0,
-            q_token_stride: (self.num_q_heads * self.q_dim) as u32,
-            q_head_stride: self.q_dim as u32,
+            q_token_stride: (self.num_q_heads * self.qk_head_dim) as u32,
+            q_head_stride: self.qk_head_dim as u32,
             k_offset: 0,
-            k_token_stride: (self.num_kv_heads * self.q_dim) as u32,
-            k_head_stride: self.q_dim as u32,
+            k_token_stride: (self.num_kv_heads * self.qk_head_dim) as u32,
+            k_head_stride: self.qk_head_dim as u32,
             v_offset: 0,
-            v_token_stride: (self.num_kv_heads * self.v_dim) as u32,
-            v_head_stride: self.v_dim as u32,
+            v_token_stride: (self.num_kv_heads * self.v_head_dim) as u32,
+            v_head_stride: self.v_head_dim as u32,
             output_offset: 0,
-            output_token_stride: (self.num_q_heads * self.v_dim) as u32,
-            output_head_stride: self.v_dim as u32,
+            output_token_stride: (self.num_q_heads * self.v_head_dim) as u32,
+            output_head_stride: self.v_head_dim as u32,
             num_q_heads: self.num_q_heads as u32,
             num_kv_heads: self.num_kv_heads as u32,
-            q_dim: self.q_dim as u32,
-            v_dim: self.v_dim as u32,
+            q_dim: self.qk_head_dim as u32,
+            v_dim: self.v_head_dim as u32,
             seq_len: seq_len as u32,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[params]));

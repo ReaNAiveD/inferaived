@@ -38,7 +38,7 @@ impl MultiLayerPerceptron {
             mlp_gate_proj_weight_name
         );
         let mlp_gate_proj_mul_mat =
-            MulMatWebgpu::new(&device, &queue, mlp_gate_proj_weight, hidden_size);
+            MulMatWebgpu::new(&device, &queue, mlp_gate_proj_weight);
         let mlp_up_proj_weight_name = format!("{}.mlp.up_proj.weight", weight_prefix);
         let mlp_up_proj_weight = tensor.tensor(&mlp_up_proj_weight_name).expect(&format!(
             "Failed to get tensor for {}",
@@ -58,7 +58,7 @@ impl MultiLayerPerceptron {
             mlp_up_proj_weight_name
         );
         let mlp_up_proj_mul_mat =
-            MulMatWebgpu::new(&device, &queue, mlp_up_proj_weight, hidden_size);
+            MulMatWebgpu::new(&device, &queue, mlp_up_proj_weight);
         let mlp_silu_mul = SiluMulInplaceWebgpu::new(&device, intermediate_size);
         let mlp_down_proj_weight_name = format!("{}.mlp.down_proj.weight", weight_prefix);
         let mlp_down_proj_weight = tensor.tensor(&mlp_down_proj_weight_name).expect(&format!(
@@ -79,7 +79,7 @@ impl MultiLayerPerceptron {
             mlp_down_proj_weight_name
         );
         let mlp_down_proj_mul_mat =
-            MulMatWebgpu::new(&device, &queue, mlp_down_proj_weight, intermediate_size);
+            MulMatWebgpu::new(&device, &queue, mlp_down_proj_weight);
         Self {
             intermediate_size,
             mlp_gate_proj_mul_mat,

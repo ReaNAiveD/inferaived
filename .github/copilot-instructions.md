@@ -15,6 +15,8 @@ These principles synthesize widely-accepted software engineering wisdom (SOLID, 
 - **Parse, don't validate.** Convert untrusted input into a strongly-typed representation at the boundary, then operate on the typed form internally. Do not re-check the same invariant at every use site.
 - **High cohesion, low coupling.** Group related data and behavior together. Minimize what each module needs to know about others. Depend on abstractions, not concrete implementations.
 - **APIs should be hard to misuse.** Function signatures, type bounds, and ownership rules should make incorrect calls fail to compile. Surface errors as early as possible — preferably at compile time, otherwise at construction, never silently at runtime.
+- **Name parameters by semantic role, not by typical-case value.** A matmul's contraction dim is `k`, not `hidden_size` — the latter happens to be correct for q/k/v projections but silently wrong for o_proj or FFN down-projection. Names that encode "where this value usually comes from" lure callers into supplying the wrong value when the typical case doesn't apply.
+- **Validate every dimension of weight tensors at construction.** When a `Linear(in, out)` weight is loaded, assert BOTH `shape[0] == out` AND `shape[1] == in`. One-sided assertions catch only half of misconfigurations and let the other half degrade silently into wrong results.
 - **Optimize for reading, not writing.** Code is read far more often than written. Choose names that describe intent over implementation. Keep functions short enough to understand at a glance.
 
 ## GPU Compute Design Principles

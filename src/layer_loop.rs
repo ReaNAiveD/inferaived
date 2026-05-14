@@ -77,6 +77,12 @@ impl LinearAttentionLayer {
             "{} height does not match q_dim+k_dim+v_dim",
             qkv_weight_name
         );
+        debug_assert_eq!(
+            qkv_weight.shape()[1] as usize,
+            hidden_size,
+            "{} width does not match hidden_size",
+            qkv_weight_name
+        );
         let in_proj_qkv_mul_mat = MulMatWebgpu::new(device, queue, qkv_weight, hidden_size);
         let in_proj_z_weight_name = format!("{}.linear_attn.in_proj_z.weight", weight_prefix);
         let in_proj_z_weight = tensor.tensor(&in_proj_z_weight_name).expect(&format!(
@@ -88,6 +94,12 @@ impl LinearAttentionLayer {
             in_proj_z_weight.shape()[0] as usize,
             v_dim,
             "{} height does not match v_dim",
+            in_proj_z_weight_name
+        );
+        debug_assert_eq!(
+            in_proj_z_weight.shape()[1] as usize,
+            hidden_size,
+            "{} width does not match hidden_size",
             in_proj_z_weight_name
         );
         let in_proj_z_mul_mat = MulMatWebgpu::new(device, queue, in_proj_z_weight, hidden_size);
@@ -103,6 +115,12 @@ impl LinearAttentionLayer {
             "{} height does not match linear_num_value_heads",
             in_proj_a_weight_name
         );
+        debug_assert_eq!(
+            in_proj_a_weight.shape()[1] as usize,
+            hidden_size,
+            "{} width does not match hidden_size",
+            in_proj_a_weight_name
+        );
         let in_proj_a_mul_mat = MulMatWebgpu::new(device, queue, in_proj_a_weight, hidden_size);
         let in_proj_b_weight_name = format!("{}.linear_attn.in_proj_b.weight", weight_prefix);
         let in_proj_b_weight = tensor.tensor(&in_proj_b_weight_name).expect(&format!(
@@ -114,6 +132,12 @@ impl LinearAttentionLayer {
             in_proj_b_weight.shape()[0] as usize,
             config.linear_num_value_heads,
             "{} height does not match linear_num_value_heads",
+            in_proj_b_weight_name
+        );
+        debug_assert_eq!(
+            in_proj_b_weight.shape()[1] as usize,
+            hidden_size,
+            "{} width does not match hidden_size",
             in_proj_b_weight_name
         );
         let in_proj_b_mul_mat = MulMatWebgpu::new(device, queue, in_proj_b_weight, hidden_size);
@@ -185,6 +209,12 @@ impl LinearAttentionLayer {
             out_proj_weight.shape()[0] as usize,
             hidden_size,
             "{} height does not match hidden_size",
+            out_proj_weight_name
+        );
+        debug_assert_eq!(
+            out_proj_weight.shape()[1] as usize,
+            v_dim,
+            "{} width does not match v_dim",
             out_proj_weight_name
         );
         let out_proj_mat_mul = MulMatWebgpu::new(&device, &queue, out_proj_weight, v_dim);
@@ -471,6 +501,12 @@ impl SelfAttentionLayer {
             "{} height does not match num_attention_heads * head_dim * 2 (output gate)",
             q_proj_weight_name
         );
+        debug_assert_eq!(
+            q_proj_weight.shape()[1] as usize,
+            hidden_size,
+            "{} width does not match hidden_size",
+            q_proj_weight_name
+        );
         let q_proj_mul_mat = MulMatWebgpu::new(device, queue, q_proj_weight, hidden_size);
         let q_extract = SliceCopyWebgpu::new(device);
         let k_proj_weight_name = format!("{}.self_attn.k_proj.weight", weight_prefix);
@@ -484,6 +520,12 @@ impl SelfAttentionLayer {
             "{} height does not match num_key_value_heads * head_dim",
             k_proj_weight_name
         );
+        debug_assert_eq!(
+            k_proj_weight.shape()[1] as usize,
+            hidden_size,
+            "{} width does not match hidden_size",
+            k_proj_weight_name
+        );
         let k_proj_mul_mat = MulMatWebgpu::new(device, queue, k_proj_weight, hidden_size);
         let v_proj_weight_name = format!("{}.self_attn.v_proj.weight", weight_prefix);
         let v_proj_weight = tensor
@@ -494,6 +536,12 @@ impl SelfAttentionLayer {
             v_proj_weight.shape()[0] as usize,
             kv_dim,
             "{} height does not match num_key_value_heads * head_dim",
+            v_proj_weight_name
+        );
+        debug_assert_eq!(
+            v_proj_weight.shape()[1] as usize,
+            hidden_size,
+            "{} width does not match hidden_size",
             v_proj_weight_name
         );
         let v_proj_mul_mat = MulMatWebgpu::new(device, queue, v_proj_weight, hidden_size);

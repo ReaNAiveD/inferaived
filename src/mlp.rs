@@ -31,6 +31,12 @@ impl MultiLayerPerceptron {
             "{} height does not match intermediate_size",
             mlp_gate_proj_weight_name
         );
+        debug_assert_eq!(
+            mlp_gate_proj_weight.shape()[1] as usize,
+            hidden_size,
+            "{} width does not match hidden_size",
+            mlp_gate_proj_weight_name
+        );
         let mlp_gate_proj_mul_mat =
             MulMatWebgpu::new(&device, &queue, mlp_gate_proj_weight, hidden_size);
         let mlp_up_proj_weight_name = format!("{}.mlp.up_proj.weight", weight_prefix);
@@ -43,6 +49,12 @@ impl MultiLayerPerceptron {
             mlp_up_proj_weight.shape()[0] as usize,
             intermediate_size,
             "{} height does not match intermediate_size",
+            mlp_up_proj_weight_name
+        );
+        debug_assert_eq!(
+            mlp_up_proj_weight.shape()[1] as usize,
+            hidden_size,
+            "{} width does not match hidden_size",
             mlp_up_proj_weight_name
         );
         let mlp_up_proj_mul_mat =
@@ -58,6 +70,12 @@ impl MultiLayerPerceptron {
             mlp_down_proj_weight.shape()[0] as usize,
             hidden_size,
             "{} height does not match hidden_size",
+            mlp_down_proj_weight_name
+        );
+        debug_assert_eq!(
+            mlp_down_proj_weight.shape()[1] as usize,
+            intermediate_size,
+            "{} width does not match intermediate_size",
             mlp_down_proj_weight_name
         );
         let mlp_down_proj_mul_mat =

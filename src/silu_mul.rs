@@ -77,8 +77,7 @@ impl SiluMulInplaceWebgpu {
         });
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("silu_mul/uniform_buffer"),
-            size: std::mem::size_of::<SiluMulParams
-                >() as wgpu::BufferAddress,
+            size: std::mem::size_of::<SiluMulParams>() as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });

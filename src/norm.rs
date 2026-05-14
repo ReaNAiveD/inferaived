@@ -30,8 +30,15 @@ pub struct RmsNormWebgpu {
 }
 
 impl RmsNormWebgpu {
-    pub fn new<'data>(device: &wgpu::Device, queue: &wgpu::Queue, weight: TensorView<'data>, hidden_size: usize) -> Self {
-        let weight_f32: Vec<f32> = weight.data().chunks_exact(2)
+    pub fn new<'data>(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        weight: TensorView<'data>,
+        hidden_size: usize,
+    ) -> Self {
+        let weight_f32: Vec<f32> = weight
+            .data()
+            .chunks_exact(2)
             .map(|chunk| {
                 let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
                 half::bf16::from_bits(bits).to_f32()
@@ -99,7 +106,10 @@ impl RmsNormWebgpu {
             layout: Some(&pipeline_layout),
             module: &shader_module,
             entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions { constants: &[("workgroup_size", 256f64)], zero_initialize_workgroup_memory: true },
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &[("workgroup_size", 256f64)],
+                zero_initialize_workgroup_memory: true,
+            },
             cache: None,
         });
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -124,7 +134,14 @@ impl RmsNormWebgpu {
         }
     }
 
-    pub fn compute(&self, device: &wgpu::Device, queue: &wgpu::Queue, input_buffer: &Buffer, dst_buffer: &Buffer, n_rows: usize) {
+    pub fn compute(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input_buffer: &Buffer,
+        dst_buffer: &Buffer,
+        n_rows: usize,
+    ) {
         let uniform = RmsNormParams {
             input_offset: 0,
             input_row_stride: self.hidden_size as u32,
@@ -179,8 +196,15 @@ pub struct RmsNormInplaceWebgpu {
 }
 
 impl RmsNormInplaceWebgpu {
-    pub fn new<'data>(device: &wgpu::Device, queue: &wgpu::Queue, weight: TensorView<'data>, hidden_size: usize) -> Self {
-        let weight_f32: Vec<f32> = weight.data().chunks_exact(2)
+    pub fn new<'data>(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        weight: TensorView<'data>,
+        hidden_size: usize,
+    ) -> Self {
+        let weight_f32: Vec<f32> = weight
+            .data()
+            .chunks_exact(2)
             .map(|chunk| {
                 let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
                 half::bf16::from_bits(bits).to_f32()
@@ -238,7 +262,10 @@ impl RmsNormInplaceWebgpu {
             layout: Some(&pipeline_layout),
             module: &shader_module,
             entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions { constants: &[("workgroup_size", 256f64)], zero_initialize_workgroup_memory: true },
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &[("workgroup_size", 256f64)],
+                zero_initialize_workgroup_memory: true,
+            },
             cache: None,
         });
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -263,7 +290,13 @@ impl RmsNormInplaceWebgpu {
         }
     }
 
-    pub fn compute(&self, device: &wgpu::Device, queue: &wgpu::Queue, src_buffer: &Buffer, n_rows: usize) {
+    pub fn compute(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        src_buffer: &Buffer,
+        n_rows: usize,
+    ) {
         self.compute_strided(device, queue, src_buffer, 0, n_rows, self.hidden_size);
     }
 
@@ -392,7 +425,9 @@ mod tests {
     ) {
         for t in 0..n_rows {
             let base = offset + t * row_stride;
-            let ss: f32 = (0..hidden_size).map(|i| hidden[base + i] * hidden[base + i]).sum();
+            let ss: f32 = (0..hidden_size)
+                .map(|i| hidden[base + i] * hidden[base + i])
+                .sum();
             let scale = 1.0 / (ss / hidden_size as f32 + eps).sqrt();
             for i in 0..hidden_size {
                 hidden[base + i] = hidden[base + i] * scale * (1.0 + weight[i]);
@@ -426,7 +461,15 @@ mod tests {
         .unwrap();
 
         let mut expected = data.clone();
-        cpu_rms_norm_inplace(&mut expected, &weight_roundtrip, hidden_size, 0, seq_len, hidden_size, 1e-6);
+        cpu_rms_norm_inplace(
+            &mut expected,
+            &weight_roundtrip,
+            hidden_size,
+            0,
+            seq_len,
+            hidden_size,
+            1e-6,
+        );
 
         let gpu = RmsNormInplaceWebgpu::new(&device, &queue, tv, hidden_size);
         let buf = upload_f32(&device, &data);
@@ -463,7 +506,15 @@ mod tests {
         .unwrap();
 
         let mut expected = data.clone();
-        cpu_rms_norm_inplace(&mut expected, &weight_roundtrip, hidden_size, offset, n_rows, row_stride, 1e-6);
+        cpu_rms_norm_inplace(
+            &mut expected,
+            &weight_roundtrip,
+            hidden_size,
+            offset,
+            n_rows,
+            row_stride,
+            1e-6,
+        );
 
         let gpu = RmsNormInplaceWebgpu::new(&device, &queue, tv, hidden_size);
         let buf = upload_f32(&device, &data);

@@ -15,9 +15,9 @@ pub struct MambaScanParams {
     q_offset: u32,
     k_offset: u32,
     v_offset: u32,
-    qk_head_stride: u32,    // = key_head_dim
-    v_head_stride: u32,     // = value_head_dim (may differ from key_head_dim)
-    qkv_token_stride: u32,  // = num_key_heads * key_head_dim * 2 + num_value_heads * value_head_dim
+    qk_head_stride: u32,   // = key_head_dim
+    v_head_stride: u32,    // = value_head_dim (may differ from key_head_dim)
+    qkv_token_stride: u32, // = num_key_heads * key_head_dim * 2 + num_value_heads * value_head_dim
 
     // Projection buffers (per-head scalars)
     proj_a_offset: u32,
@@ -69,9 +69,18 @@ impl MambaScanWebgpu {
             .chunks_exact(4)
             .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
             .collect();
-        debug_assert_eq!(dt_bias.len(), num_key_heads as usize, "dt_bias length must match num_key_heads");
-        debug_assert_eq!(a_log.len(), num_key_heads as usize, "a_log length must match num_key_heads");
-        let cols_per_thread = (value_head_dim as usize + Self::WORKGROUP_SIZE - 1) / Self::WORKGROUP_SIZE;
+        debug_assert_eq!(
+            dt_bias.len(),
+            num_key_heads as usize,
+            "dt_bias length must match num_key_heads"
+        );
+        debug_assert_eq!(
+            a_log.len(),
+            num_key_heads as usize,
+            "a_log length must match num_key_heads"
+        );
+        let cols_per_thread =
+            (value_head_dim as usize + Self::WORKGROUP_SIZE - 1) / Self::WORKGROUP_SIZE;
         debug_assert!(
             cols_per_thread * key_head_dim as usize <= 256,
             "Private state overflow: need {} floats per thread but MAX_KEY_HEAD_DIM=256. \
@@ -327,16 +336,19 @@ mod tests {
                 let scale = dt * pb;
 
                 for vi in 0..value_head_dim {
-                    let v_val = qkv[v_offset + vi + head * v_head_stride + token * qkv_token_stride];
+                    let v_val =
+                        qkv[v_offset + vi + head * v_head_stride + token * qkv_token_stride];
                     for ki in 0..key_head_dim {
                         let s_idx = head * state_head_stride + ki * value_head_dim + vi;
-                        let k_val = qkv[k_offset + ki + head * qk_head_stride + token * qkv_token_stride];
+                        let k_val =
+                            qkv[k_offset + ki + head * qk_head_stride + token * qkv_token_stride];
                         state[s_idx] = da * state[s_idx] + scale * k_val * v_val;
                     }
                     let mut acc = 0.0f32;
                     for ki in 0..key_head_dim {
                         let s_idx = head * state_head_stride + ki * value_head_dim + vi;
-                        let q_val = qkv[q_offset + ki + head * qk_head_stride + token * qkv_token_stride];
+                        let q_val =
+                            qkv[q_offset + ki + head * qk_head_stride + token * qkv_token_stride];
                         acc += q_val * state[s_idx];
                     }
                     output[token * output_token_stride + head * output_head_stride + vi] = acc;
@@ -365,33 +377,70 @@ mod tests {
             .map(|i| (i as f32) * 0.05 + 0.1)
             .collect();
         let dt_bias: Vec<f32> = (0..num_key_heads).map(|i| (i as f32) * 0.1 + 0.5).collect();
-        let a_log: Vec<f32> = (0..num_key_heads).map(|i| -1.0 + (i as f32) * 0.3).collect();
+        let a_log: Vec<f32> = (0..num_key_heads)
+            .map(|i| -1.0 + (i as f32) * 0.3)
+            .collect();
 
         let state_size = num_key_heads * key_head_dim * value_head_dim;
 
-        let dt_bias_bf16: Vec<u8> = dt_bias.iter().flat_map(|&v| half::bf16::from_f32(v).to_le_bytes()).collect();
+        let dt_bias_bf16: Vec<u8> = dt_bias
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
         let a_log_f32_bytes: Vec<u8> = a_log.iter().flat_map(|&v| v.to_le_bytes()).collect();
-        let dt_tv = safetensors::tensor::TensorView::new(safetensors::Dtype::BF16, vec![num_key_heads], &dt_bias_bf16).unwrap();
-        let al_tv = safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![num_key_heads], &a_log_f32_bytes).unwrap();
+        let dt_tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::BF16,
+            vec![num_key_heads],
+            &dt_bias_bf16,
+        )
+        .unwrap();
+        let al_tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::F32,
+            vec![num_key_heads],
+            &a_log_f32_bytes,
+        )
+        .unwrap();
 
-        let dt_bias_rt: Vec<f32> = dt_bias.iter().map(|&v| half::bf16::from_f32(v).to_f32()).collect();
+        let dt_bias_rt: Vec<f32> = dt_bias
+            .iter()
+            .map(|&v| half::bf16::from_f32(v).to_f32())
+            .collect();
         let mut cpu_state = vec![0.0f32; state_size];
         let expected = cpu_mamba_scan(
-            &qkv, &proj_a, &proj_b, &dt_bias_rt, &a_log,
-            &mut cpu_state, num_key_heads, key_head_dim, value_head_dim, seq_len,
+            &qkv,
+            &proj_a,
+            &proj_b,
+            &dt_bias_rt,
+            &a_log,
+            &mut cpu_state,
+            num_key_heads,
+            key_head_dim,
+            value_head_dim,
+            seq_len,
         );
 
         let gpu = MambaScanWebgpu::new(
-            &device, dt_tv, al_tv,
-            num_key_heads as u32, key_head_dim as u32, value_head_dim as u32,
+            &device,
+            dt_tv,
+            al_tv,
+            num_key_heads as u32,
+            key_head_dim as u32,
+            value_head_dim as u32,
         );
         let qkv_buf = upload_f32(&device, &qkv);
         let pa_buf = upload_f32(&device, &proj_a);
         let pb_buf = upload_f32(&device, &proj_b);
         let state_buf = upload_f32(&device, &vec![0.0f32; state_size]);
         let out_buf = create_f32_buffer(&device, seq_len * num_key_heads * value_head_dim);
-        gpu.compute(&device, &queue, &qkv_buf, &pa_buf, &pb_buf, &state_buf, &out_buf, seq_len);
-        let actual = download_f32(&device, &queue, &out_buf, seq_len * num_key_heads * value_head_dim);
+        gpu.compute(
+            &device, &queue, &qkv_buf, &pa_buf, &pb_buf, &state_buf, &out_buf, seq_len,
+        );
+        let actual = download_f32(
+            &device,
+            &queue,
+            &out_buf,
+            seq_len * num_key_heads * value_head_dim,
+        );
 
         assert_approx_eq(&actual, &expected, 1e-3);
     }

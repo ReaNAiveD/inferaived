@@ -104,13 +104,8 @@ impl MultiLayerPerceptron {
             &mlp_gate_proj_buffer,
             seq_len,
         );
-        self.mlp_up_proj_mul_mat.compute(
-            device,
-            queue,
-            input_buffer,
-            &mlp_up_proj_buffer,
-            seq_len,
-        );
+        self.mlp_up_proj_mul_mat
+            .compute(device, queue, input_buffer, &mlp_up_proj_buffer, seq_len);
         self.mlp_silu_mul.compute(
             device,
             queue,

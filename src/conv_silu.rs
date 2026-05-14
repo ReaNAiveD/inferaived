@@ -173,11 +173,7 @@ impl ConvSiluWebgpu {
             k_apply_conv: self.k_mode as u32,
             v_apply_conv: self.v_mode as u32,
         };
-        queue.write_buffer(
-            &self.uniform_buffer,
-            0,
-            bytemuck::cast_slice(&[params]),
-        );
+        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[params]));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("conv_silu/bind_group"),
             layout: &self.bind_group_layout,
@@ -310,12 +306,16 @@ mod tests {
         let expected = cpu_conv_silu(
             &input,
             &weight_packed,
-            q_dim, k_dim, v_dim,
-            seq_len, kernel_size,
+            q_dim,
+            k_dim,
+            v_dim,
+            seq_len,
+            kernel_size,
             ChannelMode::ConvSilu,
             ChannelMode::ConvSilu,
             ChannelMode::ConvSilu,
-            nc, nc,
+            nc,
+            nc,
         );
 
         let tv = safetensors::tensor::TensorView::new(
@@ -325,8 +325,15 @@ mod tests {
         )
         .unwrap();
         let gpu = ConvSiluWebgpu::new(
-            &device, tv, q_dim, k_dim, v_dim, kernel_size,
-            ChannelMode::ConvSilu, ChannelMode::ConvSilu, ChannelMode::ConvSilu,
+            &device,
+            tv,
+            q_dim,
+            k_dim,
+            v_dim,
+            kernel_size,
+            ChannelMode::ConvSilu,
+            ChannelMode::ConvSilu,
+            ChannelMode::ConvSilu,
         );
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, seq_len * nc);

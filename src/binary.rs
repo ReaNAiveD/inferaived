@@ -22,7 +22,9 @@ impl ElementwiseAddInplaceWebgpu {
     pub fn new(device: &wgpu::Device, hidden_size: usize) -> Self {
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("elementwise_add/shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("wgsl-shaders/elementwise_add.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("wgsl-shaders/elementwise_add.wgsl").into(),
+            ),
         });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("elementwise_add/bind_group_layout"),
@@ -74,7 +76,7 @@ impl ElementwiseAddInplaceWebgpu {
                 ..Default::default()
             },
             cache: None,
-         });
+        });
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("elementwise_add/uniform_buffer"),
             size: std::mem::size_of::<ElementwiseAddParams>() as u64,
@@ -89,7 +91,14 @@ impl ElementwiseAddInplaceWebgpu {
         }
     }
 
-    pub fn compute(&self, device: &wgpu::Device, queue: &wgpu::Queue, src_buffer: &wgpu::Buffer, other_buffer: &wgpu::Buffer, seq_len: usize) {
+    pub fn compute(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        src_buffer: &wgpu::Buffer,
+        other_buffer: &wgpu::Buffer,
+        seq_len: usize,
+    ) {
         let uniform = ElementwiseAddParams {
             hidden_offset: 0,
             hidden_token_stride: self.hidden_size as u32,

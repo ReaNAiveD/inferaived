@@ -243,8 +243,7 @@ impl LinearAttentionLayer {
     ) {
         let normed_embedding_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("linear_attention_layer/normed_embedding_buffer"),
-            size: (seq_len * self.hidden_size * std::mem::size_of::<f32>())
-                as wgpu::BufferAddress,
+            size: (seq_len * self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
@@ -302,8 +301,7 @@ impl LinearAttentionLayer {
         });
         let out_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("linear_attention_layer/out_proj_buffer"),
-            size: (seq_len * self.hidden_size * std::mem::size_of::<f32>())
-                as wgpu::BufferAddress,
+            size: (seq_len * self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
@@ -311,8 +309,7 @@ impl LinearAttentionLayer {
         });
         let mlp_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("linear_attention_layer/mlp_output_buffer"),
-            size: (seq_len * self.hidden_size * std::mem::size_of::<f32>())
-                as wgpu::BufferAddress,
+            size: (seq_len * self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
@@ -384,13 +381,8 @@ impl LinearAttentionLayer {
             &out_proj_buffer,
             seq_len,
         );
-        self.attn_residual_add.compute(
-            device,
-            queue,
-            &embedding_buffer,
-            &out_proj_buffer,
-            seq_len,
-        );
+        self.attn_residual_add
+            .compute(device, queue, &embedding_buffer, &out_proj_buffer, seq_len);
         self.post_attention_layernorm.compute(
             device,
             queue,
@@ -605,8 +597,7 @@ impl SelfAttentionLayer {
         let kv_dim = self.num_key_value_heads * self.head_dim;
         let normed_embedding_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("self_attention_layer/normed_embedding_buffer"),
-            size: (seq_len * self.hidden_size * std::mem::size_of::<f32>())
-                as wgpu::BufferAddress,
+            size: (seq_len * self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
@@ -657,8 +648,7 @@ impl SelfAttentionLayer {
         });
         let o_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("self_attention_layer/o_proj_buffer"),
-            size: (seq_len * self.hidden_size * std::mem::size_of::<f32>())
-                as wgpu::BufferAddress,
+            size: (seq_len * self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
@@ -666,8 +656,7 @@ impl SelfAttentionLayer {
         });
         let mlp_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("self_attention_layer/mlp_output_buffer"),
-            size: (seq_len * self.hidden_size * std::mem::size_of::<f32>())
-                as wgpu::BufferAddress,
+            size: (seq_len * self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
@@ -728,14 +717,8 @@ impl SelfAttentionLayer {
             &k_proj_buffer,
             seq_len * self.num_key_value_heads,
         );
-        self.rope.compute(
-            device,
-            queue,
-            &q_proj_buffer,
-            &k_proj_buffer,
-            seq_len,
-            0,
-        );
+        self.rope
+            .compute(device, queue, &q_proj_buffer, &k_proj_buffer, seq_len, 0);
         self.gqa_attention.compute(
             device,
             queue,
@@ -760,20 +743,10 @@ impl SelfAttentionLayer {
             self.head_dim,
             seq_len,
         );
-        self.o_proj_mul_mat.compute(
-            device,
-            queue,
-            &attn_output_buffer,
-            &o_proj_buffer,
-            seq_len,
-        );
-        self.attn_residual_add.compute(
-            device,
-            queue,
-            &embedding_buffer,
-            &o_proj_buffer,
-            seq_len,
-        );
+        self.o_proj_mul_mat
+            .compute(device, queue, &attn_output_buffer, &o_proj_buffer, seq_len);
+        self.attn_residual_add
+            .compute(device, queue, &embedding_buffer, &o_proj_buffer, seq_len);
         self.post_attention_layernorm.compute(
             device,
             queue,
@@ -813,10 +786,10 @@ impl AttentionLayer {
         seq_len: usize,
     ) {
         match self {
-            AttentionLayer::Linear(layer) => layer.compute(device, queue, embedding_buffer, seq_len),
-            AttentionLayer::Full(layer) => {
+            AttentionLayer::Linear(layer) => {
                 layer.compute(device, queue, embedding_buffer, seq_len)
             }
+            AttentionLayer::Full(layer) => layer.compute(device, queue, embedding_buffer, seq_len),
         }
     }
 }
@@ -849,14 +822,16 @@ impl LayerStack {
         for (i, layer_config) in config.layers.iter().enumerate() {
             let layer_weight_prefix = format!("{}.layers.{}", weight_prefix, i);
             let layer = match layer_config {
-                LayerConfig::Linear(linear_config) => AttentionLayer::Linear(LinearAttentionLayer::new(
-                    device,
-                    queue,
-                    tensor,
-                    &layer_weight_prefix,
-                    hidden_size,
-                    linear_config,
-                )),
+                LayerConfig::Linear(linear_config) => {
+                    AttentionLayer::Linear(LinearAttentionLayer::new(
+                        device,
+                        queue,
+                        tensor,
+                        &layer_weight_prefix,
+                        hidden_size,
+                        linear_config,
+                    ))
+                }
                 LayerConfig::Full(full_config) => AttentionLayer::Full(SelfAttentionLayer::new(
                     device,
                     queue,

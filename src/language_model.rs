@@ -133,7 +133,11 @@ impl<'data> Qwen35Model<'data> {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        queue.write_buffer(&hidden_states_buffer, 0, bytemuck::cast_slice(&token_embeddings));
+        queue.write_buffer(
+            &hidden_states_buffer,
+            0,
+            bytemuck::cast_slice(&token_embeddings),
+        );
         self.layer_stack
             .compute(device, queue, &hidden_states_buffer, input_ids.len());
         self.final_norm
@@ -166,8 +170,7 @@ impl<'data> Qwen35Model<'data> {
         rx.await
             .expect("Failed to map buffer")
             .expect("Failed to map buffer");
-        let last_hidden_state =
-            bytemuck::cast_slice::<u8, f32>(&slice.get_mapped_range()).to_vec();
+        let last_hidden_state = bytemuck::cast_slice::<u8, f32>(&slice.get_mapped_range()).to_vec();
         self.last_hidden_readback_buffer.unmap();
         let logits = self.lm_head.compute(&last_hidden_state);
         self.sampler.sample(&logits, top_k)

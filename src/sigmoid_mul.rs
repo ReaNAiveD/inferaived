@@ -197,12 +197,7 @@ mod tests {
     }
 
     /// CPU: hidden[t,h,i] *= sigmoid(gate[t,h,i])
-    fn cpu_sigmoid_mul(
-        hidden: &mut [f32],
-        gate: &[f32],
-        hidden_size: usize,
-        seq_len: usize,
-    ) {
+    fn cpu_sigmoid_mul(hidden: &mut [f32], gate: &[f32], hidden_size: usize, seq_len: usize) {
         for idx in 0..seq_len * hidden_size {
             hidden[idx] *= sigmoid(gate[idx]);
         }
@@ -249,7 +244,8 @@ mod tests {
         for t in 0..seq_len {
             for h in 0..num_heads {
                 for i in 0..head_dim {
-                    let h_idx = hidden_offset + t * hidden_token_stride + h * hidden_head_stride + i;
+                    let h_idx =
+                        hidden_offset + t * hidden_token_stride + h * hidden_head_stride + i;
                     let g_idx = gate_offset + t * gate_token_stride + h * gate_head_stride + i;
                     hidden[h_idx] *= sigmoid(gate[g_idx]);
                 }
@@ -271,20 +267,36 @@ mod tests {
 
         let mut expected = hidden.clone();
         cpu_sigmoid_mul_strided(
-            &mut expected, &gate,
-            0, hidden_token_stride, hidden_head_stride,
-            0, hidden_token_stride, hidden_head_stride,
-            num_heads, head_dim, seq_len,
+            &mut expected,
+            &gate,
+            0,
+            hidden_token_stride,
+            hidden_head_stride,
+            0,
+            hidden_token_stride,
+            hidden_head_stride,
+            num_heads,
+            head_dim,
+            seq_len,
         );
 
         let gpu = SigmoidMulInplaceWebgpu::new(&device, num_heads * head_dim);
         let h_buf = upload_f32(&device, &hidden);
         let g_buf = upload_f32(&device, &gate);
         gpu.compute_strided(
-            &device, &queue, &h_buf, &g_buf,
-            0, hidden_token_stride, hidden_head_stride,
-            0, hidden_token_stride, hidden_head_stride,
-            num_heads, head_dim, seq_len,
+            &device,
+            &queue,
+            &h_buf,
+            &g_buf,
+            0,
+            hidden_token_stride,
+            hidden_head_stride,
+            0,
+            hidden_token_stride,
+            hidden_head_stride,
+            num_heads,
+            head_dim,
+            seq_len,
         );
         let actual = download_f32(&device, &queue, &h_buf, total);
 

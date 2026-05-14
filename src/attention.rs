@@ -310,12 +310,11 @@ mod tests {
             .map(|i| ((i as f32) * 0.03).sin() * 0.5)
             .collect();
 
-        let expected = cpu_causal_gqa_attention(
-            &q, &k, &v,
-            num_q_heads, num_kv_heads, q_dim, v_dim, seq_len,
-        );
+        let expected =
+            cpu_causal_gqa_attention(&q, &k, &v, num_q_heads, num_kv_heads, q_dim, v_dim, seq_len);
 
-        let gpu = CausalGqaNaiveAttentionWebgpu::new(&device, num_q_heads, num_kv_heads, q_dim, v_dim);
+        let gpu =
+            CausalGqaNaiveAttentionWebgpu::new(&device, num_q_heads, num_kv_heads, q_dim, v_dim);
         let q_buf = upload_f32(&device, &q);
         let k_buf = upload_f32(&device, &k);
         let v_buf = upload_f32(&device, &v);
@@ -326,4 +325,3 @@ mod tests {
         assert_approx_eq(&actual, &expected, 1e-3);
     }
 }
-

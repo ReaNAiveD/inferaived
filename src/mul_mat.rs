@@ -33,7 +33,12 @@ impl MulMatWebgpu {
     pub const WORKGROUP_SIZE_M: usize = 8;
     pub const WORKGROUP_SIZE_N: usize = 4;
 
-    pub fn new<'data>(device: &wgpu::Device, queue: &wgpu::Queue, mat_src0: TensorView<'data>, hidden_size: usize) -> Self {
+    pub fn new<'data>(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mat_src0: TensorView<'data>,
+        hidden_size: usize,
+    ) -> Self {
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("mul_mat/shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
@@ -101,7 +106,7 @@ impl MulMatWebgpu {
                     ("workgroup_size_m", Self::WORKGROUP_SIZE_M as f64),
                     ("workgroup_size_n", Self::WORKGROUP_SIZE_N as f64),
                 ],
-                zero_initialize_workgroup_memory: true
+                zero_initialize_workgroup_memory: true,
             },
             cache: None,
         });
@@ -111,9 +116,11 @@ impl MulMatWebgpu {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let mat_src_u32 = mat_src0.data().chunks_exact(4).map(|chunk| {
-            u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-        }).collect::<Vec<u32>>();
+        let mat_src_u32 = mat_src0
+            .data()
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect::<Vec<u32>>();
         if mat_src_u32.len() * 2 % hidden_size != 0 {
             panic!("The size of matrix src0 must be a multiple of hidden_size");
         }
@@ -135,7 +142,14 @@ impl MulMatWebgpu {
         }
     }
 
-    pub fn compute(&self, device: &wgpu::Device, queue: &wgpu::Queue, mat_src1_buffer: &wgpu::Buffer, mat_dst_buffer: &wgpu::Buffer, n_rows: usize) {
+    pub fn compute(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mat_src1_buffer: &wgpu::Buffer,
+        mat_dst_buffer: &wgpu::Buffer,
+        n_rows: usize,
+    ) {
         let uniform = MulMatParams {
             weight_offset: 0,
             input_offset: 0,
@@ -179,8 +193,10 @@ impl MulMatWebgpu {
             });
             cpass.set_pipeline(&self.pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
-            let wg_num_m = (self.m_size + Self::WORKGROUP_SIZE_M * Self::TILE_M - 1) / (Self::WORKGROUP_SIZE_M * Self::TILE_M);
-            let wg_num_n = (n_rows + Self::WORKGROUP_SIZE_N * Self::TILE_N - 1) / (Self::WORKGROUP_SIZE_N * Self::TILE_N);
+            let wg_num_m = (self.m_size + Self::WORKGROUP_SIZE_M * Self::TILE_M - 1)
+                / (Self::WORKGROUP_SIZE_M * Self::TILE_M);
+            let wg_num_n = (n_rows + Self::WORKGROUP_SIZE_N * Self::TILE_N - 1)
+                / (Self::WORKGROUP_SIZE_N * Self::TILE_N);
             cpass.dispatch_workgroups((wg_num_m * wg_num_n) as u32, 1, 1);
         }
         queue.submit(Some(encoder.finish()));
@@ -193,13 +209,7 @@ mod tests {
     use crate::gpu_test_utils::*;
 
     /// CPU reference: output[n,m] = sum_k weight[m,k] * input[n,k]
-    fn cpu_mul_mat(
-        weight_packed: &[u32],
-        input: &[f32],
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> Vec<f32> {
+    fn cpu_mul_mat(weight_packed: &[u32], input: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
         let mut out = vec![0.0f32; n * m];
         for row_n in 0..n {
             for col_m in 0..m {
@@ -223,18 +233,14 @@ mod tests {
         let n = 3;
         let k = 16;
 
-        let weight_f32: Vec<f32> = (0..m * k)
-            .map(|i| ((i as f32) * 0.05).sin())
-            .collect();
+        let weight_f32: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.05).sin()).collect();
         let weight_packed = pack_f32_to_bf16_u32(&weight_f32);
         let weight_bf16_bytes: Vec<u8> = weight_f32
             .iter()
             .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
             .collect();
 
-        let input: Vec<f32> = (0..n * k)
-            .map(|i| ((i as f32) * 0.07).cos())
-            .collect();
+        let input: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.07).cos()).collect();
 
         let expected = cpu_mul_mat(&weight_packed, &input, m, n, k);
 

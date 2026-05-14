@@ -135,7 +135,14 @@ impl GatedRmsNormInplaceWebgpu {
         };
     }
 
-    pub fn compute(&self, device: &wgpu::Device, queue: &wgpu::Queue, src_buffer: &wgpu::Buffer, gate_buffer: &wgpu::Buffer, seq_len: usize) {
+    pub fn compute(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        src_buffer: &wgpu::Buffer,
+        gate_buffer: &wgpu::Buffer,
+        seq_len: usize,
+    ) {
         let uniform = GatedRmsNormParams {
             num_heads: self.num_value_heads as u32,
             head_dim: self.value_head_dim as u32,
@@ -211,7 +218,9 @@ mod tests {
         for t in 0..seq_len {
             for h in 0..num_heads {
                 let base = t * token_stride + h * head_dim;
-                let ss: f32 = (0..head_dim).map(|i| hidden[base + i] * hidden[base + i]).sum();
+                let ss: f32 = (0..head_dim)
+                    .map(|i| hidden[base + i] * hidden[base + i])
+                    .sum();
                 let scale = 1.0 / (ss / head_dim as f32 + eps).sqrt();
                 for i in 0..head_dim {
                     let g = gate[base + i];
@@ -234,10 +243,7 @@ mod tests {
         let gate: Vec<f32> = (0..total).map(|i| ((i as f32) * 0.07).cos()).collect();
         let weight_f32: Vec<f32> = (0..head_dim).map(|i| 1.0 + (i as f32) * 0.01).collect();
 
-        let weight_f32_bytes: Vec<u8> = weight_f32
-            .iter()
-            .flat_map(|&v| v.to_le_bytes())
-            .collect();
+        let weight_f32_bytes: Vec<u8> = weight_f32.iter().flat_map(|&v| v.to_le_bytes()).collect();
         let tv = safetensors::tensor::TensorView::new(
             safetensors::Dtype::F32,
             vec![head_dim],
@@ -246,7 +252,15 @@ mod tests {
         .unwrap();
 
         let mut expected = hidden.clone();
-        cpu_gated_rms_norm(&mut expected, &gate, &weight_f32, num_heads, head_dim, seq_len, eps);
+        cpu_gated_rms_norm(
+            &mut expected,
+            &gate,
+            &weight_f32,
+            num_heads,
+            head_dim,
+            seq_len,
+            eps,
+        );
 
         let gpu = GatedRmsNormInplaceWebgpu::new(&device, tv, num_heads, head_dim, eps);
         let h_buf = upload_f32(&device, &hidden);

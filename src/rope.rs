@@ -141,7 +141,11 @@ impl RopeInplaceWebgpu {
             theta_scale: self.theta_scale,
             position_offset: position_offset as u32,
         };
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniform_data]));
+        queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            bytemuck::cast_slice(&[uniform_data]),
+        );
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rope/bind_group"),
             layout: &self.bind_group_layout,
@@ -171,8 +175,7 @@ impl RopeInplaceWebgpu {
             compute_pass.set_pipeline(&self.pipeline);
             compute_pass.set_bind_group(0, &bind_group, &[]);
             let max_heads = self.num_q_heads.max(self.num_k_heads);
-            let total_invocations =
-                ((self.num_rotated_dims / 2) * max_heads * seq_len) as u32;
+            let total_invocations = ((self.num_rotated_dims / 2) * max_heads * seq_len) as u32;
             let workgroup_count =
                 (total_invocations + Self::WORKGROUP_SIZE - 1) / Self::WORKGROUP_SIZE;
             compute_pass.dispatch_workgroups(workgroup_count, 1, 1);

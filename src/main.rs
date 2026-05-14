@@ -114,9 +114,7 @@ async fn main() {
     let model = Qwen35Model::new(&device, &queue, &tensors, &config);
     info!("Model constructed");
 
-    let top_candidates = model
-        .compute(&device, &queue, encoded.get_ids(), 5)
-        .await;
+    let top_candidates = model.compute(&device, &queue, encoded.get_ids(), 5).await;
     let next_token_id = top_candidates[0].0 as u32;
     let next_token_text = tokenizer
         .decode(&[next_token_id], false)

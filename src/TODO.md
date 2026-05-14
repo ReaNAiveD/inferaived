@@ -36,3 +36,8 @@ Optimization directions for the Rust orchestration layer (kernels-side TODOs liv
 
 - `main.rs` hardcodes `hidden_size`, `intermediate_size`, head dims, etc.
 - Direction: parse `model/Qwen3.5-0.8B/config.json` via `serde_json` into a typed `Qwen35Config`, drive `LayerStackConfig` from it.
+
+## Replace env-var dump with proper Inspector abstraction
+
+- Per-layer GPU readback for validation is currently driven by `INFERAIVED_DUMP_DIR` (env var, hardcoded path scheme, side-effecting from inside `LayerStack::compute`).
+- Direction: design a clean inspector / tap interface (trait-based, zero-cost when unused) so the same hooks can serve dump, profile, KV-cache validation, and per-step logging without env-var coupling.

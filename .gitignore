@@ -1,2 +1,4 @@
 /model
 /target
+/rust_dumps
+/.backup_dump_state

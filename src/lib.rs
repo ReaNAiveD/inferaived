@@ -2,6 +2,7 @@ pub mod attention;
 pub mod binary;
 pub mod conv_silu;
 pub mod delta_rule;
+pub mod dump;
 pub mod embedding_lookup;
 pub mod gated_rms_norm;
 pub mod language_model;

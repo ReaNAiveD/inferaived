@@ -5,6 +5,7 @@ use crate::{
     binary::ElementwiseAddInplaceWebgpu,
     conv_silu::{ChannelMode, ConvSiluWebgpu},
     delta_rule::DeltaRuleWebgpu,
+    dump::{dump_buffer_as_safetensors, dump_dir, layer_dump_dir},
     gated_rms_norm::GatedRmsNormInplaceWebgpu,
     log_tensor,
     mlp::MultiLayerPerceptron,
@@ -234,12 +235,13 @@ impl LinearAttentionLayer {
         }
     }
 
-    pub fn compute(
+    pub async fn compute(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         embedding_buffer: &wgpu::Buffer,
         seq_len: usize,
+        _layer_index: usize,
     ) {
         let normed_embedding_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("linear_attention_layer/normed_embedding_buffer"),
@@ -543,6 +545,9 @@ impl SelfAttentionLayer {
             "{} width does not match num_attention_heads * head_dim",
             o_proj_weight_name
         );
+        // o_proj is `Linear(num_q_heads * head_dim -> hidden_size)`, so its
+        // input/K dimension is `q_dim`, NOT `hidden_size`. They happen to be
+        // equal in vanilla transformers but differ in Qwen3.5 (Q*D=2048, hidden=1024).
         let o_proj_mul_mat = MulMatWebgpu::new(device, queue, o_proj_weight, q_dim);
         let attn_residual_add = ElementwiseAddInplaceWebgpu::new(&device, hidden_size);
         let post_attention_layernorm_weight_name =
@@ -591,13 +596,15 @@ impl SelfAttentionLayer {
         }
     }
 
-    pub fn compute(
+    pub async fn compute(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         embedding_buffer: &wgpu::Buffer,
         seq_len: usize,
+        layer_index: usize,
     ) {
+        let dump_dir = layer_dump_dir(layer_index);
         let q_dim = self.num_attention_heads * self.head_dim;
         let q_gate_dim = q_dim * 2;
         let kv_dim = self.num_key_value_heads * self.head_dim;
@@ -675,6 +682,21 @@ impl SelfAttentionLayer {
             &normed_embedding_buffer,
             seq_len,
         );
+        if let Some(dir) = &dump_dir {
+            dump_buffer_as_safetensors(
+                device,
+                queue,
+                &normed_embedding_buffer,
+                0,
+                seq_len * self.hidden_size,
+                vec![seq_len, self.hidden_size],
+                &dir.join(format!(
+                    "layer_{:02}_input_layernorm_output.safetensors",
+                    layer_index
+                )),
+            )
+            .await;
+        }
         self.q_proj_mul_mat.compute(
             device,
             queue,
@@ -682,6 +704,18 @@ impl SelfAttentionLayer {
             &q_gate_proj_buffer,
             seq_len,
         );
+        if let Some(dir) = &dump_dir {
+            dump_buffer_as_safetensors(
+                device,
+                queue,
+                &q_gate_proj_buffer,
+                0,
+                seq_len * q_gate_dim,
+                vec![seq_len, q_gate_dim],
+                &dir.join(format!("layer_{:02}_q_proj_output.safetensors", layer_index)),
+            )
+            .await;
+        }
         self.k_proj_mul_mat.compute(
             device,
             queue,
@@ -689,6 +723,18 @@ impl SelfAttentionLayer {
             &k_proj_buffer,
             seq_len,
         );
+        if let Some(dir) = &dump_dir {
+            dump_buffer_as_safetensors(
+                device,
+                queue,
+                &k_proj_buffer,
+                0,
+                seq_len * kv_dim,
+                vec![seq_len, kv_dim],
+                &dir.join(format!("layer_{:02}_k_proj_output.safetensors", layer_index)),
+            )
+            .await;
+        }
         self.v_proj_mul_mat.compute(
             device,
             queue,
@@ -696,11 +742,27 @@ impl SelfAttentionLayer {
             &v_proj_buffer,
             seq_len,
         );
+        if let Some(dir) = &dump_dir {
+            dump_buffer_as_safetensors(
+                device,
+                queue,
+                &v_proj_buffer,
+                0,
+                seq_len * kv_dim,
+                vec![seq_len, kv_dim],
+                &dir.join(format!("layer_{:02}_v_proj_output.safetensors", layer_index)),
+            )
+            .await;
+        }
         self.q_extract.compute(
             device,
             queue,
             &q_gate_proj_buffer,
             &q_proj_buffer,
+            // q_proj output (HF Qwen3.5): per token = [Q_h0(D) | gate_h0(D) | Q_h1(D) | gate_h1(D) | ...]
+            // i.e. per-head interleaved Q+gate. HF reshapes via
+            //   q_proj_out.view(seq, num_heads, head_dim*2).chunk(2, dim=-1)
+            // which is only valid when memory is laid out per-head interleaved.
             /* src_offset       */ 0,
             /* src_token_stride */ self.num_attention_heads * self.head_dim * 2,
             /* src_head_stride  */ self.head_dim * 2,
@@ -711,20 +773,81 @@ impl SelfAttentionLayer {
             self.head_dim,
             seq_len,
         );
+        if let Some(dir) = &dump_dir {
+            dump_buffer_as_safetensors(
+                device,
+                queue,
+                &q_proj_buffer,
+                0,
+                seq_len * q_dim,
+                vec![seq_len, q_dim],
+                &dir.join(format!(
+                    "layer_{:02}_q_extract_output.safetensors",
+                    layer_index
+                )),
+            )
+            .await;
+        }
         self.q_norm.compute(
             device,
             queue,
             &q_proj_buffer,
             seq_len * self.num_attention_heads,
         );
+        if let Some(dir) = &dump_dir {
+            dump_buffer_as_safetensors(
+                device,
+                queue,
+                &q_proj_buffer,
+                0,
+                seq_len * q_dim,
+                vec![seq_len, q_dim],
+                &dir.join(format!("layer_{:02}_q_norm_output.safetensors", layer_index)),
+            )
+            .await;
+        }
         self.k_norm.compute(
             device,
             queue,
             &k_proj_buffer,
             seq_len * self.num_key_value_heads,
         );
+        if let Some(dir) = &dump_dir {
+            dump_buffer_as_safetensors(
+                device,
+                queue,
+                &k_proj_buffer,
+                0,
+                seq_len * kv_dim,
+                vec![seq_len, kv_dim],
+                &dir.join(format!("layer_{:02}_k_norm_output.safetensors", layer_index)),
+            )
+            .await;
+        }
         self.rope
             .compute(device, queue, &q_proj_buffer, &k_proj_buffer, seq_len, 0);
+        if let Some(dir) = &dump_dir {
+            dump_buffer_as_safetensors(
+                device,
+                queue,
+                &q_proj_buffer,
+                0,
+                seq_len * q_dim,
+                vec![seq_len, q_dim],
+                &dir.join(format!("layer_{:02}_q_rope_output.safetensors", layer_index)),
+            )
+            .await;
+            dump_buffer_as_safetensors(
+                device,
+                queue,
+                &k_proj_buffer,
+                0,
+                seq_len * kv_dim,
+                vec![seq_len, kv_dim],
+                &dir.join(format!("layer_{:02}_k_rope_output.safetensors", layer_index)),
+            )
+            .await;
+        }
         self.gqa_attention.compute(
             device,
             queue,
@@ -734,14 +857,33 @@ impl SelfAttentionLayer {
             &attn_output_buffer,
             seq_len,
         );
+        if let Some(dir) = &dump_dir {
+            dump_buffer_as_safetensors(
+                device,
+                queue,
+                &attn_output_buffer,
+                0,
+                seq_len * q_dim,
+                vec![seq_len, q_dim],
+                &dir.join(format!(
+                    "layer_{:02}_attn_naive_output.safetensors",
+                    layer_index
+                )),
+            )
+            .await;
+        }
         self.sigmoid_mul.compute_strided(
             device,
             queue,
             &attn_output_buffer,
             &q_gate_proj_buffer,
+            // hidden = tight attn_output [seq, num_heads, head_dim]
             0,
             self.num_attention_heads * self.head_dim,
             self.head_dim,
+            // gate sits in the SECOND half of each head's slot in the
+            // per-head-interleaved q_proj_buffer:
+            //   per token: [Q_h0 | gate_h0 | Q_h1 | gate_h1 | ...]
             self.head_dim,
             self.num_attention_heads * self.head_dim * 2,
             self.head_dim * 2,
@@ -749,10 +891,57 @@ impl SelfAttentionLayer {
             self.head_dim,
             seq_len,
         );
+        if let Some(dir) = &dump_dir {
+            dump_buffer_as_safetensors(
+                device,
+                queue,
+                &attn_output_buffer,
+                0,
+                seq_len * q_dim,
+                vec![seq_len, q_dim],
+                &dir.join(format!(
+                    "layer_{:02}_attn_gated_output.safetensors",
+                    layer_index
+                )),
+            )
+            .await;
+        }
         self.o_proj_mul_mat
             .compute(device, queue, &attn_output_buffer, &o_proj_buffer, seq_len);
+        // Naming `self_attn_output` matches the HF hook on `layer.self_attn`,
+        // i.e. attention block output AFTER o_proj BEFORE the residual add.
+        if let Some(dir) = &dump_dir {
+            dump_buffer_as_safetensors(
+                device,
+                queue,
+                &o_proj_buffer,
+                0,
+                seq_len * self.hidden_size,
+                vec![seq_len, self.hidden_size],
+                &dir.join(format!(
+                    "layer_{:02}_self_attn_output.safetensors",
+                    layer_index
+                )),
+            )
+            .await;
+        }
         self.attn_residual_add
             .compute(device, queue, &embedding_buffer, &o_proj_buffer, seq_len);
+        if let Some(dir) = &dump_dir {
+            dump_buffer_as_safetensors(
+                device,
+                queue,
+                &embedding_buffer,
+                0,
+                seq_len * self.hidden_size,
+                vec![seq_len, self.hidden_size],
+                &dir.join(format!(
+                    "layer_{:02}_after_attn_residual.safetensors",
+                    layer_index
+                )),
+            )
+            .await;
+        }
         self.post_attention_layernorm.compute(
             device,
             queue,
@@ -760,6 +949,21 @@ impl SelfAttentionLayer {
             &normed_embedding_buffer,
             seq_len,
         );
+        if let Some(dir) = &dump_dir {
+            dump_buffer_as_safetensors(
+                device,
+                queue,
+                &normed_embedding_buffer,
+                0,
+                seq_len * self.hidden_size,
+                vec![seq_len, self.hidden_size],
+                &dir.join(format!(
+                    "layer_{:02}_post_attn_layernorm_output.safetensors",
+                    layer_index
+                )),
+            )
+            .await;
+        }
         self.mlp.compute(
             device,
             queue,
@@ -767,6 +971,19 @@ impl SelfAttentionLayer {
             &mlp_output_buffer,
             seq_len,
         );
+        // Matches HF hook on `layer.mlp` (MLP block output, before residual).
+        if let Some(dir) = &dump_dir {
+            dump_buffer_as_safetensors(
+                device,
+                queue,
+                &mlp_output_buffer,
+                0,
+                seq_len * self.hidden_size,
+                vec![seq_len, self.hidden_size],
+                &dir.join(format!("layer_{:02}_mlp_output.safetensors", layer_index)),
+            )
+            .await;
+        }
         self.mlp_residual_add.compute(
             device,
             queue,
@@ -784,18 +1001,25 @@ pub enum AttentionLayer {
 }
 
 impl AttentionLayer {
-    pub fn compute(
+    pub async fn compute(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         embedding_buffer: &wgpu::Buffer,
         seq_len: usize,
+        layer_index: usize,
     ) {
         match self {
             AttentionLayer::Linear(layer) => {
-                layer.compute(device, queue, embedding_buffer, seq_len)
+                layer
+                    .compute(device, queue, embedding_buffer, seq_len, layer_index)
+                    .await
             }
-            AttentionLayer::Full(layer) => layer.compute(device, queue, embedding_buffer, seq_len),
+            AttentionLayer::Full(layer) => {
+                layer
+                    .compute(device, queue, embedding_buffer, seq_len, layer_index)
+                    .await
+            }
         }
     }
 }
@@ -812,6 +1036,7 @@ pub struct LayerStackConfig {
 }
 
 pub struct LayerStack {
+    hidden_size: usize,
     layers: Vec<AttentionLayer>,
 }
 
@@ -849,18 +1074,34 @@ impl LayerStack {
             };
             layers.push(layer);
         }
-        Self { layers }
+        Self {
+            hidden_size,
+            layers,
+        }
     }
 
-    pub fn compute(
+    pub async fn compute(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         embedding_buffer: &wgpu::Buffer,
         seq_len: usize,
     ) {
-        for layer in &self.layers {
-            layer.compute(device, queue, embedding_buffer, seq_len);
+        let dump_root = dump_dir();
+        for (i, layer) in self.layers.iter().enumerate() {
+            layer.compute(device, queue, embedding_buffer, seq_len, i).await;
+            if let Some(dir) = &dump_root {
+                dump_buffer_as_safetensors(
+                    device,
+                    queue,
+                    embedding_buffer,
+                    0,
+                    seq_len * self.hidden_size,
+                    vec![seq_len, self.hidden_size],
+                    &dir.join(format!("layer_{:02}_output.safetensors", i)),
+                )
+                .await;
+            }
         }
     }
 }

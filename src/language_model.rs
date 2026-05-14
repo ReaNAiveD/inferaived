@@ -1,6 +1,7 @@
 use safetensors::SafeTensors;
 
 use crate::{
+    dump::{dump_buffer_as_safetensors, dump_dir},
     embedding_lookup::EmbeddingLookupCpu,
     layer_loop::{
         LayerConfig, LayerStack, LayerStackConfig, LinearAttentionConfig, SelfAttentionConfig,
@@ -124,6 +125,7 @@ impl<'data> Qwen35Model<'data> {
         input_ids: &[u32],
         top_k: usize,
     ) -> Vec<(usize, f32)> {
+        let dump_root = dump_dir();
         let token_embeddings = self.embedding_lookup.compute(input_ids);
         let hidden_states_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("qwen35_model/hidden_states_buffer"),
@@ -138,10 +140,35 @@ impl<'data> Qwen35Model<'data> {
             0,
             bytemuck::cast_slice(&token_embeddings),
         );
+        if let Some(dir) = &dump_root {
+            dump_buffer_as_safetensors(
+                device,
+                queue,
+                &hidden_states_buffer,
+                0,
+                input_ids.len() * self.hidden_size,
+                vec![input_ids.len(), self.hidden_size],
+                &dir.join("embed_output.safetensors"),
+            )
+            .await;
+        }
         self.layer_stack
-            .compute(device, queue, &hidden_states_buffer, input_ids.len());
+            .compute(device, queue, &hidden_states_buffer, input_ids.len())
+            .await;
         self.final_norm
             .compute(device, queue, &hidden_states_buffer, input_ids.len());
+        if let Some(dir) = &dump_root {
+            dump_buffer_as_safetensors(
+                device,
+                queue,
+                &hidden_states_buffer,
+                0,
+                input_ids.len() * self.hidden_size,
+                vec![input_ids.len(), self.hidden_size],
+                &dir.join("final_norm_output.safetensors"),
+            )
+            .await;
+        }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("qwen35_model/last_hidden_readback_encoder"),
         });

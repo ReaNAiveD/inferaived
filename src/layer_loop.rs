@@ -537,7 +537,13 @@ impl SelfAttentionLayer {
             "{} height does not match hidden_size",
             o_proj_weight_name
         );
-        let o_proj_mul_mat = MulMatWebgpu::new(device, queue, o_proj_weight, hidden_size);
+        debug_assert_eq!(
+            o_proj_weight.shape()[1] as usize,
+            q_dim,
+            "{} width does not match num_attention_heads * head_dim",
+            o_proj_weight_name
+        );
+        let o_proj_mul_mat = MulMatWebgpu::new(device, queue, o_proj_weight, q_dim);
         let attn_residual_add = ElementwiseAddInplaceWebgpu::new(&device, hidden_size);
         let post_attention_layernorm_weight_name =
             format!("{}.post_attention_layernorm.weight", weight_prefix);

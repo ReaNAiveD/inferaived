@@ -68,7 +68,7 @@ async fn main() {
     let tensors = SafeTensors::deserialize(&buffer[..]).expect("Failed to deserialize tensors");
     let tokenizer = Tokenizer::from_file("model/Qwen3.5-0.8B/tokenizer.json")
         .expect("Failed to load tokenizer");
-    let prompt = "Hello ";
+    let prompt = "Inferaived is a Rust library for running transformer-based language models on consumer GPUs using WebGPU.";
     let encoded = tokenizer
         .encode(prompt, false)
         .expect("Failed to encode input");

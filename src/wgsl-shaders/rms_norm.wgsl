@@ -28,11 +28,12 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
     if (wg_id.x >= params.seq_len) {
         return;
     }
-    let row_offset = params.input_offset + wg_id.x * params.input_row_stride;
+    let input_row_offset = params.input_offset + wg_id.x * params.input_row_stride;
+    let output_row_offset = wg_id.x * params.hidden_size;
 
     var sum: f32 = 0.0;
     for (var i: u32 = local_id.x; i < params.hidden_size; i += workgroup_size) {
-        let val = input[row_offset + i];
+        let val = input[input_row_offset + i];
         sum += val * val;
     }
     scratch[local_id.x] = sum;
@@ -51,7 +52,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
     let scale = inverseSqrt(scratch[0] / f32(params.hidden_size) + params.eps);
 
     for (var i: u32 = local_id.x; i < params.hidden_size; i += workgroup_size) {
-        let val = input[row_offset + i];
-        output[row_offset + i] = val * scale * (1.0 + weight[i]);
+        let val = input[input_row_offset + i];
+        output[output_row_offset + i] = val * scale * (1.0 + weight[i]);
     }
 }

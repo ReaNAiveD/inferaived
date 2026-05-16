@@ -430,6 +430,54 @@ mod tests {
         assert_approx_eq(&actual, &expected, 1e-4);
     }
 
+    /// Mimics the decode-step use case: read a single row from the middle
+    /// of a large input buffer (rows [input_start_row..input_start_row +
+    /// num_rows)), write the normalized rows tight-packed starting at row
+    /// 0 of a small output buffer sized for exactly num_rows.
+    #[tokio::test]
+    async fn test_rms_norm_input_offset_decode_style() {
+        let (device, queue) = gpu_or_skip!();
+        let total_rows = 8;
+        let input_start_row = 5;
+        let num_rows = 1;
+        let hidden_size = 32;
+
+        let input_full: Vec<f32> = (0..total_rows * hidden_size)
+            .map(|i| ((i as f32) * 0.05).sin())
+            .collect();
+        let weight_f32: Vec<f32> = (0..hidden_size).map(|i| (i as f32) * 0.02 - 0.1).collect();
+
+        let weight_bf16_bytes: Vec<u8> = weight_f32
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+        let weight_roundtrip: Vec<f32> = weight_bf16_bytes
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+            .collect();
+        let tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::BF16,
+            vec![hidden_size],
+            &weight_bf16_bytes,
+        )
+        .unwrap();
+
+        let sliced_input = &input_full
+            [input_start_row * hidden_size..(input_start_row + num_rows) * hidden_size];
+        let expected = cpu_rms_norm(sliced_input, &weight_roundtrip, hidden_size, num_rows, 1e-6);
+
+        let gpu = RmsNormWebgpu::new(&device, &queue, tv);
+        let in_buf = upload_f32(&device, &input_full);
+        // Output buffer sized only for `num_rows` — the kernel must write
+        // tight-packed from row 0 (not at the input offset, which would
+        // be out of bounds here).
+        let out_buf = create_f32_buffer(&device, num_rows * hidden_size);
+        gpu.forward(&device, &queue, &in_buf, &out_buf, input_start_row, num_rows);
+        let actual = download_f32(&device, &queue, &out_buf, num_rows * hidden_size);
+
+        assert_approx_eq(&actual, &expected, 1e-4);
+    }
+
     /// CPU reference: hidden[t,i] = (hidden[t,i] / rms) * (1 + weight[i])
     fn cpu_rms_norm_inplace(
         hidden: &mut [f32],

@@ -29,6 +29,8 @@ pub struct LinearAttentionLayer {
     linear_num_value_heads: usize,
     qkv_dim: usize,
     v_dim: usize,
+    recurrent_state_size: usize,
+    conv_state_size: usize,
     input_layernorm: RmsNormWebgpu,
     in_proj_qkv_mul_mat: MulMatWebgpu,
     in_proj_z_mul_mat: MulMatWebgpu,
@@ -36,7 +38,6 @@ pub struct LinearAttentionLayer {
     in_proj_b_mul_mat: MulMatWebgpu,
     conv_silu: ConvSiluWebgpu,
     delta_rule: DeltaRuleWebgpu,
-    recurrent_state_buffer: wgpu::Buffer,
     gated_norm: GatedRmsNormInplaceWebgpu,
     out_proj_mat_mul: MulMatWebgpu,
     attn_residual_add: ElementwiseAddInplaceWebgpu,
@@ -64,8 +65,7 @@ impl LinearAttentionLayer {
             input_layernorm_weight_name
         ));
         log_tensor(&input_layernorm_weight_name, &input_layernorm_weight);
-        let input_layernorm =
-            RmsNormWebgpu::new(device, queue, input_layernorm_weight);
+        let input_layernorm = RmsNormWebgpu::new(device, queue, input_layernorm_weight);
         let qkv_weight_name = format!("{}.linear_attn.in_proj_qkv.weight", weight_prefix);
         let qkv_weight = tensor
             .tensor(&qkv_weight_name)
@@ -176,17 +176,9 @@ impl LinearAttentionLayer {
             config.linear_key_head_dim,
             config.linear_value_head_dim,
         );
-        let recurrent_state_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/recurrent_state_buffer"),
-            size: (config.linear_num_key_heads
-                * config.linear_key_head_dim
-                * config.linear_value_head_dim
-                * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        let recurrent_state_size = config.linear_num_key_heads
+            * config.linear_key_head_dim
+            * config.linear_value_head_dim;
         let norm_weight_name = format!("{}.linear_attn.norm.weight", weight_prefix);
         let norm_weight = tensor
             .tensor(&norm_weight_name)
@@ -227,11 +219,8 @@ impl LinearAttentionLayer {
                 "Failed to get tensor for {}",
                 post_attention_layernorm_weight_name
             ));
-        let post_attention_layernorm = RmsNormWebgpu::new(
-            &device,
-            &queue,
-            post_attention_layernorm_weight,
-        );
+        let post_attention_layernorm =
+            RmsNormWebgpu::new(&device, &queue, post_attention_layernorm_weight);
         let mlp = MultiLayerPerceptron::new(
             device,
             queue,
@@ -241,11 +230,14 @@ impl LinearAttentionLayer {
             config.intermediate_size,
         );
         let mlp_residual_add = ElementwiseAddInplaceWebgpu::new(&device, hidden_size);
+        let conv_state_size = conv_silu.conv_state_size();
         Self {
             hidden_size,
             linear_num_value_heads: config.linear_num_value_heads,
             qkv_dim,
             v_dim,
+            recurrent_state_size,
+            conv_state_size,
             input_layernorm,
             in_proj_qkv_mul_mat,
             in_proj_z_mul_mat,
@@ -253,7 +245,6 @@ impl LinearAttentionLayer {
             in_proj_b_mul_mat,
             conv_silu,
             delta_rule,
-            recurrent_state_buffer,
             gated_norm,
             out_proj_mat_mul,
             attn_residual_add,
@@ -344,6 +335,23 @@ impl LinearAttentionLayer {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let recurrent_state_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/recurrent_state_buffer"),
+            size: (self.recurrent_state_size * std::mem::size_of::<f32>())
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let conv_state_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/conv_state_buffer"),
+            size: (self.conv_state_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
         self.input_layernorm.compute(
             device,
             queue,
@@ -377,6 +385,7 @@ impl LinearAttentionLayer {
             queue,
             &in_proj_qkv_buffer,
             &conv_qkv_buffer,
+            &conv_state_buffer,
             seq_len,
         );
         self.delta_rule.compute(
@@ -385,7 +394,7 @@ impl LinearAttentionLayer {
             &conv_qkv_buffer,
             &in_proj_a_buffer,
             &in_proj_b_buffer,
-            &self.recurrent_state_buffer,
+            &recurrent_state_buffer,
             &attn_output_buffer,
             seq_len,
         );
@@ -432,6 +441,193 @@ impl LinearAttentionLayer {
             &embedding_buffer,
             &mlp_output_buffer,
             seq_len,
+        );
+    }
+
+    pub fn compute_decode(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        embedding_buffer: &wgpu::Buffer,
+        conv_state_buffer: &wgpu::Buffer,
+        recurrent_state_buffer: &wgpu::Buffer,
+        seq_len: usize,
+    ) {
+        debug_assert!(
+            seq_len >= 1,
+            "compute_decode requires seq_len >= 1, got {}",
+            seq_len,
+        );
+        let _ = self.conv_state_size;
+        let _ = self.recurrent_state_size;
+        let position = seq_len - 1;
+        let residual_offset = position * self.hidden_size;
+        let normed_embedding_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/normed_embedding_buffer"),
+            size: (self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let in_proj_qkv_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/in_proj_qkv_buffer"),
+            size: (self.qkv_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let in_proj_z_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/in_proj_z_buffer"),
+            size: (self.v_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let in_proj_a_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/in_proj_a_buffer"),
+            size: (self.linear_num_value_heads * std::mem::size_of::<f32>())
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let in_proj_b_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/in_proj_b_buffer"),
+            size: (self.linear_num_value_heads * std::mem::size_of::<f32>())
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let conv_qkv_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/conv_qkv_buffer"),
+            size: (self.qkv_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let attn_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/attn_output_buffer"),
+            size: (self.v_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let out_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/out_proj_buffer"),
+            size: (self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let mlp_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/mlp_output_buffer"),
+            size: (self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        self.input_layernorm.compute_last_row(
+            device,
+            queue,
+            embedding_buffer,
+            &normed_embedding_buffer,
+            seq_len,
+        );
+        self.in_proj_qkv_mul_mat.compute(
+            device,
+            queue,
+            &normed_embedding_buffer,
+            &in_proj_qkv_buffer,
+            1,
+        );
+        self.in_proj_a_mul_mat.compute(
+            device,
+            queue,
+            &normed_embedding_buffer,
+            &in_proj_a_buffer,
+            1,
+        );
+        self.in_proj_b_mul_mat.compute(
+            device,
+            queue,
+            &normed_embedding_buffer,
+            &in_proj_b_buffer,
+            1,
+        );
+        self.conv_silu.compute(
+            device,
+            queue,
+            &in_proj_qkv_buffer,
+            &conv_qkv_buffer,
+            conv_state_buffer,
+            1,
+        );
+        self.delta_rule.compute(
+            device,
+            queue,
+            &conv_qkv_buffer,
+            &in_proj_a_buffer,
+            &in_proj_b_buffer,
+            recurrent_state_buffer,
+            &attn_output_buffer,
+            1,
+        );
+        self.in_proj_z_mul_mat.compute(
+            device,
+            queue,
+            &normed_embedding_buffer,
+            &in_proj_z_buffer,
+            1,
+        );
+        self.gated_norm
+            .compute(device, queue, &attn_output_buffer, &in_proj_z_buffer, 1);
+        self.out_proj_mat_mul.compute(
+            device,
+            queue,
+            &attn_output_buffer,
+            &out_proj_buffer,
+            1,
+        );
+        self.attn_residual_add.compute_strided(
+            device,
+            queue,
+            embedding_buffer,
+            &out_proj_buffer,
+            residual_offset,
+            0,
+            1,
+        );
+        self.post_attention_layernorm.compute_last_row(
+            device,
+            queue,
+            embedding_buffer,
+            &normed_embedding_buffer,
+            seq_len,
+        );
+        self.mlp.compute_decode(
+            device,
+            queue,
+            &normed_embedding_buffer,
+            &mlp_output_buffer,
+        );
+        self.mlp_residual_add.compute_strided(
+            device,
+            queue,
+            embedding_buffer,
+            &mlp_output_buffer,
+            residual_offset,
+            0,
+            1,
         );
     }
 }
@@ -487,8 +683,7 @@ impl SelfAttentionLayer {
             input_layernorm_weight_name
         ));
         log_tensor(&input_layernorm_weight_name, &input_layernorm_weight);
-        let input_layernorm =
-            RmsNormWebgpu::new(device, queue, input_layernorm_weight);
+        let input_layernorm = RmsNormWebgpu::new(device, queue, input_layernorm_weight);
         let q_proj_weight_name = format!("{}.self_attn.q_proj.weight", weight_prefix);
         let q_proj_weight = tensor
             .tensor(&q_proj_weight_name)
@@ -600,11 +795,8 @@ impl SelfAttentionLayer {
                 "Failed to get tensor for {}",
                 post_attention_layernorm_weight_name
             ));
-        let post_attention_layernorm = RmsNormWebgpu::new(
-            &device,
-            &queue,
-            post_attention_layernorm_weight,
-        );
+        let post_attention_layernorm =
+            RmsNormWebgpu::new(&device, &queue, post_attention_layernorm_weight);
         let mlp = MultiLayerPerceptron::new(
             device,
             queue,
@@ -819,6 +1011,205 @@ impl SelfAttentionLayer {
             &embedding_buffer,
             &mlp_output_buffer,
             seq_len,
+        );
+    }
+
+    pub fn compute_decode(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        embedding_buffer: &wgpu::Buffer,
+        k_buffer: &wgpu::Buffer,
+        v_buffer: &wgpu::Buffer,
+        seq_len: usize,
+    ) {
+        debug_assert!(
+            seq_len >= 1,
+            "compute_decoder requires seq_len >= 1, got {}",
+            seq_len,
+        );
+        let q_dim = self.num_attention_heads * self.head_dim;
+        let q_gate_dim = q_dim * 2;
+        let kv_dim = self.num_key_value_heads * self.head_dim;
+        let position = seq_len - 1;
+        let kv_cache_slot_offset = position * kv_dim;
+        let residual_offset = position * self.hidden_size;
+        let normed_embedding_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("self_attention_layer/normed_embedding_buffer"),
+            size: (self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let q_gate_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("self_attention_layer/q_gate_proj_buffer"),
+            size: (q_gate_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let q_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("self_attention_layer/q_proj_buffer"),
+            size: (q_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let attn_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("self_attention_layer/attn_output_buffer"),
+            size: (q_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let o_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("self_attention_layer/o_proj_buffer"),
+            size: (self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let mlp_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("self_attention_layer/mlp_output_buffer"),
+            size: (self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        self.input_layernorm.compute_last_row(
+            device,
+            queue,
+            embedding_buffer,
+            &normed_embedding_buffer,
+            seq_len,
+        );
+        self.q_proj_mul_mat.compute(
+            device,
+            queue,
+            &normed_embedding_buffer,
+            &q_gate_proj_buffer,
+            1,
+        );
+        self.k_proj_mul_mat.compute_strided(
+            device,
+            queue,
+            &normed_embedding_buffer,
+            k_buffer,
+            0,
+            kv_cache_slot_offset,
+            1,
+        );
+        self.v_proj_mul_mat.compute_strided(
+            device,
+            queue,
+            &normed_embedding_buffer,
+            v_buffer,
+            0,
+            kv_cache_slot_offset,
+            1,
+        );
+        self.q_extract.compute(
+            device,
+            queue,
+            &q_gate_proj_buffer,
+            &q_proj_buffer,
+            0,
+            self.num_attention_heads * self.head_dim * 2,
+            self.head_dim * 2,
+            0,
+            self.num_attention_heads * self.head_dim,
+            self.head_dim,
+            self.num_attention_heads,
+            self.head_dim,
+            1,
+        );
+        self.q_norm
+            .compute(device, queue, &q_proj_buffer, self.num_attention_heads);
+        self.k_norm.compute_strided(
+            device,
+            queue,
+            k_buffer,
+            kv_cache_slot_offset,
+            self.num_key_value_heads,
+            self.head_dim,
+        );
+        self.rope.compute_strided(
+            device,
+            queue,
+            &q_proj_buffer,
+            k_buffer,
+            0,
+            kv_cache_slot_offset,
+            1,
+            position,
+        );
+        self.gqa_attention.compute_strided(
+            device,
+            queue,
+            &q_proj_buffer,
+            k_buffer,
+            v_buffer,
+            &attn_output_buffer,
+            0,
+            0,
+            0,
+            0,
+            1,
+            position,
+        );
+        self.sigmoid_mul.compute_strided(
+            device,
+            queue,
+            &attn_output_buffer,
+            &q_gate_proj_buffer,
+            0,
+            self.num_attention_heads * self.head_dim,
+            self.head_dim,
+            self.head_dim,
+            self.num_attention_heads * self.head_dim * 2,
+            self.head_dim * 2,
+            self.num_attention_heads,
+            self.head_dim,
+            1,
+        );
+        self.o_proj_mul_mat
+            .compute(device, queue, &attn_output_buffer, &o_proj_buffer, 1);
+        self.attn_residual_add.compute_strided(
+            device,
+            queue,
+            embedding_buffer,
+            &o_proj_buffer,
+            residual_offset,
+            0,
+            1,
+        );
+        self.post_attention_layernorm.compute_last_row(
+            device,
+            queue,
+            embedding_buffer,
+            &normed_embedding_buffer,
+            seq_len,
+        );
+        self.mlp.compute_decode(
+            device,
+            queue,
+            &normed_embedding_buffer,
+            &mlp_output_buffer,
+        );
+        self.mlp_residual_add.compute_strided(
+            device,
+            queue,
+            embedding_buffer,
+            &mlp_output_buffer,
+            residual_offset,
+            0,
+            1,
         );
     }
 }

@@ -139,4 +139,54 @@ impl MultiLayerPerceptron {
             seq_len,
         );
     }
+
+    pub fn compute_decode(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input_buffer: &wgpu::Buffer,
+        output_buffer: &wgpu::Buffer,
+    ) {
+        let intermediate_buffer_size =
+            (self.intermediate_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
+        let mlp_gate_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mlp/gate_proj_buffer"),
+            size: intermediate_buffer_size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let mlp_up_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mlp/up_proj_buffer"),
+            size: intermediate_buffer_size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        self.mlp_gate_proj_mul_mat.compute(
+            device,
+            queue,
+            input_buffer,
+            &mlp_gate_proj_buffer,
+            1,
+        );
+        self.mlp_up_proj_mul_mat
+            .compute(device, queue, input_buffer, &mlp_up_proj_buffer, 1);
+        self.mlp_silu_mul.compute(
+            device,
+            queue,
+            &mlp_up_proj_buffer,
+            &mlp_gate_proj_buffer,
+            1,
+        );
+        self.mlp_down_proj_mul_mat.compute(
+            device,
+            queue,
+            &mlp_up_proj_buffer,
+            output_buffer,
+            1,
+        );
+    }
 }

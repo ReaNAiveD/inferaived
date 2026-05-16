@@ -154,9 +154,34 @@ impl RmsNormWebgpu {
         dst_buffer: &Buffer,
         n_rows: usize,
     ) {
+        self.compute_strided(device, queue, input_buffer, dst_buffer, n_rows, 0, self.norm_dim);
+    }
+
+    pub fn compute_last_row(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input_buffer: &Buffer,
+        dst_buffer: &Buffer,
+        n_rows: usize,
+    ) {
+        let offset = (n_rows - 1) * self.norm_dim;
+        self.compute_strided(device, queue, input_buffer, dst_buffer, 1, offset, self.norm_dim);
+    }
+
+    pub fn compute_strided(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input_buffer: &Buffer,
+        dst_buffer: &Buffer,
+        n_rows: usize,
+        input_offset: usize,
+        input_row_stride: usize,
+    ) {
         let uniform = RmsNormParams {
-            input_offset: 0,
-            input_row_stride: self.norm_dim as u32,
+            input_offset: input_offset as u32,
+            input_row_stride: input_row_stride as u32,
             hidden_size: self.norm_dim as u32,
             seq_len: n_rows as u32,
             eps: 1e-6,
@@ -204,10 +229,6 @@ pub struct RmsNormInplaceWebgpu {
     pipeline: ComputePipeline,
     uniform_buffer: Buffer,
     weight_buffer: Buffer,
-    /// Length of the per-vector axis being normalized (the "last dim" of each
-    /// row). Inferred from `weight.shape()[0]` at construction — NOT necessarily
-    /// the model's `hidden_size`. The caller is expected to load a weight whose
-    /// shape matches the intended axis (e.g. `head_dim` for q_norm/k_norm).
     norm_dim: usize,
 }
 
@@ -326,6 +347,17 @@ impl RmsNormInplaceWebgpu {
         n_rows: usize,
     ) {
         self.compute_strided(device, queue, src_buffer, 0, n_rows, self.norm_dim);
+    }
+
+    pub fn compute_last_row(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        src_buffer: &Buffer,
+        n_rows: usize,
+    ) {
+        let offset = (n_rows - 1) * self.norm_dim;
+        self.compute_strided(device, queue, src_buffer, offset, 1, self.norm_dim);
     }
 
     /// Normalize `n_rows` rows that are spaced `row_stride` elements apart,

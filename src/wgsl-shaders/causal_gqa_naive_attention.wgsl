@@ -21,6 +21,8 @@ struct Params {
     q_dim: u32,
     v_dim: u32,
     seq_len: u32,
+
+    q_position_offset: u32,
 }
 
 @group(0) @binding(0)
@@ -81,10 +83,12 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
     let num_q_per_kv = params.num_q_heads / params.num_kv_heads;
     let kv_head = q_head / num_q_per_kv;
     let softmax_scale = inverseSqrt(f32(params.q_dim));
+    // Absolute KV position this Q can attend up to (inclusive).
+    let k_token_max = q_token + params.q_position_offset;
 
     // Scan max
     var max_score: f32 = -1e30;
-    for (var k_token: u32 = 0; k_token <= q_token; k_token += 1u) {
+    for (var k_token: u32 = 0; k_token <= k_token_max; k_token += 1u) {
         var score_acc: f32 = 0f;
         for (var d: u32 = local_id.x; d < params.q_dim; d += workgroup_size) {
             score_acc += get_q(q_token, q_head, d) * get_k(k_token, kv_head, d);
@@ -95,7 +99,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
     }
     // Sum Exp
     var sum_exp: f32 = 0f;
-    for (var k_token: u32 = 0; k_token <= q_token; k_token += 1u) {
+    for (var k_token: u32 = 0; k_token <= k_token_max; k_token += 1u) {
         var score_acc: f32 = 0f;
         for (var d: u32 = local_id.x; d < params.q_dim; d += workgroup_size) {
             score_acc += get_q(q_token, q_head, d) * get_k(k_token, kv_head, d);
@@ -110,7 +114,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
     for (var i: u32 = 0u; i < MAX_V_PER_THREAD; i += 1u) {
         v_acc[i] = 0f;
     }
-    for (var k_token: u32 = 0; k_token <= q_token; k_token += 1u) {
+    for (var k_token: u32 = 0; k_token <= k_token_max; k_token += 1u) {
         var score_acc: f32 = 0f;
         for (var q_d: u32 = local_id.x; q_d < params.q_dim; q_d += workgroup_size) {
             score_acc += get_q(q_token, q_head, q_d) * get_k(k_token, kv_head, q_d);

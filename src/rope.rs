@@ -126,12 +126,44 @@ impl RopeInplaceWebgpu {
         seq_len: usize,
         position_offset: usize,
     ) {
+        self.compute_strided(
+            device,
+            queue,
+            q_buffer,
+            k_buffer,
+            0,
+            0,
+            seq_len,
+            position_offset,
+        );
+    }
+
+    /// Apply RoPE in-place to a `seq_len`-token slice of Q and K, starting
+    /// at `q_offset` / `k_offset` (in f32 elements). Both Q and K rows are
+    /// still assumed tightly packed `[num_*_heads, head_dim]`.
+    ///
+    /// The slice's absolute token positions are `position_offset ..
+    /// position_offset + seq_len`. For a single-token decode step that
+    /// writes K into slot `pos` of the KV cache, call with
+    /// `q_offset = 0`, `k_offset = pos * num_k_heads * head_dim`,
+    /// `seq_len = 1`, `position_offset = pos`.
+    pub fn compute_strided(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        q_buffer: &wgpu::Buffer,
+        k_buffer: &wgpu::Buffer,
+        q_offset: usize,
+        k_offset: usize,
+        seq_len: usize,
+        position_offset: usize,
+    ) {
         let head_dim = self.head_dim as u32;
         let uniform_data = RopeParams {
-            q_offset: 0,
+            q_offset: q_offset as u32,
             q_token_stride: self.num_q_heads as u32 * head_dim,
             q_head_stride: head_dim,
-            k_offset: 0,
+            k_offset: k_offset as u32,
             k_token_stride: self.num_k_heads as u32 * head_dim,
             k_head_stride: head_dim,
             num_q_heads: self.num_q_heads as u32,

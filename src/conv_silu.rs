@@ -16,6 +16,7 @@ pub struct ConvSiluParams {
     // Elements between consecutive tokens (>= q_dim + k_dim + v_dim when padded)
     input_token_stride: u32,
     output_token_stride: u32,
+    state_token_stride: u32,
 
     // Per-group flag: 0 = passthrough copy, 1 = conv1d + silu
     q_apply_conv: u32,
@@ -34,7 +35,8 @@ pub enum ChannelMode {
 
 pub struct ConvSiluWebgpu {
     bind_group_layout: wgpu::BindGroupLayout,
-    pipeline: wgpu::ComputePipeline,
+    conv_pipeline: wgpu::ComputePipeline,
+    state_update_pipeline: wgpu::ComputePipeline,
     weights_buffer: wgpu::Buffer,
     uniform_buffer: wgpu::Buffer,
 
@@ -105,6 +107,16 @@ impl ConvSiluWebgpu {
                     binding: 3,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: None,
@@ -118,11 +130,19 @@ impl ConvSiluWebgpu {
             bind_group_layouts: &[&bind_group_layout],
             immediate_size: 0,
         });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("conv_silu/pipeline"),
+        let conv_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("conv_silu/conv_pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader_module,
             entry_point: Some("conv1d_silu"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        let state_update_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("conv_silu/state_update_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader_module,
+            entry_point: Some("conv_state_update"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
@@ -139,7 +159,8 @@ impl ConvSiluWebgpu {
         });
         Self {
             bind_group_layout,
-            pipeline,
+            conv_pipeline,
+            state_update_pipeline,
             weights_buffer,
             uniform_buffer,
             q_dim,
@@ -158,6 +179,7 @@ impl ConvSiluWebgpu {
         queue: &wgpu::Queue,
         src_buffer: &wgpu::Buffer,
         dst_buffer: &wgpu::Buffer,
+        state_buffer: &wgpu::Buffer,
         seq_len: usize,
     ) {
         let num_channels = self.q_dim + self.k_dim + self.v_dim;
@@ -169,6 +191,7 @@ impl ConvSiluWebgpu {
             kernel_size: self.kernel_size as u32,
             input_token_stride: num_channels as u32,
             output_token_stride: num_channels as u32,
+            state_token_stride: num_channels as u32,
             q_apply_conv: self.q_mode as u32,
             k_apply_conv: self.k_mode as u32,
             v_apply_conv: self.v_mode as u32,
@@ -192,6 +215,10 @@ impl ConvSiluWebgpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
+                    resource: state_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
                     resource: self.uniform_buffer.as_entire_binding(),
                 },
             ],
@@ -204,13 +231,35 @@ impl ConvSiluWebgpu {
                 label: Some("conv_silu/compute_pass"),
                 timestamp_writes: None,
             });
-            compute_pass.set_pipeline(&self.pipeline);
-            compute_pass.set_bind_group(0, &bind_group, &[]);
             let workgroup_size = 256usize;
-            let num_workgroups = (seq_len * num_channels + workgroup_size - 1) / workgroup_size;
-            compute_pass.dispatch_workgroups(num_workgroups as u32, 1, 1);
+            // Conv reads from state; safe because state writes happen in
+            // the next dispatch (consecutive dispatches in a compute pass
+            // are ordered by wgpu).
+            compute_pass.set_pipeline(&self.conv_pipeline);
+            compute_pass.set_bind_group(0, &bind_group, &[]);
+            let conv_workgroups =
+                (seq_len * num_channels + workgroup_size - 1) / workgroup_size;
+            compute_pass.dispatch_workgroups(conv_workgroups as u32, 1, 1);
+            // Refresh the rolling-window state for next call.
+            if self.kernel_size >= 2 {
+                compute_pass.set_pipeline(&self.state_update_pipeline);
+                let update_workgroups = (num_channels + workgroup_size - 1) / workgroup_size;
+                compute_pass.dispatch_workgroups(update_workgroups as u32, 1, 1);
+            }
         }
         queue.submit(Some(encoder.finish()));
+    }
+
+    /// f32 element count of the conv state buffer this kernel reads from
+    /// and writes back to: `(K - 1) * num_channels`. Returns 0 if
+    /// `kernel_size <= 1` (the shader skips state work in that case).
+    pub fn conv_state_size(&self) -> usize {
+        let num_channels = self.q_dim + self.k_dim + self.v_dim;
+        if self.kernel_size <= 1 {
+            0
+        } else {
+            (self.kernel_size - 1) * num_channels
+        }
     }
 }
 
@@ -337,7 +386,8 @@ mod tests {
         );
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, seq_len * nc);
-        gpu.compute(&device, &queue, &in_buf, &out_buf, seq_len);
+        let state_buf = create_f32_buffer(&device, gpu.conv_state_size());
+        gpu.compute(&device, &queue, &in_buf, &out_buf, &state_buf, seq_len);
         let actual = download_f32(&device, &queue, &out_buf, seq_len * nc);
 
         assert_approx_eq(&actual, &expected, 1e-2);

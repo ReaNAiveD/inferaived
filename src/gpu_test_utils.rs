@@ -106,19 +106,21 @@ pub fn download_f32(
 }
 
 /// Pack a slice of `f32` values into packed bf16 u32 pairs (2 bf16 per u32).
-/// The input length must be even.
+/// Odd-length inputs are padded with a single zero bf16 in the high lane of
+/// the final u32 — this matches how `MulMatWebgpu` pads its weight buffer.
 pub fn pack_f32_to_bf16_u32(data: &[f32]) -> Vec<u32> {
-    assert!(
-        data.len() % 2 == 0,
-        "pack_f32_to_bf16_u32 requires even length"
-    );
-    data.chunks_exact(2)
-        .map(|pair| {
-            let lo = half::bf16::from_f32(pair[0]).to_bits() as u32;
-            let hi = half::bf16::from_f32(pair[1]).to_bits() as u32;
-            lo | (hi << 16)
-        })
-        .collect()
+    let mut out = Vec::with_capacity(data.len().div_ceil(2));
+    let mut iter = data.chunks_exact(2);
+    for pair in &mut iter {
+        let lo = half::bf16::from_f32(pair[0]).to_bits() as u32;
+        let hi = half::bf16::from_f32(pair[1]).to_bits() as u32;
+        out.push(lo | (hi << 16));
+    }
+    if let [last] = iter.remainder() {
+        let lo = half::bf16::from_f32(*last).to_bits() as u32;
+        out.push(lo);
+    }
+    out
 }
 
 /// Unpack a bf16 value from a packed u32 at the given element index.

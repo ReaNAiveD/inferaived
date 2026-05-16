@@ -19,6 +19,7 @@ pub struct CausalGqaNaiveAttentionParams {
     q_dim: u32,
     v_dim: u32,
     seq_len: u32,
+    q_position_offset: u32,
 }
 
 pub struct CausalGqaNaiveAttentionWebgpu {
@@ -172,24 +173,67 @@ impl CausalGqaNaiveAttentionWebgpu {
         output_buffer: &wgpu::Buffer,
         seq_len: usize,
     ) {
+        self.compute_strided(
+            device,
+            queue,
+            q_buffer,
+            k_buffer,
+            v_buffer,
+            output_buffer,
+            0,
+            0,
+            0,
+            0,
+            seq_len,
+            0,
+        );
+    }
+
+    /// Run causal GQA attention over a `q_seq_len`-token slice of Q (and a
+    /// matching slice of the output) against K/V history rows
+    /// `0..q_seq_len + q_position_offset`.
+    ///
+    /// `*_offset` are in f32 elements. Q row `q_row` has absolute position
+    /// `q_row + q_position_offset` for causal masking. K/V are always read
+    /// from row 0 of their respective buffers up to the cap, so for a
+    /// decode step that has a KV cache populated at slots `0..N` and feeds
+    /// the new Q row in a 1-row scratch buffer, pass
+    /// `q_offset = 0`, `k_offset = v_offset = output_offset = 0`,
+    /// `q_seq_len = 1`, `q_position_offset = N - 1`.
+    pub fn compute_strided(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        q_buffer: &wgpu::Buffer,
+        k_buffer: &wgpu::Buffer,
+        v_buffer: &wgpu::Buffer,
+        output_buffer: &wgpu::Buffer,
+        q_offset: usize,
+        k_offset: usize,
+        v_offset: usize,
+        output_offset: usize,
+        q_seq_len: usize,
+        q_position_offset: usize,
+    ) {
         let params = CausalGqaNaiveAttentionParams {
-            q_offset: 0,
+            q_offset: q_offset as u32,
             q_token_stride: (self.num_q_heads * self.qk_head_dim) as u32,
             q_head_stride: self.qk_head_dim as u32,
-            k_offset: 0,
+            k_offset: k_offset as u32,
             k_token_stride: (self.num_kv_heads * self.qk_head_dim) as u32,
             k_head_stride: self.qk_head_dim as u32,
-            v_offset: 0,
+            v_offset: v_offset as u32,
             v_token_stride: (self.num_kv_heads * self.v_head_dim) as u32,
             v_head_stride: self.v_head_dim as u32,
-            output_offset: 0,
+            output_offset: output_offset as u32,
             output_token_stride: (self.num_q_heads * self.v_head_dim) as u32,
             output_head_stride: self.v_head_dim as u32,
             num_q_heads: self.num_q_heads as u32,
             num_kv_heads: self.num_kv_heads as u32,
             q_dim: self.qk_head_dim as u32,
             v_dim: self.v_head_dim as u32,
-            seq_len: seq_len as u32,
+            seq_len: q_seq_len as u32,
+            q_position_offset: q_position_offset as u32,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[params]));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -229,7 +273,7 @@ impl CausalGqaNaiveAttentionWebgpu {
             compute_pass.set_pipeline(&self.pipeline);
             compute_pass.set_bind_group(0, &bind_group, &[]);
             // One workgroup per (q_token, q_head).
-            let workgroup_count = (seq_len * self.num_q_heads) as u32;
+            let workgroup_count = (q_seq_len * self.num_q_heads) as u32;
             compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
         }
         queue.submit(Some(encoder.finish()));
@@ -323,5 +367,69 @@ mod tests {
         let actual = download_f32(&device, &queue, &out_buf, seq_len * num_q_heads * v_dim);
 
         assert_approx_eq(&actual, &expected, 1e-3);
+    }
+
+    /// Decode-step shape: Q is a 1-row scratch at absolute position
+    /// `seq_len - 1`; K/V are the full populated cache. The single output
+    /// row must match the last row of the full-attention reference.
+    #[tokio::test]
+    async fn test_causal_gqa_attention_decode_last_row() {
+        let (device, queue) = gpu_or_skip!();
+        let seq_len = 5;
+        let num_q_heads = 4;
+        let num_kv_heads = 2;
+        let q_dim = 16;
+        let v_dim = 16;
+
+        let q_full: Vec<f32> = (0..seq_len * num_q_heads * q_dim)
+            .map(|i| ((i as f32) * 0.05).sin() * 0.3)
+            .collect();
+        let k: Vec<f32> = (0..seq_len * num_kv_heads * q_dim)
+            .map(|i| ((i as f32) * 0.07).cos() * 0.3)
+            .collect();
+        let v: Vec<f32> = (0..seq_len * num_kv_heads * v_dim)
+            .map(|i| ((i as f32) * 0.03).sin() * 0.5)
+            .collect();
+
+        // Reference: full attention, then keep just the last token's row.
+        let expected_full = cpu_causal_gqa_attention(
+            &q_full,
+            &k,
+            &v,
+            num_q_heads,
+            num_kv_heads,
+            q_dim,
+            v_dim,
+            seq_len,
+        );
+        let expected_last =
+            expected_full[(seq_len - 1) * num_q_heads * v_dim..].to_vec();
+
+        // Q on the GPU side is a 1-row buffer holding just the last token.
+        let q_last = q_full[(seq_len - 1) * num_q_heads * q_dim..].to_vec();
+
+        let gpu =
+            CausalGqaNaiveAttentionWebgpu::new(&device, num_q_heads, num_kv_heads, q_dim, v_dim);
+        let q_buf = upload_f32(&device, &q_last);
+        let k_buf = upload_f32(&device, &k);
+        let v_buf = upload_f32(&device, &v);
+        let out_buf = create_f32_buffer(&device, num_q_heads * v_dim);
+        gpu.compute_strided(
+            &device,
+            &queue,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &out_buf,
+            /* q_offset           */ 0,
+            /* k_offset           */ 0,
+            /* v_offset           */ 0,
+            /* output_offset      */ 0,
+            /* q_seq_len          */ 1,
+            /* q_position_offset  */ seq_len - 1,
+        );
+        let actual = download_f32(&device, &queue, &out_buf, num_q_heads * v_dim);
+
+        assert_approx_eq(&actual, &expected_last, 1e-3);
     }
 }

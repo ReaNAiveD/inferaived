@@ -99,10 +99,26 @@ impl ElementwiseAddInplaceWebgpu {
         other_buffer: &wgpu::Buffer,
         seq_len: usize,
     ) {
+        self.compute_strided(device, queue, src_buffer, other_buffer, 0, 0, seq_len);
+    }
+
+    /// Add `seq_len` rows of `other_buffer` (starting at `addend_offset`,
+    /// f32 elements, row stride = `vec_dim`) onto `src_buffer` (starting at
+    /// `hidden_offset`, same row stride), in place.
+    pub fn compute_strided(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        src_buffer: &wgpu::Buffer,
+        other_buffer: &wgpu::Buffer,
+        hidden_offset: usize,
+        addend_offset: usize,
+        seq_len: usize,
+    ) {
         let uniform = ElementwiseAddParams {
-            hidden_offset: 0,
+            hidden_offset: hidden_offset as u32,
             hidden_token_stride: self.vec_dim as u32,
-            addend_offset: 0,
+            addend_offset: addend_offset as u32,
             addend_token_stride: self.vec_dim as u32,
             hidden_size: self.vec_dim as u32,
             seq_len: seq_len as u32,

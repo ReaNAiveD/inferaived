@@ -15,7 +15,9 @@ pub struct MulMatParams {
 
 pub struct MulMatWebgpu {
     bind_group_layout: wgpu::BindGroupLayout,
-    pipeline: wgpu::ComputePipeline,
+    // Selected by `compute` on N: reg_tile for N > 1, vec for N == 1.
+    pipeline_reg_tile: wgpu::ComputePipeline,
+    pipeline_vec: wgpu::ComputePipeline,
     uniform_buffer: wgpu::Buffer,
     mat_src0_buffer: wgpu::Buffer,
     m_dim: usize,
@@ -32,6 +34,7 @@ impl MulMatWebgpu {
     pub const TILE_K: usize = 16;
     pub const WORKGROUP_SIZE_M: usize = 8;
     pub const WORKGROUP_SIZE_N: usize = 4;
+    pub const WORKGROUP_SIZE_VEC: usize = 256;
 
     pub fn new<'data>(
         device: &wgpu::Device,
@@ -46,10 +49,16 @@ impl MulMatWebgpu {
         );
         let m_dim = mat_src0.shape()[0] as usize;
         let k_dim = mat_src0.shape()[1] as usize;
-        let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("mul_mat/shader"),
+        let reg_tile_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("mul_mat/reg_tile_shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
                 "wgsl-shaders/mul_mat_reg_tile.wgsl"
+            ))),
+        });
+        let vec_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("mul_mat/vec_shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
+                "wgsl-shaders/mul_mat_vec.wgsl"
             ))),
         });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -102,10 +111,10 @@ impl MulMatWebgpu {
             bind_group_layouts: &[&bind_group_layout],
             immediate_size: 0,
         });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("mul_mat/pipeline"),
+        let pipeline_reg_tile = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("mul_mat/pipeline_reg_tile"),
             layout: Some(&pipeline_layout),
-            module: &shader_module,
+            module: &reg_tile_shader,
             entry_point: Some("main"),
             compilation_options: wgpu::PipelineCompilationOptions {
                 constants: &[
@@ -117,27 +126,49 @@ impl MulMatWebgpu {
             },
             cache: None,
         });
+        let pipeline_vec = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("mul_mat/pipeline_vec"),
+            layout: Some(&pipeline_layout),
+            module: &vec_shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &[("workgroup_size", Self::WORKGROUP_SIZE_VEC as f64)],
+                zero_initialize_workgroup_memory: true,
+            },
+            cache: None,
+        });
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mul_mat/uniform_buffer"),
             size: std::mem::size_of::<MulMatParams>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let mat_src_u32 = mat_src0
-            .data()
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect::<Vec<u32>>();
+        let mat_src_bytes = mat_src0.data();
+        // wgpu validates `write_buffer` lengths against COPY_BUFFER_ALIGNMENT
+        // (= 4) at runtime, even though the Rust API doc only mentions
+        // in-bounds. bf16 is 2 bytes, so an odd element count leaves a 2-byte
+        // tail that has to be padded to a u32 word in a second write.
+        let aligned_len = mat_src_bytes.len() & !3;
+        let tail_len = mat_src_bytes.len() - aligned_len; // 0 or 2
+        let padded_size = aligned_len + if tail_len == 0 { 0 } else { 4 };
         let mat_src0_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mul_mat/mat_src0_buffer"),
-            size: (mat_src_u32.len() * std::mem::size_of::<u32>()) as u64,
+            size: padded_size as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        queue.write_buffer(&mat_src0_buffer, 0, bytemuck::cast_slice(&mat_src_u32));
+        if aligned_len > 0 {
+            queue.write_buffer(&mat_src0_buffer, 0, &mat_src_bytes[..aligned_len]);
+        }
+        if tail_len > 0 {
+            let mut tail = [0u8; 4];
+            tail[..tail_len].copy_from_slice(&mat_src_bytes[aligned_len..]);
+            queue.write_buffer(&mat_src0_buffer, aligned_len as u64, &tail);
+        }
         Self {
             bind_group_layout,
-            pipeline,
+            pipeline_reg_tile,
+            pipeline_vec,
             uniform_buffer,
             mat_src0_buffer,
             m_dim,
@@ -153,16 +184,79 @@ impl MulMatWebgpu {
         mat_dst_buffer: &wgpu::Buffer,
         n_dim: usize,
     ) {
+        self.compute_strided(device, queue, mat_src1_buffer, mat_dst_buffer, 0, 0, n_dim);
+    }
+
+    /// Compute the matmul for only the last row of an `n_dim`-row input,
+    /// leaving the earlier rows of both buffers untouched. Mirrors
+    /// `RmsNormWebgpu::compute_last_row` so the two compose in a decode step.
+    pub fn compute_last_row(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mat_src1_buffer: &wgpu::Buffer,
+        mat_dst_buffer: &wgpu::Buffer,
+        n_dim: usize,
+    ) {
+        debug_assert!(
+            n_dim >= 1,
+            "MulMatWebgpu::compute_last_row requires n_dim >= 1, got {}",
+            n_dim,
+        );
+        let last = n_dim - 1;
+        self.compute_strided(
+            device,
+            queue,
+            mat_src1_buffer,
+            mat_dst_buffer,
+            last * self.k_dim,
+            last * self.m_dim,
+            1,
+        );
+    }
+
+    /// Multiply `n` row-vectors of input — starting at `input_offset` (f32
+    /// elements) of `mat_src1_buffer` — by the weight matrix, writing the
+    /// results starting at `output_offset` (f32 elements) of `mat_dst_buffer`.
+    ///
+    /// Picks the pipeline by `n`: the reg-tile kernel is sized for ~16-wide
+    /// operand reuse and wastes most of its work at `n == 1`, so single-row
+    /// calls go to the matvec kernel instead.
+    pub fn compute_strided(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mat_src1_buffer: &wgpu::Buffer,
+        mat_dst_buffer: &wgpu::Buffer,
+        input_offset: usize,
+        output_offset: usize,
+        n: usize,
+    ) {
         let uniform = MulMatParams {
             weight_offset: 0,
-            input_offset: 0,
-            output_offset: 0,
+            input_offset: input_offset as u32,
+            output_offset: output_offset as u32,
             m: self.m_dim as u32,
-            n: n_dim as u32,
+            n: n as u32,
             k: self.k_dim as u32,
             weight_row_stride: self.k_dim as u32,
             input_row_stride: self.k_dim as u32,
         };
+        let (pipeline, workgroup_count, variant) = if n == 1 {
+            // matvec: one workgroup per output row m.
+            (&self.pipeline_vec, self.m_dim as u32, "vec")
+        } else {
+            let wg_num_m = (self.m_dim + Self::WORKGROUP_SIZE_M * Self::TILE_M - 1)
+                / (Self::WORKGROUP_SIZE_M * Self::TILE_M);
+            let wg_num_n = (n + Self::WORKGROUP_SIZE_N * Self::TILE_N - 1)
+                / (Self::WORKGROUP_SIZE_N * Self::TILE_N);
+            (
+                &self.pipeline_reg_tile,
+                (wg_num_m * wg_num_n) as u32,
+                "reg_tile",
+            )
+        };
+
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniform]));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mul_mat/bind_group"),
@@ -187,20 +281,16 @@ impl MulMatWebgpu {
             ],
         });
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("mul_mat/command_encoder"),
+            label: Some(&format!("mul_mat/command_encoder_{}", variant)),
         });
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("mul_mat/compute_pass"),
+                label: Some(&format!("mul_mat/compute_pass_{}", variant)),
                 timestamp_writes: None,
             });
-            cpass.set_pipeline(&self.pipeline);
+            cpass.set_pipeline(pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
-            let wg_num_m = (self.m_dim + Self::WORKGROUP_SIZE_M * Self::TILE_M - 1)
-                / (Self::WORKGROUP_SIZE_M * Self::TILE_M);
-            let wg_num_n = (n_dim + Self::WORKGROUP_SIZE_N * Self::TILE_N - 1)
-                / (Self::WORKGROUP_SIZE_N * Self::TILE_N);
-            cpass.dispatch_workgroups((wg_num_m * wg_num_n) as u32, 1, 1);
+            cpass.dispatch_workgroups(workgroup_count, 1, 1);
         }
         queue.submit(Some(encoder.finish()));
     }
@@ -260,5 +350,130 @@ mod tests {
         let actual = download_f32(&device, &queue, &out_buf, n * m);
 
         assert_approx_eq(&actual, &expected, 1e-2);
+    }
+
+    /// `compute` with n_dim == 1 must take the matvec path and still match
+    /// the CPU reference.
+    #[tokio::test]
+    async fn test_mul_mat_vec_n1() {
+        let (device, queue) = gpu_or_skip!();
+        // Use a larger M and K than the default test to actually exercise
+        // the workgroup-wide K-split + tree reduction.
+        let m = 320;
+        let n = 1;
+        let k = 512;
+
+        let weight_f32: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.013).sin()).collect();
+        let weight_packed = pack_f32_to_bf16_u32(&weight_f32);
+        let weight_bf16_bytes: Vec<u8> = weight_f32
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+        let input: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.021).cos()).collect();
+
+        let expected = cpu_mul_mat(&weight_packed, &input, m, n, k);
+
+        let tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::BF16,
+            vec![m, k],
+            &weight_bf16_bytes,
+        )
+        .unwrap();
+        let gpu = MulMatWebgpu::new(&device, &queue, tv);
+        let in_buf = upload_f32(&device, &input);
+        let out_buf = create_f32_buffer(&device, n * m);
+        gpu.compute(&device, &queue, &in_buf, &out_buf, n);
+        let actual = download_f32(&device, &queue, &out_buf, n * m);
+
+        assert_approx_eq(&actual, &expected, 1e-2);
+    }
+
+    /// Matvec must handle odd K (and the resulting odd row alignment) — the
+    /// shader resolves bf16 lo/hi per element rather than iterating in
+    /// u32-aligned pairs, so no caller-side padding is required.
+    #[tokio::test]
+    async fn test_mul_mat_vec_odd_k() {
+        let (device, queue) = gpu_or_skip!();
+        let m = 7;
+        let n = 1;
+        let k = 13;
+
+        let weight_f32: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.041).sin()).collect();
+        let weight_packed = pack_f32_to_bf16_u32(&weight_f32);
+        let weight_bf16_bytes: Vec<u8> = weight_f32
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+        let input: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.037).cos()).collect();
+
+        let expected = cpu_mul_mat(&weight_packed, &input, m, n, k);
+
+        let tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::BF16,
+            vec![m, k],
+            &weight_bf16_bytes,
+        )
+        .unwrap();
+        let gpu = MulMatWebgpu::new(&device, &queue, tv);
+        let in_buf = upload_f32(&device, &input);
+        let out_buf = create_f32_buffer(&device, n * m);
+        gpu.compute(&device, &queue, &in_buf, &out_buf, n);
+        let actual = download_f32(&device, &queue, &out_buf, n * m);
+
+        assert_approx_eq(&actual, &expected, 1e-2);
+    }
+
+    /// `compute_last_row` reads only the last input row and writes only the
+    /// last output slot. Other output rows must be left untouched.
+    #[tokio::test]
+    async fn test_mul_mat_compute_last_row() {
+        let (device, queue) = gpu_or_skip!();
+        let m = 96;
+        let n = 4;
+        let k = 128;
+
+        let weight_f32: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.017).sin()).collect();
+        let weight_packed = pack_f32_to_bf16_u32(&weight_f32);
+        let weight_bf16_bytes: Vec<u8> = weight_f32
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+        let input: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.029).cos()).collect();
+
+        // Reference: full matmul. We only compare the last row of it.
+        let expected_full = cpu_mul_mat(&weight_packed, &input, m, n, k);
+        let expected_last = &expected_full[(n - 1) * m..n * m];
+
+        let tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::BF16,
+            vec![m, k],
+            &weight_bf16_bytes,
+        )
+        .unwrap();
+        let gpu = MulMatWebgpu::new(&device, &queue, tv);
+        let in_buf = upload_f32(&device, &input);
+
+        // Pre-fill output with a sentinel so we can verify the earlier rows
+        // were not overwritten.
+        let sentinel: Vec<f32> = vec![-12345.0; n * m];
+        let out_buf = upload_f32(&device, &sentinel);
+
+        gpu.compute_last_row(&device, &queue, &in_buf, &out_buf, n);
+        let actual = download_f32(&device, &queue, &out_buf, n * m);
+
+        // Last row matches the reference.
+        assert_approx_eq(&actual[(n - 1) * m..n * m], expected_last, 1e-2);
+        // All earlier rows are untouched.
+        for row in 0..n - 1 {
+            for col in 0..m {
+                assert_eq!(
+                    actual[row * m + col],
+                    sentinel[row * m + col],
+                    "row {} col {} was modified",
+                    row,
+                    col,
+                );
+            }
+        }
     }
 }

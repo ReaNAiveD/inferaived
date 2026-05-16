@@ -1,4 +1,4 @@
-use inferaived::language_model::{LayerType, Qwen35Config, Qwen35Model};
+use inferaived::language_model::{LayerType, Qwen35Config, Qwen35Model, Qwen35Session};
 use safetensors::SafeTensors;
 use tokenizers::Tokenizer;
 use tokio;
@@ -114,13 +114,47 @@ async fn main() {
     let model = Qwen35Model::new(&device, &queue, &tensors, &config);
     info!("Model constructed");
 
-    let top_candidates = model.compute(&device, &queue, encoded.get_ids(), 5).await;
-    let next_token_id = top_candidates[0].0 as u32;
-    let next_token_text = tokenizer
-        .decode(&[next_token_id], false)
-        .expect("Failed to decode next token");
+    // Small max_seq_len is enough for this smoke test (prompt + a few
+    // generated tokens). Bump this up for longer generation or multi-turn
+    // chat.
+    let max_seq_len = 32;
+    let num_generated = 5;
+    let mut session = Qwen35Session::new(&model, &device, max_seq_len);
+
+    // Cold prefill of the prompt; the top candidates are for the FIRST
+    // token immediately after the prompt.
+    let prompt_top = session
+        .forward(&device, &queue, encoded.get_ids(), 5)
+        .await;
+    let first_token = prompt_top[0].0 as u32;
     println!(
-        "Next token id: {}, text: {:?}, top candidates: {:?}",
-        next_token_id, next_token_text, top_candidates
+        "Prefill picked token {}: {:?} (top 5: {:?})",
+        first_token,
+        tokenizer
+            .decode(&[first_token], false)
+            .unwrap_or_default(),
+        prompt_top,
     );
+
+    // Decode loop: feed the previously-sampled token back into the session
+    // one at a time and take the greedy pick each step.
+    let mut generated: Vec<u32> = vec![first_token];
+    let mut next_input = first_token;
+    for _ in 0..(num_generated - 1) {
+        let top = session.forward(&device, &queue, &[next_input], 5).await;
+        let tok = top[0].0 as u32;
+        println!(
+            "Step picked token {}: {:?} (top 5: {:?})",
+            tok,
+            tokenizer.decode(&[tok], false).unwrap_or_default(),
+            top,
+        );
+        generated.push(tok);
+        next_input = tok;
+    }
+
+    let generated_text = tokenizer
+        .decode(&generated, false)
+        .expect("Failed to decode generated tokens");
+    println!("Prompt + generated: {:?}{:?}", prompt, generated_text);
 }

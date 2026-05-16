@@ -114,61 +114,30 @@ impl RopeInplaceWebgpu {
     }
 
     /// Apply RoPE in-place to Q and K.
-    ///
-    /// Both buffers are assumed to be tightly packed `[seq, num_*_heads, head_dim]`
-    /// in row-major layout starting at offset 0.
-    pub fn compute(
+    pub fn forward(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         q_buffer: &wgpu::Buffer,
         k_buffer: &wgpu::Buffer,
-        seq_len: usize,
-        position_offset: usize,
-    ) {
-        self.compute_strided(
-            device,
-            queue,
-            q_buffer,
-            k_buffer,
-            0,
-            0,
-            seq_len,
-            position_offset,
-        );
-    }
-
-    /// Apply RoPE in-place to a `seq_len`-token slice of Q and K, starting
-    /// at `q_offset` / `k_offset` (in f32 elements). Both Q and K rows are
-    /// still assumed tightly packed `[num_*_heads, head_dim]`.
-    ///
-    /// The slice's absolute token positions are `position_offset ..
-    /// position_offset + seq_len`. For a single-token decode step that
-    /// writes K into slot `pos` of the KV cache, call with
-    /// `q_offset = 0`, `k_offset = pos * num_k_heads * head_dim`,
-    /// `seq_len = 1`, `position_offset = pos`.
-    pub fn compute_strided(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        q_buffer: &wgpu::Buffer,
-        k_buffer: &wgpu::Buffer,
-        q_offset: usize,
-        k_offset: usize,
-        seq_len: usize,
+        q_start_row: usize,
+        k_start_row: usize,
+        num_rows: usize,
         position_offset: usize,
     ) {
         let head_dim = self.head_dim as u32;
+        let q_token_stride = self.num_q_heads as u32 * head_dim;
+        let k_token_stride = self.num_k_heads as u32 * head_dim;
         let uniform_data = RopeParams {
-            q_offset: q_offset as u32,
-            q_token_stride: self.num_q_heads as u32 * head_dim,
+            q_offset: (q_start_row * q_token_stride as usize) as u32,
+            q_token_stride,
             q_head_stride: head_dim,
-            k_offset: k_offset as u32,
-            k_token_stride: self.num_k_heads as u32 * head_dim,
+            k_offset: (k_start_row * k_token_stride as usize) as u32,
+            k_token_stride,
             k_head_stride: head_dim,
             num_q_heads: self.num_q_heads as u32,
             num_k_heads: self.num_k_heads as u32,
-            seq_len: seq_len as u32,
+            seq_len: num_rows as u32,
             num_rotated_dims: self.num_rotated_dims as u32,
             theta_scale: self.theta_scale,
             position_offset: position_offset as u32,
@@ -207,7 +176,8 @@ impl RopeInplaceWebgpu {
             compute_pass.set_pipeline(&self.pipeline);
             compute_pass.set_bind_group(0, &bind_group, &[]);
             let max_heads = self.num_q_heads.max(self.num_k_heads);
-            let total_invocations = ((self.num_rotated_dims / 2) * max_heads * seq_len) as u32;
+            let total_invocations =
+                ((self.num_rotated_dims / 2) * max_heads * num_rows) as u32;
             let workgroup_count =
                 (total_invocations + Self::WORKGROUP_SIZE - 1) / Self::WORKGROUP_SIZE;
             compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
@@ -309,7 +279,7 @@ mod tests {
         );
         let q_buf = upload_f32(&device, &q);
         let k_buf = upload_f32(&device, &k);
-        gpu.compute(&device, &queue, &q_buf, &k_buf, seq_len, 0);
+        gpu.forward(&device, &queue, &q_buf, &k_buf, 0, 0, seq_len, 0);
         let actual_q = download_f32(&device, &queue, &q_buf, seq_len * num_q_heads * head_dim);
         let actual_k = download_f32(&device, &queue, &k_buf, seq_len * num_k_heads * head_dim);
 

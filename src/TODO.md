@@ -36,3 +36,15 @@ Optimization directions for the Rust orchestration layer (kernels-side TODOs liv
 
 - `main.rs` hardcodes `hidden_size`, `intermediate_size`, head dims, etc.
 - Direction: parse `model/Qwen3.5-0.8B/config.json` via `serde_json` into a typed `Qwen35Config`, drive `LayerStackConfig` from it.
+
+## Wrap `buffer` as BufferView to support strided access
+
+- Pending
+
+## ScratchArena
+
+- 把每次 prefill / decode_step 里那一堆 device.create_buffer 走 allocator，未来可换成 bump arena 复用显存。
+
+## File structure Optimization
+
+- Pending

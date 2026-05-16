@@ -91,37 +91,26 @@ impl ElementwiseAddInplaceWebgpu {
         }
     }
 
-    pub fn compute(
+    /// Add `num_rows` rows of `other_buffer` (starting at row
+    /// `other_start_row`) onto `src_buffer` (starting at row
+    /// `src_start_row`), in place.
+    pub fn forward(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         src_buffer: &wgpu::Buffer,
         other_buffer: &wgpu::Buffer,
-        seq_len: usize,
-    ) {
-        self.compute_strided(device, queue, src_buffer, other_buffer, 0, 0, seq_len);
-    }
-
-    /// Add `seq_len` rows of `other_buffer` (starting at `addend_offset`,
-    /// f32 elements, row stride = `vec_dim`) onto `src_buffer` (starting at
-    /// `hidden_offset`, same row stride), in place.
-    pub fn compute_strided(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        src_buffer: &wgpu::Buffer,
-        other_buffer: &wgpu::Buffer,
-        hidden_offset: usize,
-        addend_offset: usize,
-        seq_len: usize,
+        src_start_row: usize,
+        other_start_row: usize,
+        num_rows: usize,
     ) {
         let uniform = ElementwiseAddParams {
-            hidden_offset: hidden_offset as u32,
+            hidden_offset: (src_start_row * self.vec_dim) as u32,
             hidden_token_stride: self.vec_dim as u32,
-            addend_offset: addend_offset as u32,
+            addend_offset: (other_start_row * self.vec_dim) as u32,
             addend_token_stride: self.vec_dim as u32,
             hidden_size: self.vec_dim as u32,
-            seq_len: seq_len as u32,
+            seq_len: num_rows as u32,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -152,7 +141,7 @@ impl ElementwiseAddInplaceWebgpu {
             });
             cpass.set_pipeline(&self.pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
-            cpass.dispatch_workgroups(seq_len as u32, 1, 1);
+            cpass.dispatch_workgroups(num_rows as u32, 1, 1);
         }
         queue.submit(Some(encoder.finish()));
     }
@@ -190,7 +179,7 @@ mod tests {
         let gpu = ElementwiseAddInplaceWebgpu::new(&device, hidden_size);
         let h_buf = upload_f32(&device, &hidden);
         let a_buf = upload_f32(&device, &addend);
-        gpu.compute(&device, &queue, &h_buf, &a_buf, seq_len);
+        gpu.forward(&device, &queue, &h_buf, &a_buf, 0, 0, seq_len);
         let actual = download_f32(&device, &queue, &h_buf, seq_len * hidden_size);
 
         assert_approx_eq(&actual, &expected, 1e-5);

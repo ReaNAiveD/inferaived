@@ -176,79 +176,37 @@ impl MulMatWebgpu {
         }
     }
 
-    pub fn compute(
+    /// Compute `num_rows` rows of `dst = src @ W^T`, reading `num_rows`
+    /// input rows starting at row `src_start_row` of `mat_src1_buffer`
+    /// and writing `num_rows` output rows starting at row `dst_start_row`
+    /// of `mat_dst_buffer`.
+    pub fn forward(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         mat_src1_buffer: &wgpu::Buffer,
         mat_dst_buffer: &wgpu::Buffer,
-        n_dim: usize,
-    ) {
-        self.compute_strided(device, queue, mat_src1_buffer, mat_dst_buffer, 0, 0, n_dim);
-    }
-
-    /// Compute the matmul for only the last row of an `n_dim`-row input,
-    /// leaving the earlier rows of both buffers untouched. Mirrors
-    /// `RmsNormWebgpu::compute_last_row` so the two compose in a decode step.
-    pub fn compute_last_row(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        mat_src1_buffer: &wgpu::Buffer,
-        mat_dst_buffer: &wgpu::Buffer,
-        n_dim: usize,
-    ) {
-        debug_assert!(
-            n_dim >= 1,
-            "MulMatWebgpu::compute_last_row requires n_dim >= 1, got {}",
-            n_dim,
-        );
-        let last = n_dim - 1;
-        self.compute_strided(
-            device,
-            queue,
-            mat_src1_buffer,
-            mat_dst_buffer,
-            last * self.k_dim,
-            last * self.m_dim,
-            1,
-        );
-    }
-
-    /// Multiply `n` row-vectors of input — starting at `input_offset` (f32
-    /// elements) of `mat_src1_buffer` — by the weight matrix, writing the
-    /// results starting at `output_offset` (f32 elements) of `mat_dst_buffer`.
-    ///
-    /// Picks the pipeline by `n`: the reg-tile kernel is sized for ~16-wide
-    /// operand reuse and wastes most of its work at `n == 1`, so single-row
-    /// calls go to the matvec kernel instead.
-    pub fn compute_strided(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        mat_src1_buffer: &wgpu::Buffer,
-        mat_dst_buffer: &wgpu::Buffer,
-        input_offset: usize,
-        output_offset: usize,
-        n: usize,
+        src_start_row: usize,
+        dst_start_row: usize,
+        num_rows: usize,
     ) {
         let uniform = MulMatParams {
             weight_offset: 0,
-            input_offset: input_offset as u32,
-            output_offset: output_offset as u32,
+            input_offset: (src_start_row * self.k_dim) as u32,
+            output_offset: (dst_start_row * self.m_dim) as u32,
             m: self.m_dim as u32,
-            n: n as u32,
+            n: num_rows as u32,
             k: self.k_dim as u32,
             weight_row_stride: self.k_dim as u32,
             input_row_stride: self.k_dim as u32,
         };
-        let (pipeline, workgroup_count, variant) = if n == 1 {
+        let (pipeline, workgroup_count, variant) = if num_rows == 1 {
             // matvec: one workgroup per output row m.
             (&self.pipeline_vec, self.m_dim as u32, "vec")
         } else {
             let wg_num_m = (self.m_dim + Self::WORKGROUP_SIZE_M * Self::TILE_M - 1)
                 / (Self::WORKGROUP_SIZE_M * Self::TILE_M);
-            let wg_num_n = (n + Self::WORKGROUP_SIZE_N * Self::TILE_N - 1)
+            let wg_num_n = (num_rows + Self::WORKGROUP_SIZE_N * Self::TILE_N - 1)
                 / (Self::WORKGROUP_SIZE_N * Self::TILE_N);
             (
                 &self.pipeline_reg_tile,
@@ -346,7 +304,7 @@ mod tests {
         let gpu = MulMatWebgpu::new(&device, &queue, tv);
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, n * m);
-        gpu.compute(&device, &queue, &in_buf, &out_buf, n);
+        gpu.forward(&device, &queue, &in_buf, &out_buf, 0, 0, n);
         let actual = download_f32(&device, &queue, &out_buf, n * m);
 
         assert_approx_eq(&actual, &expected, 1e-2);
@@ -382,7 +340,7 @@ mod tests {
         let gpu = MulMatWebgpu::new(&device, &queue, tv);
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, n * m);
-        gpu.compute(&device, &queue, &in_buf, &out_buf, n);
+        gpu.forward(&device, &queue, &in_buf, &out_buf, 0, 0, n);
         let actual = download_f32(&device, &queue, &out_buf, n * m);
 
         assert_approx_eq(&actual, &expected, 1e-2);
@@ -417,16 +375,17 @@ mod tests {
         let gpu = MulMatWebgpu::new(&device, &queue, tv);
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, n * m);
-        gpu.compute(&device, &queue, &in_buf, &out_buf, n);
+        gpu.forward(&device, &queue, &in_buf, &out_buf, 0, 0, n);
         let actual = download_f32(&device, &queue, &out_buf, n * m);
 
         assert_approx_eq(&actual, &expected, 1e-2);
     }
 
-    /// `compute_last_row` reads only the last input row and writes only the
-    /// last output slot. Other output rows must be left untouched.
+    /// Same as `forward` but called with `src_start_row = dst_start_row =
+    /// n - 1, num_rows = 1`: read only the last input row and write only
+    /// the last output slot. Other output rows must be left untouched.
     #[tokio::test]
-    async fn test_mul_mat_compute_last_row() {
+    async fn test_mul_mat_forward_last_row() {
         let (device, queue) = gpu_or_skip!();
         let m = 96;
         let n = 4;
@@ -458,7 +417,7 @@ mod tests {
         let sentinel: Vec<f32> = vec![-12345.0; n * m];
         let out_buf = upload_f32(&device, &sentinel);
 
-        gpu.compute_last_row(&device, &queue, &in_buf, &out_buf, n);
+        gpu.forward(&device, &queue, &in_buf, &out_buf, n - 1, n - 1, 1);
         let actual = download_f32(&device, &queue, &out_buf, n * m);
 
         // Last row matches the reference.

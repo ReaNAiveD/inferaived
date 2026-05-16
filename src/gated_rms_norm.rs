@@ -135,7 +135,10 @@ impl GatedRmsNormInplaceWebgpu {
         };
     }
 
-    pub fn compute(
+    /// In-place gated RMS-norm over `num_rows` token rows of
+    /// `src_buffer` and `gate_buffer` (both read/written tight from row
+    /// 0).
+    pub fn forward(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -265,7 +268,7 @@ mod tests {
         let gpu = GatedRmsNormInplaceWebgpu::new(&device, tv, num_heads, head_dim, eps);
         let h_buf = upload_f32(&device, &hidden);
         let g_buf = upload_f32(&device, &gate);
-        gpu.compute(&device, &queue, &h_buf, &g_buf, seq_len);
+        gpu.forward(&device, &queue, &h_buf, &g_buf, seq_len);
         let actual = download_f32(&device, &queue, &h_buf, total);
 
         assert_approx_eq(&actual, &expected, 1e-3);

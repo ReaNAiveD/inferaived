@@ -173,7 +173,10 @@ impl ConvSiluWebgpu {
         }
     }
 
-    pub fn compute(
+    /// Run depthwise causal conv1d + SiLU over `num_rows` token rows of
+    /// `src_buffer` (read tight from row 0), writing the activated
+    /// outputs to `dst_buffer` (also tight from row 0).
+    pub fn forward(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -387,7 +390,7 @@ mod tests {
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, seq_len * nc);
         let state_buf = create_f32_buffer(&device, gpu.conv_state_size());
-        gpu.compute(&device, &queue, &in_buf, &out_buf, &state_buf, seq_len);
+        gpu.forward(&device, &queue, &in_buf, &out_buf, &state_buf, seq_len);
         let actual = download_f32(&device, &queue, &out_buf, seq_len * nc);
 
         assert_approx_eq(&actual, &expected, 1e-2);

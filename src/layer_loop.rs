@@ -176,9 +176,8 @@ impl LinearAttentionLayer {
             config.linear_key_head_dim,
             config.linear_value_head_dim,
         );
-        let recurrent_state_size = config.linear_num_key_heads
-            * config.linear_key_head_dim
-            * config.linear_value_head_dim;
+        let recurrent_state_size =
+            config.linear_num_key_heads * config.linear_key_head_dim * config.linear_value_head_dim;
         let norm_weight_name = format!("{}.linear_attn.norm.weight", weight_prefix);
         let norm_weight = tensor
             .tensor(&norm_weight_name)
@@ -253,383 +252,6 @@ impl LinearAttentionLayer {
             mlp_residual_add,
         }
     }
-
-    pub fn compute(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        embedding_buffer: &wgpu::Buffer,
-        seq_len: usize,
-    ) {
-        let normed_embedding_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/normed_embedding_buffer"),
-            size: (seq_len * self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let in_proj_qkv_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/in_proj_qkv_buffer"),
-            size: (seq_len * self.qkv_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let in_proj_z_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/in_proj_z_buffer"),
-            size: (seq_len * self.v_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let in_proj_a_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/in_proj_a_buffer"),
-            size: (seq_len * self.linear_num_value_heads * std::mem::size_of::<f32>())
-                as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let in_proj_b_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/in_proj_b_buffer"),
-            size: (seq_len * self.linear_num_value_heads * std::mem::size_of::<f32>())
-                as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let conv_qkv_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/conv_qkv_buffer"),
-            size: (seq_len * self.qkv_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let attn_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/attn_output_buffer"),
-            size: (seq_len * self.v_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let out_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/out_proj_buffer"),
-            size: (seq_len * self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let mlp_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/mlp_output_buffer"),
-            size: (seq_len * self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let recurrent_state_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/recurrent_state_buffer"),
-            size: (self.recurrent_state_size * std::mem::size_of::<f32>())
-                as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let conv_state_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/conv_state_buffer"),
-            size: (self.conv_state_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        self.input_layernorm.compute(
-            device,
-            queue,
-            &embedding_buffer,
-            &normed_embedding_buffer,
-            seq_len,
-        );
-        self.in_proj_qkv_mul_mat.compute(
-            device,
-            queue,
-            &normed_embedding_buffer,
-            &in_proj_qkv_buffer,
-            seq_len,
-        );
-        self.in_proj_a_mul_mat.compute(
-            device,
-            queue,
-            &normed_embedding_buffer,
-            &in_proj_a_buffer,
-            seq_len,
-        );
-        self.in_proj_b_mul_mat.compute(
-            device,
-            queue,
-            &normed_embedding_buffer,
-            &in_proj_b_buffer,
-            seq_len,
-        );
-        self.conv_silu.compute(
-            device,
-            queue,
-            &in_proj_qkv_buffer,
-            &conv_qkv_buffer,
-            &conv_state_buffer,
-            seq_len,
-        );
-        self.delta_rule.compute(
-            device,
-            queue,
-            &conv_qkv_buffer,
-            &in_proj_a_buffer,
-            &in_proj_b_buffer,
-            &recurrent_state_buffer,
-            &attn_output_buffer,
-            seq_len,
-        );
-        self.in_proj_z_mul_mat.compute(
-            device,
-            queue,
-            &normed_embedding_buffer,
-            &in_proj_z_buffer,
-            seq_len,
-        );
-        self.gated_norm.compute(
-            device,
-            queue,
-            &attn_output_buffer,
-            &in_proj_z_buffer,
-            seq_len,
-        );
-        self.out_proj_mat_mul.compute(
-            device,
-            queue,
-            &attn_output_buffer,
-            &out_proj_buffer,
-            seq_len,
-        );
-        self.attn_residual_add
-            .compute(device, queue, &embedding_buffer, &out_proj_buffer, seq_len);
-        self.post_attention_layernorm.compute(
-            device,
-            queue,
-            &embedding_buffer,
-            &normed_embedding_buffer,
-            seq_len,
-        );
-        self.mlp.compute(
-            device,
-            queue,
-            &normed_embedding_buffer,
-            &mlp_output_buffer,
-            seq_len,
-        );
-        self.mlp_residual_add.compute(
-            device,
-            queue,
-            &embedding_buffer,
-            &mlp_output_buffer,
-            seq_len,
-        );
-    }
-
-    pub fn compute_decode(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        embedding_buffer: &wgpu::Buffer,
-        conv_state_buffer: &wgpu::Buffer,
-        recurrent_state_buffer: &wgpu::Buffer,
-        seq_len: usize,
-    ) {
-        debug_assert!(
-            seq_len >= 1,
-            "compute_decode requires seq_len >= 1, got {}",
-            seq_len,
-        );
-        let _ = self.conv_state_size;
-        let _ = self.recurrent_state_size;
-        let position = seq_len - 1;
-        let residual_offset = position * self.hidden_size;
-        let normed_embedding_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/normed_embedding_buffer"),
-            size: (self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let in_proj_qkv_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/in_proj_qkv_buffer"),
-            size: (self.qkv_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let in_proj_z_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/in_proj_z_buffer"),
-            size: (self.v_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let in_proj_a_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/in_proj_a_buffer"),
-            size: (self.linear_num_value_heads * std::mem::size_of::<f32>())
-                as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let in_proj_b_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/in_proj_b_buffer"),
-            size: (self.linear_num_value_heads * std::mem::size_of::<f32>())
-                as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let conv_qkv_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/conv_qkv_buffer"),
-            size: (self.qkv_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let attn_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/attn_output_buffer"),
-            size: (self.v_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let out_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/out_proj_buffer"),
-            size: (self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let mlp_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/mlp_output_buffer"),
-            size: (self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        self.input_layernorm.compute_last_row(
-            device,
-            queue,
-            embedding_buffer,
-            &normed_embedding_buffer,
-            seq_len,
-        );
-        self.in_proj_qkv_mul_mat.compute(
-            device,
-            queue,
-            &normed_embedding_buffer,
-            &in_proj_qkv_buffer,
-            1,
-        );
-        self.in_proj_a_mul_mat.compute(
-            device,
-            queue,
-            &normed_embedding_buffer,
-            &in_proj_a_buffer,
-            1,
-        );
-        self.in_proj_b_mul_mat.compute(
-            device,
-            queue,
-            &normed_embedding_buffer,
-            &in_proj_b_buffer,
-            1,
-        );
-        self.conv_silu.compute(
-            device,
-            queue,
-            &in_proj_qkv_buffer,
-            &conv_qkv_buffer,
-            conv_state_buffer,
-            1,
-        );
-        self.delta_rule.compute(
-            device,
-            queue,
-            &conv_qkv_buffer,
-            &in_proj_a_buffer,
-            &in_proj_b_buffer,
-            recurrent_state_buffer,
-            &attn_output_buffer,
-            1,
-        );
-        self.in_proj_z_mul_mat.compute(
-            device,
-            queue,
-            &normed_embedding_buffer,
-            &in_proj_z_buffer,
-            1,
-        );
-        self.gated_norm
-            .compute(device, queue, &attn_output_buffer, &in_proj_z_buffer, 1);
-        self.out_proj_mat_mul.compute(
-            device,
-            queue,
-            &attn_output_buffer,
-            &out_proj_buffer,
-            1,
-        );
-        self.attn_residual_add.compute_strided(
-            device,
-            queue,
-            embedding_buffer,
-            &out_proj_buffer,
-            residual_offset,
-            0,
-            1,
-        );
-        self.post_attention_layernorm.compute_last_row(
-            device,
-            queue,
-            embedding_buffer,
-            &normed_embedding_buffer,
-            seq_len,
-        );
-        self.mlp.compute_decode(
-            device,
-            queue,
-            &normed_embedding_buffer,
-            &mlp_output_buffer,
-        );
-        self.mlp_residual_add.compute_strided(
-            device,
-            queue,
-            embedding_buffer,
-            &mlp_output_buffer,
-            residual_offset,
-            0,
-            1,
-        );
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -702,7 +324,7 @@ impl SelfAttentionLayer {
             q_proj_weight_name
         );
         let q_proj_mul_mat = MulMatWebgpu::new(device, queue, q_proj_weight);
-        let q_extract = SliceCopyWebgpu::new(device);
+        let q_extract = SliceCopyWebgpu::new(device, config.num_attention_heads, config.head_dim);
         let k_proj_weight_name = format!("{}.self_attn.k_proj.weight", weight_prefix);
         let k_proj_weight = tensor
             .tensor(&k_proj_weight_name)
@@ -767,7 +389,7 @@ impl SelfAttentionLayer {
             config.head_dim, // value head dim is typically the same as key head dim in GQA
         );
         let sigmoid_mul =
-            SigmoidMulInplaceWebgpu::new(device, config.head_dim * config.num_attention_heads);
+            SigmoidMulInplaceWebgpu::new(device, config.num_attention_heads, config.head_dim);
         let o_proj_weight_name = format!("{}.self_attn.o_proj.weight", weight_prefix);
         let o_proj_weight = tensor
             .tensor(&o_proj_weight_name)
@@ -828,390 +450,6 @@ impl SelfAttentionLayer {
             mlp_residual_add,
         }
     }
-
-    pub fn compute(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        embedding_buffer: &wgpu::Buffer,
-        seq_len: usize,
-    ) {
-        let q_dim = self.num_attention_heads * self.head_dim;
-        let q_gate_dim = q_dim * 2;
-        let kv_dim = self.num_key_value_heads * self.head_dim;
-        let normed_embedding_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("self_attention_layer/normed_embedding_buffer"),
-            size: (seq_len * self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let q_gate_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("self_attention_layer/q_gate_proj_buffer"),
-            size: (seq_len * q_gate_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        // Tight buffer that holds just the Q half of `q_gate_proj_buffer`, used as
-        // input by q_norm / RoPE / attention. The gate half stays in
-        // `q_gate_proj_buffer` for the later sigmoid * gate step.
-        let q_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("self_attention_layer/q_proj_buffer"),
-            size: (seq_len * q_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let k_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("self_attention_layer/k_proj_buffer"),
-            size: (seq_len * kv_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let v_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("self_attention_layer/v_proj_buffer"),
-            size: (seq_len * kv_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let attn_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("self_attention_layer/attn_output_buffer"),
-            size: (seq_len * q_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let o_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("self_attention_layer/o_proj_buffer"),
-            size: (seq_len * self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let mlp_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("self_attention_layer/mlp_output_buffer"),
-            size: (seq_len * self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        self.input_layernorm.compute(
-            device,
-            queue,
-            &embedding_buffer,
-            &normed_embedding_buffer,
-            seq_len,
-        );
-        self.q_proj_mul_mat.compute(
-            device,
-            queue,
-            &normed_embedding_buffer,
-            &q_gate_proj_buffer,
-            seq_len,
-        );
-        self.k_proj_mul_mat.compute(
-            device,
-            queue,
-            &normed_embedding_buffer,
-            &k_proj_buffer,
-            seq_len,
-        );
-        self.v_proj_mul_mat.compute(
-            device,
-            queue,
-            &normed_embedding_buffer,
-            &v_proj_buffer,
-            seq_len,
-        );
-        self.q_extract.compute(
-            device,
-            queue,
-            &q_gate_proj_buffer,
-            &q_proj_buffer,
-            /* src_offset       */ 0,
-            /* src_token_stride */ self.num_attention_heads * self.head_dim * 2,
-            /* src_head_stride  */ self.head_dim * 2,
-            /* dst_offset       */ 0,
-            /* dst_token_stride */ self.num_attention_heads * self.head_dim,
-            /* dst_head_stride  */ self.head_dim,
-            self.num_attention_heads,
-            self.head_dim,
-            seq_len,
-        );
-        self.q_norm.compute(
-            device,
-            queue,
-            &q_proj_buffer,
-            seq_len * self.num_attention_heads,
-        );
-        self.k_norm.compute(
-            device,
-            queue,
-            &k_proj_buffer,
-            seq_len * self.num_key_value_heads,
-        );
-        self.rope
-            .compute(device, queue, &q_proj_buffer, &k_proj_buffer, seq_len, 0);
-        self.gqa_attention.compute(
-            device,
-            queue,
-            &q_proj_buffer,
-            &k_proj_buffer,
-            &v_proj_buffer,
-            &attn_output_buffer,
-            seq_len,
-        );
-        self.sigmoid_mul.compute_strided(
-            device,
-            queue,
-            &attn_output_buffer,
-            &q_gate_proj_buffer,
-            0,
-            self.num_attention_heads * self.head_dim,
-            self.head_dim,
-            self.head_dim,
-            self.num_attention_heads * self.head_dim * 2,
-            self.head_dim * 2,
-            self.num_attention_heads,
-            self.head_dim,
-            seq_len,
-        );
-        self.o_proj_mul_mat
-            .compute(device, queue, &attn_output_buffer, &o_proj_buffer, seq_len);
-        self.attn_residual_add
-            .compute(device, queue, &embedding_buffer, &o_proj_buffer, seq_len);
-        self.post_attention_layernorm.compute(
-            device,
-            queue,
-            &embedding_buffer,
-            &normed_embedding_buffer,
-            seq_len,
-        );
-        self.mlp.compute(
-            device,
-            queue,
-            &normed_embedding_buffer,
-            &mlp_output_buffer,
-            seq_len,
-        );
-        self.mlp_residual_add.compute(
-            device,
-            queue,
-            &embedding_buffer,
-            &mlp_output_buffer,
-            seq_len,
-        );
-    }
-
-    pub fn compute_decode(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        embedding_buffer: &wgpu::Buffer,
-        k_buffer: &wgpu::Buffer,
-        v_buffer: &wgpu::Buffer,
-        seq_len: usize,
-    ) {
-        debug_assert!(
-            seq_len >= 1,
-            "compute_decoder requires seq_len >= 1, got {}",
-            seq_len,
-        );
-        let q_dim = self.num_attention_heads * self.head_dim;
-        let q_gate_dim = q_dim * 2;
-        let kv_dim = self.num_key_value_heads * self.head_dim;
-        let position = seq_len - 1;
-        let kv_cache_slot_offset = position * kv_dim;
-        let residual_offset = position * self.hidden_size;
-        let normed_embedding_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("self_attention_layer/normed_embedding_buffer"),
-            size: (self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let q_gate_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("self_attention_layer/q_gate_proj_buffer"),
-            size: (q_gate_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let q_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("self_attention_layer/q_proj_buffer"),
-            size: (q_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let attn_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("self_attention_layer/attn_output_buffer"),
-            size: (q_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let o_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("self_attention_layer/o_proj_buffer"),
-            size: (self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let mlp_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("self_attention_layer/mlp_output_buffer"),
-            size: (self.hidden_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        self.input_layernorm.compute_last_row(
-            device,
-            queue,
-            embedding_buffer,
-            &normed_embedding_buffer,
-            seq_len,
-        );
-        self.q_proj_mul_mat.compute(
-            device,
-            queue,
-            &normed_embedding_buffer,
-            &q_gate_proj_buffer,
-            1,
-        );
-        self.k_proj_mul_mat.compute_strided(
-            device,
-            queue,
-            &normed_embedding_buffer,
-            k_buffer,
-            0,
-            kv_cache_slot_offset,
-            1,
-        );
-        self.v_proj_mul_mat.compute_strided(
-            device,
-            queue,
-            &normed_embedding_buffer,
-            v_buffer,
-            0,
-            kv_cache_slot_offset,
-            1,
-        );
-        self.q_extract.compute(
-            device,
-            queue,
-            &q_gate_proj_buffer,
-            &q_proj_buffer,
-            0,
-            self.num_attention_heads * self.head_dim * 2,
-            self.head_dim * 2,
-            0,
-            self.num_attention_heads * self.head_dim,
-            self.head_dim,
-            self.num_attention_heads,
-            self.head_dim,
-            1,
-        );
-        self.q_norm
-            .compute(device, queue, &q_proj_buffer, self.num_attention_heads);
-        self.k_norm.compute_strided(
-            device,
-            queue,
-            k_buffer,
-            kv_cache_slot_offset,
-            self.num_key_value_heads,
-            self.head_dim,
-        );
-        self.rope.compute_strided(
-            device,
-            queue,
-            &q_proj_buffer,
-            k_buffer,
-            0,
-            kv_cache_slot_offset,
-            1,
-            position,
-        );
-        self.gqa_attention.compute_strided(
-            device,
-            queue,
-            &q_proj_buffer,
-            k_buffer,
-            v_buffer,
-            &attn_output_buffer,
-            0,
-            0,
-            0,
-            0,
-            1,
-            position,
-        );
-        self.sigmoid_mul.compute_strided(
-            device,
-            queue,
-            &attn_output_buffer,
-            &q_gate_proj_buffer,
-            0,
-            self.num_attention_heads * self.head_dim,
-            self.head_dim,
-            self.head_dim,
-            self.num_attention_heads * self.head_dim * 2,
-            self.head_dim * 2,
-            self.num_attention_heads,
-            self.head_dim,
-            1,
-        );
-        self.o_proj_mul_mat
-            .compute(device, queue, &attn_output_buffer, &o_proj_buffer, 1);
-        self.attn_residual_add.compute_strided(
-            device,
-            queue,
-            embedding_buffer,
-            &o_proj_buffer,
-            residual_offset,
-            0,
-            1,
-        );
-        self.post_attention_layernorm.compute_last_row(
-            device,
-            queue,
-            embedding_buffer,
-            &normed_embedding_buffer,
-            seq_len,
-        );
-        self.mlp.compute_decode(
-            device,
-            queue,
-            &normed_embedding_buffer,
-            &mlp_output_buffer,
-        );
-        self.mlp_residual_add.compute_strided(
-            device,
-            queue,
-            embedding_buffer,
-            &mlp_output_buffer,
-            residual_offset,
-            0,
-            1,
-        );
-    }
 }
 
 // TODO: consider unifying LinearAttentionLayer and SelfAttentionLayer into a single generic AttentionLayer with generic parameters for the various components
@@ -1221,18 +459,21 @@ pub enum AttentionLayer {
 }
 
 impl AttentionLayer {
-    pub fn compute(
+    /// Allocate the per-sequence state needed to run this layer. The
+    /// returned session borrows `self` and owns its own KV cache /
+    /// recurrent state.
+    pub fn new_session(
         &self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        embedding_buffer: &wgpu::Buffer,
-        seq_len: usize,
-    ) {
+        max_seq_len: usize,
+    ) -> AttentionLayerSession<'_> {
         match self {
-            AttentionLayer::Linear(layer) => {
-                layer.compute(device, queue, embedding_buffer, seq_len)
-            }
-            AttentionLayer::Full(layer) => layer.compute(device, queue, embedding_buffer, seq_len),
+            AttentionLayer::Linear(layer) => AttentionLayerSession::Linear(
+                LinearAttentionLayerSession::new(layer, device, max_seq_len),
+            ),
+            AttentionLayer::Full(layer) => AttentionLayerSession::Full(
+                SelfAttentionLayerSession::new(layer, device, max_seq_len),
+            ),
         }
     }
 }
@@ -1289,15 +530,613 @@ impl LayerStack {
         Self { layers }
     }
 
-    pub fn compute(
-        &self,
+    pub fn layers(&self) -> &[AttentionLayer] {
+        &self.layers
+    }
+}
+
+/// Per-sequence forward interface for a transformer layer.
+///
+/// Implementors own the per-sequence state (KV cache for full attention;
+/// conv / recurrent state for linear attention) and read/update it across
+/// calls. `embedding_buffer` is the residual stream, laid out as
+/// `[total_seq, hidden_size]` row-major; both the read of new-token
+/// embeddings and the write of this layer's contribution happen in place
+/// on rows `[prev_position..prev_position + num_new_tokens)`.
+pub trait LayerSession {
+    /// Run this layer over `num_new_tokens` new tokens starting at
+    /// absolute position `prev_position`. `self`'s state at entry must
+    /// reflect everything before `prev_position`; at exit it reflects
+    /// everything before `prev_position + num_new_tokens`.
+    ///
+    /// * Cold prefill of an `N`-token prompt: `forward(0, N)`.
+    /// * Single-token decode at position `P`: `forward(P, 1)`.
+    /// * Continued prefill (appending `M` tokens to a session of
+    ///   length `K`): `forward(K, M)`.
+    fn forward(
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         embedding_buffer: &wgpu::Buffer,
-        seq_len: usize,
+        prev_position: usize,
+        num_new_tokens: usize,
+    );
+}
+
+/// Per-sequence state for one linear-attention layer. Pairs a borrow of
+/// the immutable model layer with its conv and recurrent state buffers.
+pub struct LinearAttentionLayerSession<'m> {
+    layer: &'m LinearAttentionLayer,
+    conv_state_buffer: wgpu::Buffer,
+    recurrent_state_buffer: wgpu::Buffer,
+}
+
+impl<'m> LinearAttentionLayerSession<'m> {
+    /// `max_seq_len` is accepted only for API symmetry with `SelfAttentionLayerSession::new` and is unused here.
+    pub fn new(
+        layer: &'m LinearAttentionLayer,
+        device: &wgpu::Device,
+        _max_seq_len: usize,
+    ) -> Self {
+        let conv_state_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/session/conv_state_buffer"),
+            size: (layer.conv_state_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let recurrent_state_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/session/recurrent_state_buffer"),
+            size: (layer.recurrent_state_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        Self {
+            layer,
+            conv_state_buffer,
+            recurrent_state_buffer,
+        }
+    }
+}
+
+impl<'m> LayerSession for LinearAttentionLayerSession<'m> {
+    fn forward(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        embedding_buffer: &wgpu::Buffer,
+        prev_position: usize,
+        num_new_tokens: usize,
     ) {
-        for layer in &self.layers {
-            layer.compute(device, queue, embedding_buffer, seq_len);
+        debug_assert!(
+            num_new_tokens >= 1,
+            "forward requires num_new_tokens >= 1, got {}",
+            num_new_tokens,
+        );
+        let layer = self.layer;
+        let normed_embedding_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/normed_embedding_buffer"),
+            size: (num_new_tokens * layer.hidden_size * std::mem::size_of::<f32>())
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let in_proj_qkv_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/in_proj_qkv_buffer"),
+            size: (num_new_tokens * layer.qkv_dim * std::mem::size_of::<f32>())
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let in_proj_z_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/in_proj_z_buffer"),
+            size: (num_new_tokens * layer.v_dim * std::mem::size_of::<f32>())
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let in_proj_a_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/in_proj_a_buffer"),
+            size: (num_new_tokens * layer.linear_num_value_heads * std::mem::size_of::<f32>())
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let in_proj_b_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/in_proj_b_buffer"),
+            size: (num_new_tokens * layer.linear_num_value_heads * std::mem::size_of::<f32>())
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let conv_qkv_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/conv_qkv_buffer"),
+            size: (num_new_tokens * layer.qkv_dim * std::mem::size_of::<f32>())
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let attn_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/attn_output_buffer"),
+            size: (num_new_tokens * layer.v_dim * std::mem::size_of::<f32>())
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let out_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/out_proj_buffer"),
+            size: (num_new_tokens * layer.hidden_size * std::mem::size_of::<f32>())
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let mlp_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear_attention_layer/mlp_output_buffer"),
+            size: (num_new_tokens * layer.hidden_size * std::mem::size_of::<f32>())
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        // Norm reads rows [prev_position..prev_position + num_new_tokens)
+        // of the residual stream into a tightly-packed scratch buffer.
+        layer.input_layernorm.forward(
+            device,
+            queue,
+            embedding_buffer,
+            &normed_embedding_buffer,
+            prev_position,
+            num_new_tokens,
+        );
+        layer.in_proj_qkv_mul_mat.forward(
+            device,
+            queue,
+            &normed_embedding_buffer,
+            &in_proj_qkv_buffer,
+            0,
+            0,
+            num_new_tokens,
+        );
+        layer.in_proj_a_mul_mat.forward(
+            device,
+            queue,
+            &normed_embedding_buffer,
+            &in_proj_a_buffer,
+            0,
+            0,
+            num_new_tokens,
+        );
+        layer.in_proj_b_mul_mat.forward(
+            device,
+            queue,
+            &normed_embedding_buffer,
+            &in_proj_b_buffer,
+            0,
+            0,
+            num_new_tokens,
+        );
+        // Conv1d and delta-rule shaders carry state across calls: cold
+        // prefill sees zero state, decode / extend sees the state left by
+        // the previous forward.
+        layer.conv_silu.forward(
+            device,
+            queue,
+            &in_proj_qkv_buffer,
+            &conv_qkv_buffer,
+            &self.conv_state_buffer,
+            num_new_tokens,
+        );
+        layer.delta_rule.forward(
+            device,
+            queue,
+            &conv_qkv_buffer,
+            &in_proj_a_buffer,
+            &in_proj_b_buffer,
+            &self.recurrent_state_buffer,
+            &attn_output_buffer,
+            num_new_tokens,
+        );
+        layer.in_proj_z_mul_mat.forward(
+            device,
+            queue,
+            &normed_embedding_buffer,
+            &in_proj_z_buffer,
+            0,
+            0,
+            num_new_tokens,
+        );
+        layer.gated_norm.forward(
+            device,
+            queue,
+            &attn_output_buffer,
+            &in_proj_z_buffer,
+            num_new_tokens,
+        );
+        layer.out_proj_mat_mul.forward(
+            device,
+            queue,
+            &attn_output_buffer,
+            &out_proj_buffer,
+            0,
+            0,
+            num_new_tokens,
+        );
+        layer.attn_residual_add.forward(
+            device,
+            queue,
+            embedding_buffer,
+            &out_proj_buffer,
+            prev_position,
+            0,
+            num_new_tokens,
+        );
+        layer.post_attention_layernorm.forward(
+            device,
+            queue,
+            embedding_buffer,
+            &normed_embedding_buffer,
+            prev_position,
+            num_new_tokens,
+        );
+        layer.mlp.forward(
+            device,
+            queue,
+            &normed_embedding_buffer,
+            &mlp_output_buffer,
+            num_new_tokens,
+        );
+        layer.mlp_residual_add.forward(
+            device,
+            queue,
+            embedding_buffer,
+            &mlp_output_buffer,
+            prev_position,
+            0,
+            num_new_tokens,
+        );
+    }
+}
+
+pub struct SelfAttentionLayerSession<'m> {
+    layer: &'m SelfAttentionLayer,
+    k_cache_buffer: wgpu::Buffer,
+    v_cache_buffer: wgpu::Buffer,
+}
+
+impl<'m> SelfAttentionLayerSession<'m> {
+    /// `max_seq_len` is the maximum total length (prompt + generated
+    /// tokens) this session will ever be asked to handle.
+    pub fn new(layer: &'m SelfAttentionLayer, device: &wgpu::Device, max_seq_len: usize) -> Self {
+        debug_assert!(max_seq_len >= 1, "max_seq_len must be >= 1");
+        let kv_dim = layer.num_key_value_heads * layer.head_dim;
+        let cache_bytes =
+            (max_seq_len * kv_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
+        let k_cache_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("self_attention_layer/session/k_cache_buffer"),
+            size: cache_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let v_cache_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("self_attention_layer/session/v_cache_buffer"),
+            size: cache_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        Self {
+            layer,
+            k_cache_buffer,
+            v_cache_buffer,
+        }
+    }
+}
+
+impl<'m> LayerSession for SelfAttentionLayerSession<'m> {
+    fn forward(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        embedding_buffer: &wgpu::Buffer,
+        prev_position: usize,
+        num_new_tokens: usize,
+    ) {
+        debug_assert!(
+            num_new_tokens >= 1,
+            "forward requires num_new_tokens >= 1, got {}",
+            num_new_tokens,
+        );
+        let layer = self.layer;
+        let q_dim = layer.num_attention_heads * layer.head_dim;
+        let q_gate_dim = q_dim * 2;
+        let normed_embedding_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("self_attention_layer/normed_embedding_buffer"),
+            size: (num_new_tokens * layer.hidden_size * std::mem::size_of::<f32>())
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let q_gate_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("self_attention_layer/q_gate_proj_buffer"),
+            size: (num_new_tokens * q_gate_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        // Tight buffer that holds just the Q half of `q_gate_proj_buffer`,
+        // used as input by q_norm / RoPE / attention. The gate half stays
+        // in `q_gate_proj_buffer` for the later sigmoid * gate step.
+        let q_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("self_attention_layer/q_proj_buffer"),
+            size: (num_new_tokens * q_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let attn_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("self_attention_layer/attn_output_buffer"),
+            size: (num_new_tokens * q_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let o_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("self_attention_layer/o_proj_buffer"),
+            size: (num_new_tokens * layer.hidden_size * std::mem::size_of::<f32>())
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let mlp_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("self_attention_layer/mlp_output_buffer"),
+            size: (num_new_tokens * layer.hidden_size * std::mem::size_of::<f32>())
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        layer.input_layernorm.forward(
+            device,
+            queue,
+            embedding_buffer,
+            &normed_embedding_buffer,
+            prev_position,
+            num_new_tokens,
+        );
+        layer.q_proj_mul_mat.forward(
+            device,
+            queue,
+            &normed_embedding_buffer,
+            &q_gate_proj_buffer,
+            0,
+            0,
+            num_new_tokens,
+        );
+        // K/V projections write directly into the KV cache at slots
+        // [prev_position..prev_position + num_new_tokens), so subsequent
+        // forward calls see them as history.
+        layer.k_proj_mul_mat.forward(
+            device,
+            queue,
+            &normed_embedding_buffer,
+            &self.k_cache_buffer,
+            0,
+            prev_position,
+            num_new_tokens,
+        );
+        layer.v_proj_mul_mat.forward(
+            device,
+            queue,
+            &normed_embedding_buffer,
+            &self.v_cache_buffer,
+            0,
+            prev_position,
+            num_new_tokens,
+        );
+        layer.q_extract.forward(
+            device,
+            queue,
+            &q_gate_proj_buffer,
+            &q_proj_buffer,
+            num_new_tokens,
+        );
+        layer.q_norm.forward(
+            device,
+            queue,
+            &q_proj_buffer,
+            0,
+            num_new_tokens * layer.num_attention_heads,
+        );
+        // K-norm runs in place on the cache slots we just wrote. Each
+        // "row" for the norm is one head's vector of `head_dim` elements,
+        // so the per-head start row is `prev_position * num_kv_heads`.
+        layer.k_norm.forward(
+            device,
+            queue,
+            &self.k_cache_buffer,
+            prev_position * layer.num_key_value_heads,
+            num_new_tokens * layer.num_key_value_heads,
+        );
+        // RoPE: scratch Q row i has absolute position prev_position + i;
+        // K is rotated in place at its cache slots.
+        layer.rope.forward(
+            device,
+            queue,
+            &q_proj_buffer,
+            &self.k_cache_buffer,
+            0,
+            prev_position,
+            num_new_tokens,
+            prev_position,
+        );
+        // GQA: each new Q row attends causally to all K/V cache slots
+        // up to its absolute position (which includes prior-call history).
+        layer.gqa_attention.forward(
+            device,
+            queue,
+            &q_proj_buffer,
+            &self.k_cache_buffer,
+            &self.v_cache_buffer,
+            &attn_output_buffer,
+            num_new_tokens,
+            prev_position,
+        );
+        layer.sigmoid_mul.forward(
+            device,
+            queue,
+            &attn_output_buffer,
+            &q_gate_proj_buffer,
+            num_new_tokens,
+        );
+        layer.o_proj_mul_mat.forward(
+            device,
+            queue,
+            &attn_output_buffer,
+            &o_proj_buffer,
+            0,
+            0,
+            num_new_tokens,
+        );
+        layer.attn_residual_add.forward(
+            device,
+            queue,
+            embedding_buffer,
+            &o_proj_buffer,
+            prev_position,
+            0,
+            num_new_tokens,
+        );
+        layer.post_attention_layernorm.forward(
+            device,
+            queue,
+            embedding_buffer,
+            &normed_embedding_buffer,
+            prev_position,
+            num_new_tokens,
+        );
+        layer.mlp.forward(
+            device,
+            queue,
+            &normed_embedding_buffer,
+            &mlp_output_buffer,
+            num_new_tokens,
+        );
+        layer.mlp_residual_add.forward(
+            device,
+            queue,
+            embedding_buffer,
+            &mlp_output_buffer,
+            prev_position,
+            0,
+            num_new_tokens,
+        );
+    }
+}
+
+/// Per-layer, per-sequence state for one full transformer block. The enum
+/// carries the model↔state pairing in the type system: a `Linear` layer
+/// can only be paired with linear-attention state, and a `Full` layer can
+/// only be paired with KV-cache buffers. This makes type-mismatched cache
+/// access unrepresentable.
+pub enum AttentionLayerSession<'m> {
+    Linear(LinearAttentionLayerSession<'m>),
+    Full(SelfAttentionLayerSession<'m>),
+}
+
+impl<'m> LayerSession for AttentionLayerSession<'m> {
+    fn forward(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        embedding_buffer: &wgpu::Buffer,
+        prev_position: usize,
+        num_new_tokens: usize,
+    ) {
+        match self {
+            Self::Linear(session) => session.forward(
+                device,
+                queue,
+                embedding_buffer,
+                prev_position,
+                num_new_tokens,
+            ),
+            Self::Full(session) => session.forward(
+                device,
+                queue,
+                embedding_buffer,
+                prev_position,
+                num_new_tokens,
+            ),
+        }
+    }
+}
+
+/// Stack-wide per-sequence state: one `AttentionLayerSession` per layer in
+/// the underlying `LayerStack`, in the same order. Borrows the stack
+/// immutably for the lifetime of the session.
+pub struct LayerStackSession<'m> {
+    sessions: Vec<AttentionLayerSession<'m>>,
+}
+
+impl<'m> LayerStackSession<'m> {
+    pub fn new(stack: &'m LayerStack, device: &wgpu::Device, max_seq_len: usize) -> Self {
+        let sessions = stack
+            .layers()
+            .iter()
+            .map(|layer| layer.new_session(device, max_seq_len))
+            .collect();
+        Self { sessions }
+    }
+}
+
+impl<'m> LayerSession for LayerStackSession<'m> {
+    fn forward(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        embedding_buffer: &wgpu::Buffer,
+        prev_position: usize,
+        num_new_tokens: usize,
+    ) {
+        for session in &mut self.sessions {
+            session.forward(
+                device,
+                queue,
+                embedding_buffer,
+                prev_position,
+                num_new_tokens,
+            );
         }
     }
 }

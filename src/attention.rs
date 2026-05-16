@@ -156,14 +156,7 @@ impl CausalGqaNaiveAttentionWebgpu {
     }
 
     /// Run causal GQA attention.
-    ///
-    /// Buffers are assumed to be tightly packed in row-major layout starting
-    /// at offset 0:
-    /// - `q_buffer`: `[seq_len, num_q_heads, qk_head_dim]`
-    /// - `k_buffer`: `[seq_len, num_kv_heads, qk_head_dim]`
-    /// - `v_buffer`: `[seq_len, num_kv_heads, v_head_dim]`
-    /// - `output_buffer`: `[seq_len, num_q_heads, v_head_dim]`
-    pub fn compute(
+    pub fn forward(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -171,68 +164,27 @@ impl CausalGqaNaiveAttentionWebgpu {
         k_buffer: &wgpu::Buffer,
         v_buffer: &wgpu::Buffer,
         output_buffer: &wgpu::Buffer,
-        seq_len: usize,
-    ) {
-        self.compute_strided(
-            device,
-            queue,
-            q_buffer,
-            k_buffer,
-            v_buffer,
-            output_buffer,
-            0,
-            0,
-            0,
-            0,
-            seq_len,
-            0,
-        );
-    }
-
-    /// Run causal GQA attention over a `q_seq_len`-token slice of Q (and a
-    /// matching slice of the output) against K/V history rows
-    /// `0..q_seq_len + q_position_offset`.
-    ///
-    /// `*_offset` are in f32 elements. Q row `q_row` has absolute position
-    /// `q_row + q_position_offset` for causal masking. K/V are always read
-    /// from row 0 of their respective buffers up to the cap, so for a
-    /// decode step that has a KV cache populated at slots `0..N` and feeds
-    /// the new Q row in a 1-row scratch buffer, pass
-    /// `q_offset = 0`, `k_offset = v_offset = output_offset = 0`,
-    /// `q_seq_len = 1`, `q_position_offset = N - 1`.
-    pub fn compute_strided(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        q_buffer: &wgpu::Buffer,
-        k_buffer: &wgpu::Buffer,
-        v_buffer: &wgpu::Buffer,
-        output_buffer: &wgpu::Buffer,
-        q_offset: usize,
-        k_offset: usize,
-        v_offset: usize,
-        output_offset: usize,
-        q_seq_len: usize,
+        num_q_rows: usize,
         q_position_offset: usize,
     ) {
         let params = CausalGqaNaiveAttentionParams {
-            q_offset: q_offset as u32,
+            q_offset: 0,
             q_token_stride: (self.num_q_heads * self.qk_head_dim) as u32,
             q_head_stride: self.qk_head_dim as u32,
-            k_offset: k_offset as u32,
+            k_offset: 0,
             k_token_stride: (self.num_kv_heads * self.qk_head_dim) as u32,
             k_head_stride: self.qk_head_dim as u32,
-            v_offset: v_offset as u32,
+            v_offset: 0,
             v_token_stride: (self.num_kv_heads * self.v_head_dim) as u32,
             v_head_stride: self.v_head_dim as u32,
-            output_offset: output_offset as u32,
+            output_offset: 0,
             output_token_stride: (self.num_q_heads * self.v_head_dim) as u32,
             output_head_stride: self.v_head_dim as u32,
             num_q_heads: self.num_q_heads as u32,
             num_kv_heads: self.num_kv_heads as u32,
             q_dim: self.qk_head_dim as u32,
             v_dim: self.v_head_dim as u32,
-            seq_len: q_seq_len as u32,
+            seq_len: num_q_rows as u32,
             q_position_offset: q_position_offset as u32,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[params]));
@@ -273,7 +225,7 @@ impl CausalGqaNaiveAttentionWebgpu {
             compute_pass.set_pipeline(&self.pipeline);
             compute_pass.set_bind_group(0, &bind_group, &[]);
             // One workgroup per (q_token, q_head).
-            let workgroup_count = (q_seq_len * self.num_q_heads) as u32;
+            let workgroup_count = (num_q_rows * self.num_q_heads) as u32;
             compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
         }
         queue.submit(Some(encoder.finish()));
@@ -363,7 +315,7 @@ mod tests {
         let k_buf = upload_f32(&device, &k);
         let v_buf = upload_f32(&device, &v);
         let out_buf = create_f32_buffer(&device, seq_len * num_q_heads * v_dim);
-        gpu.compute(&device, &queue, &q_buf, &k_buf, &v_buf, &out_buf, seq_len);
+        gpu.forward(&device, &queue, &q_buf, &k_buf, &v_buf, &out_buf, seq_len, 0);
         let actual = download_f32(&device, &queue, &out_buf, seq_len * num_q_heads * v_dim);
 
         assert_approx_eq(&actual, &expected, 1e-3);
@@ -414,18 +366,14 @@ mod tests {
         let k_buf = upload_f32(&device, &k);
         let v_buf = upload_f32(&device, &v);
         let out_buf = create_f32_buffer(&device, num_q_heads * v_dim);
-        gpu.compute_strided(
+        gpu.forward(
             &device,
             &queue,
             &q_buf,
             &k_buf,
             &v_buf,
             &out_buf,
-            /* q_offset           */ 0,
-            /* k_offset           */ 0,
-            /* v_offset           */ 0,
-            /* output_offset      */ 0,
-            /* q_seq_len          */ 1,
+            /* num_q_rows         */ 1,
             /* q_position_offset  */ seq_len - 1,
         );
         let actual = download_f32(&device, &queue, &out_buf, num_q_heads * v_dim);

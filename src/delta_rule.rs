@@ -199,7 +199,9 @@ impl DeltaRuleWebgpu {
         }
     }
 
-    pub fn compute(
+    /// Run the gated-delta-rule SSM over `num_rows` token rows of the
+    /// QKV / projection buffers (all read tight from row 0).
+    pub fn forward(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -461,7 +463,7 @@ mod tests {
         let pb_buf = upload_f32(&device, &proj_b);
         let state_buf = upload_f32(&device, &vec![0.0f32; state_size]);
         let out_buf = create_f32_buffer(&device, seq_len * num_key_heads * value_head_dim);
-        gpu.compute(
+        gpu.forward(
             &device, &queue, &qkv_buf, &pa_buf, &pb_buf, &state_buf, &out_buf, seq_len,
         );
         let actual = download_f32(

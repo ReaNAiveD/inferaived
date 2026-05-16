@@ -14,16 +14,18 @@ pub struct SigmoidMulParams {
     seq_len: u32,
 }
 
+/// In-place fused output gate: `hidden[t, h, d] *= sigmoid(q_gate[t, h, head_dim + d])`.
 pub struct SigmoidMulInplaceWebgpu {
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
     uniform_buffer: wgpu::Buffer,
 
-    vec_dim: usize,
+    num_heads: usize,
+    head_dim: usize,
 }
 
 impl SigmoidMulInplaceWebgpu {
-    pub fn new(device: &wgpu::Device, vec_dim: usize) -> Self {
+    pub fn new(device: &wgpu::Device, num_heads: usize, head_dim: usize) -> Self {
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sigmoid_mul/shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("wgsl-shaders/sigmoid_mul.wgsl").into()),
@@ -89,68 +91,33 @@ impl SigmoidMulInplaceWebgpu {
             bind_group_layout,
             pipeline,
             uniform_buffer,
-            vec_dim,
+            num_heads,
+            head_dim,
         }
     }
 
-    /// Both buffers are tightly packed `[seq_len, vec_dim]`. Equivalent to
-    /// `compute_strided` with `num_heads = 1, head_dim = vec_dim`.
-    pub fn compute(
+    pub fn forward(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        src_buffer: &wgpu::Buffer,
-        gate_buffer: &wgpu::Buffer,
-        seq_len: usize,
+        hidden_buffer: &wgpu::Buffer,
+        q_gate_combined_buffer: &wgpu::Buffer,
+        num_rows: usize,
     ) {
-        self.compute_strided(
-            device,
-            queue,
-            src_buffer,
-            gate_buffer,
-            0,
-            self.vec_dim,
-            self.vec_dim,
-            0,
-            self.vec_dim,
-            self.vec_dim,
-            1,
-            self.vec_dim,
-            seq_len,
-        );
-    }
-
-    /// Apply sigmoid(gate) * hidden in place, with explicit per-axis offsets
-    /// and strides for both buffers. Use this when the gate is a slice of a
-    /// wider interleaved tensor (e.g. the gate half of `q_proj` output, where
-    /// gate_head_stride = head_dim * 2 because Q and gate are interleaved per
-    /// head).
-    pub fn compute_strided(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        src_buffer: &wgpu::Buffer,
-        gate_buffer: &wgpu::Buffer,
-        hidden_offset: usize,
-        hidden_token_stride: usize,
-        hidden_head_stride: usize,
-        gate_offset: usize,
-        gate_token_stride: usize,
-        gate_head_stride: usize,
-        num_heads: usize,
-        head_dim: usize,
-        seq_len: usize,
-    ) {
+        let head_dim = self.head_dim as u32;
         let uniform = SigmoidMulParams {
-            hidden_offset: hidden_offset as u32,
-            hidden_token_stride: hidden_token_stride as u32,
-            hidden_head_stride: hidden_head_stride as u32,
-            gate_offset: gate_offset as u32,
-            gate_token_stride: gate_token_stride as u32,
-            gate_head_stride: gate_head_stride as u32,
-            num_heads: num_heads as u32,
-            head_dim: head_dim as u32,
-            seq_len: seq_len as u32,
+            hidden_offset: 0,
+            hidden_token_stride: (self.num_heads * self.head_dim) as u32,
+            hidden_head_stride: head_dim,
+            // Gate half is at offset `head_dim` within each head; the
+            // head stride is `2 * head_dim` because Q and gate are
+            // interleaved per head.
+            gate_offset: head_dim,
+            gate_token_stride: (self.num_heads * self.head_dim * 2) as u32,
+            gate_head_stride: (self.head_dim * 2) as u32,
+            num_heads: self.num_heads as u32,
+            head_dim,
+            seq_len: num_rows as u32,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -159,11 +126,11 @@ impl SigmoidMulInplaceWebgpu {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: src_buffer.as_entire_binding(),
+                    resource: hidden_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: gate_buffer.as_entire_binding(),
+                    resource: q_gate_combined_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -181,7 +148,7 @@ impl SigmoidMulInplaceWebgpu {
             });
             compute_pass.set_pipeline(&self.pipeline);
             compute_pass.set_bind_group(0, &bind_group, &[]);
-            compute_pass.dispatch_workgroups(seq_len as u32, 1, 1);
+            compute_pass.dispatch_workgroups(num_rows as u32, 1, 1);
         }
         queue.submit(Some(encoder.finish()));
     }
@@ -196,109 +163,53 @@ mod tests {
         1.0 / (1.0 + (-x).exp())
     }
 
-    /// CPU: hidden[t,h,i] *= sigmoid(gate[t,h,i])
-    fn cpu_sigmoid_mul(hidden: &mut [f32], gate: &[f32], hidden_size: usize, seq_len: usize) {
-        for idx in 0..seq_len * hidden_size {
-            hidden[idx] *= sigmoid(gate[idx]);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_sigmoid_mul() {
-        let (device, queue) = gpu_or_skip!();
-        let seq_len = 2;
-        let hidden_size = 32;
-        let hidden: Vec<f32> = (0..seq_len * hidden_size)
-            .map(|i| (i as f32) * 0.1 - 2.0)
-            .collect();
-        let gate: Vec<f32> = (0..seq_len * hidden_size)
-            .map(|i| (i as f32) * 0.04 - 0.5)
-            .collect();
-
-        let mut expected = hidden.clone();
-        cpu_sigmoid_mul(&mut expected, &gate, hidden_size, seq_len);
-
-        let gpu = SigmoidMulInplaceWebgpu::new(&device, hidden_size);
-        let h_buf = upload_f32(&device, &hidden);
-        let g_buf = upload_f32(&device, &gate);
-        gpu.compute(&device, &queue, &h_buf, &g_buf, seq_len);
-        let actual = download_f32(&device, &queue, &h_buf, seq_len * hidden_size);
-
-        assert_approx_eq(&actual, &expected, 1e-5);
-    }
-
-    /// CPU strided variant: hidden and gate can have different layouts
-    fn cpu_sigmoid_mul_strided(
+    /// CPU reference for the Q-gate-interleaved fused output gate:
+    ///   `hidden[t, h, d] *= sigmoid(q_gate[t, h, head_dim + d])`
+    fn cpu_q_gate_output_gate(
         hidden: &mut [f32],
-        gate: &[f32],
-        hidden_offset: usize,
-        hidden_token_stride: usize,
-        hidden_head_stride: usize,
-        gate_offset: usize,
-        gate_token_stride: usize,
-        gate_head_stride: usize,
+        q_gate: &[f32],
         num_heads: usize,
         head_dim: usize,
         seq_len: usize,
     ) {
+        let hidden_token_stride = num_heads * head_dim;
+        let q_gate_token_stride = num_heads * head_dim * 2;
+        let q_gate_head_stride = head_dim * 2;
         for t in 0..seq_len {
             for h in 0..num_heads {
-                for i in 0..head_dim {
-                    let h_idx =
-                        hidden_offset + t * hidden_token_stride + h * hidden_head_stride + i;
-                    let g_idx = gate_offset + t * gate_token_stride + h * gate_head_stride + i;
-                    hidden[h_idx] *= sigmoid(gate[g_idx]);
+                for d in 0..head_dim {
+                    let h_idx = t * hidden_token_stride + h * head_dim + d;
+                    // Gate half lives at offset `head_dim` within each head.
+                    let g_idx = t * q_gate_token_stride + h * q_gate_head_stride + head_dim + d;
+                    hidden[h_idx] *= sigmoid(q_gate[g_idx]);
                 }
             }
         }
     }
 
     #[tokio::test]
-    async fn test_sigmoid_mul_strided() {
+    async fn test_sigmoid_mul_forward() {
         let (device, queue) = gpu_or_skip!();
-        let seq_len = 2;
-        let num_heads = 2;
+        let seq_len = 3;
+        let num_heads = 4;
         let head_dim = 8;
-        let hidden_head_stride = head_dim;
-        let hidden_token_stride = num_heads * head_dim;
-        let total = seq_len * hidden_token_stride;
-        let hidden: Vec<f32> = (0..total).map(|i| (i as f32) * 0.1 - 1.0).collect();
-        let gate: Vec<f32> = (0..total).map(|i| (i as f32) * 0.05).collect();
+        let hidden_size = num_heads * head_dim;
+        let q_gate_size = num_heads * head_dim * 2;
+        let hidden: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32) * 0.1 - 1.0)
+            .collect();
+        let q_gate: Vec<f32> = (0..seq_len * q_gate_size)
+            .map(|i| (i as f32) * 0.05 - 0.7)
+            .collect();
 
         let mut expected = hidden.clone();
-        cpu_sigmoid_mul_strided(
-            &mut expected,
-            &gate,
-            0,
-            hidden_token_stride,
-            hidden_head_stride,
-            0,
-            hidden_token_stride,
-            hidden_head_stride,
-            num_heads,
-            head_dim,
-            seq_len,
-        );
+        cpu_q_gate_output_gate(&mut expected, &q_gate, num_heads, head_dim, seq_len);
 
-        let gpu = SigmoidMulInplaceWebgpu::new(&device, num_heads * head_dim);
+        let gpu = SigmoidMulInplaceWebgpu::new(&device, num_heads, head_dim);
         let h_buf = upload_f32(&device, &hidden);
-        let g_buf = upload_f32(&device, &gate);
-        gpu.compute_strided(
-            &device,
-            &queue,
-            &h_buf,
-            &g_buf,
-            0,
-            hidden_token_stride,
-            hidden_head_stride,
-            0,
-            hidden_token_stride,
-            hidden_head_stride,
-            num_heads,
-            head_dim,
-            seq_len,
-        );
-        let actual = download_f32(&device, &queue, &h_buf, total);
+        let g_buf = upload_f32(&device, &q_gate);
+        gpu.forward(&device, &queue, &h_buf, &g_buf, seq_len);
+        let actual = download_f32(&device, &queue, &h_buf, seq_len * hidden_size);
 
         assert_approx_eq(&actual, &expected, 1e-5);
     }

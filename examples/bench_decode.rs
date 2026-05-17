@@ -164,11 +164,12 @@ async fn main() {
     );
 
     // -------- wgpu init (once, shared across runs) --------
-    let instance = Instance::new(&InstanceDescriptor {
+    let instance = Instance::new(InstanceDescriptor {
         backends: Backends::PRIMARY,
         flags: InstanceFlags::default(),
         memory_budget_thresholds: MemoryBudgetThresholds::default(),
         backend_options: BackendOptions::default(),
+        display: None,
     });
     let adapter = instance
         .request_adapter(&RequestAdapterOptions {

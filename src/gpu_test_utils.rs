@@ -6,7 +6,7 @@
 /// Returns `None` when no compatible adapter is available (e.g. headless CI
 /// without a GPU), so that tests can be skipped gracefully.
 pub async fn create_device_queue() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = match instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,

@@ -75,11 +75,12 @@ async fn main() {
     info!("Prompt: {:?}", prompt);
     info!("Encoded IDs: {:?}", encoded.get_ids());
 
-    let instance = Instance::new(&InstanceDescriptor {
+    let instance = Instance::new(InstanceDescriptor {
         backends: Backends::PRIMARY,
         flags: InstanceFlags::default(),
         memory_budget_thresholds: MemoryBudgetThresholds::default(),
         backend_options: BackendOptions::default(),
+        display: None,
     });
     debug!("WGPU Instance created successfully: {:?}", instance);
     debug!(

@@ -19,9 +19,10 @@
 // Dispatch: ceil(M / ROWS_PER_WG) workgroups, 1-D.
 //   workgroup_count = (params.m + ROWS_PER_WG - 1) / ROWS_PER_WG
 //
-// Requires: wgpu Features::SUBGROUP (enable subgroups; is mandatory below).
-
-enable subgroups;
+// Requires: wgpu Features::SUBGROUP requested on the device.
+// Note: when using wgpu natively the `enable subgroups;` directive must be
+// omitted — subgroup builtins are exposed automatically once the feature is
+// enabled on the device (see https://github.com/gfx-rs/wgpu/issues/5555).
 
 // ── Bindings ──────────────────────────────────────────────────────────────────
 @group(0) @binding(0) var<storage, read> weight: array<u32>;        // M×K bf16, 2 per u32

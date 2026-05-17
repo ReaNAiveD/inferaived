@@ -17,6 +17,9 @@ pub struct MulMatWebgpu {
     // Selected by `compute` on N: reg_tile for N > 1, vec for N == 1.
     pipeline_reg_tile: wgpu::ComputePipeline,
     pipeline_vec: wgpu::ComputePipeline,
+    // Decode-optimised GEMV pipeline (N == 1 only).  Present when the device
+    // supports wgpu::Features::SUBGROUP.  Supersedes pipeline_vec when set.
+    pipeline_decode: Option<wgpu::ComputePipeline>,
     uniform_buffer: wgpu::Buffer,
     mat_src0_buffer: wgpu::Buffer,
     m_dim: usize,
@@ -34,6 +37,10 @@ impl MulMatWebgpu {
     pub const WORKGROUP_SIZE_M: usize = 8;
     pub const WORKGROUP_SIZE_N: usize = 4;
     pub const WORKGROUP_SIZE_VEC: usize = 256;
+    // Decode-tuned GEMV: number of output rows per workgroup (matches the
+    // ROWS_PER_WG const in mul_mat_vec_decode.wgsl; update both if changed).
+    pub const ROWS_PER_WG_DECODE: usize = 4;
+    pub const WORKGROUP_SIZE_DECODE: usize = 128;
 
     pub fn new<'data>(
         device: &wgpu::Device,
@@ -136,6 +143,35 @@ impl MulMatWebgpu {
             },
             cache: None,
         });
+        // Decode-tuned GEMV pipeline: only created when the device exposes
+        // Features::SUBGROUP (required for `enable subgroups;` in WGSL).
+        let pipeline_decode = if device
+            .features()
+            .contains(wgpu::Features::SUBGROUP)
+        {
+            let decode_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("mul_mat/decode_shader"),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
+                    "wgsl-shaders/mul_mat_vec_decode.wgsl"
+                ))),
+            });
+            Some(device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("mul_mat/pipeline_decode"),
+                layout: Some(&pipeline_layout),
+                module: &decode_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &[(
+                        "workgroup_size",
+                        Self::WORKGROUP_SIZE_DECODE as f64,
+                    )],
+                    zero_initialize_workgroup_memory: true,
+                },
+                cache: None,
+            }))
+        } else {
+            None
+        };
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mul_mat/uniform_buffer"),
             size: std::mem::size_of::<MulMatParams>() as u64,
@@ -168,6 +204,7 @@ impl MulMatWebgpu {
             bind_group_layout,
             pipeline_reg_tile,
             pipeline_vec,
+            pipeline_decode,
             uniform_buffer,
             mat_src0_buffer,
             m_dim,
@@ -201,8 +238,15 @@ impl MulMatWebgpu {
             input_row_stride: input.stride[0],
         };
         let (pipeline, workgroup_count, variant) = if num_rows == 1 {
-            // matvec: one workgroup per output row m.
-            (&self.pipeline_vec, self.m_dim as u32, "vec")
+            // matvec: use the decode-tuned pipeline when available (subgroup
+            // support present), otherwise fall back to the plain vec pipeline.
+            if let Some(ref p) = self.pipeline_decode {
+                let wg_count = (self.m_dim + Self::ROWS_PER_WG_DECODE - 1)
+                    / Self::ROWS_PER_WG_DECODE;
+                (p, wg_count as u32, "decode")
+            } else {
+                (&self.pipeline_vec, self.m_dim as u32, "vec")
+            }
         } else {
             let wg_num_m = (self.m_dim + Self::WORKGROUP_SIZE_M * Self::TILE_M - 1)
                 / (Self::WORKGROUP_SIZE_M * Self::TILE_M);
@@ -473,5 +517,216 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Decode-tuned pipeline tests ────────────────────────────────────────
+    // These tests require a device with Features::SUBGROUP enabled; they are
+    // skipped if the adapter does not expose that feature.
+
+    /// Create a (device, queue) pair with SUBGROUP support requested, or return
+    /// None if the adapter does not expose the feature.
+    async fn create_subgroup_device_queue() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .ok()?;
+        if !adapter.features().contains(wgpu::Features::SUBGROUP) {
+            eprintln!("Adapter does not support SUBGROUP — skipping decode test");
+            return None;
+        }
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("test_device_subgroup"),
+                required_features: wgpu::Features::SUBGROUP,
+                required_limits: wgpu::Limits::default(),
+                ..Default::default()
+            })
+            .await
+            .ok()?;
+        Some((device, queue))
+    }
+
+    macro_rules! subgroup_or_skip {
+        () => {
+            match create_subgroup_device_queue().await {
+                Some(dq) => dq,
+                None => return,
+            }
+        };
+    }
+
+    /// Verify the decode pipeline matches the CPU reference for a typical
+    /// decode workload: M = 320, K = 512, N = 1.
+    #[tokio::test]
+    async fn test_mul_mat_vec_decode_n1() {
+        let (device, queue) = subgroup_or_skip!();
+        let m = 320;
+        let n = 1;
+        let k = 512;
+
+        let weight_f32: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.013).sin()).collect();
+        let weight_packed = pack_f32_to_bf16_u32(&weight_f32);
+        let weight_bf16_bytes: Vec<u8> = weight_f32
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+        let input: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.021).cos()).collect();
+
+        let expected = cpu_mul_mat(&weight_packed, &input, m, n, k);
+
+        let tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::BF16,
+            vec![m, k],
+            &weight_bf16_bytes,
+        )
+        .unwrap();
+        let gpu = MulMatWebgpu::new(&device, &queue, tv);
+
+        // The decode pipeline should be present when SUBGROUP is enabled.
+        assert!(
+            gpu.pipeline_decode.is_some(),
+            "pipeline_decode should be Some when SUBGROUP feature is available"
+        );
+
+        let in_buf = upload_f32(&device, &input);
+        let out_buf = create_f32_buffer(&device, n * m);
+        let sz = std::mem::size_of::<f32>() as u32;
+        gpu.forward(
+            &device,
+            &queue,
+            BufferView::new_2d_tight(&in_buf, n as u32, k as u32, sz),
+            BufferView::new_2d_tight(&out_buf, n as u32, m as u32, sz),
+        );
+        let actual = download_f32(&device, &queue, &out_buf, n * m);
+
+        assert_approx_eq(&actual, &expected, 1e-2);
+    }
+
+    /// Decode pipeline with M not a multiple of ROWS_PER_WG (boundary handling).
+    #[tokio::test]
+    async fn test_mul_mat_vec_decode_non_multiple_m() {
+        let (device, queue) = subgroup_or_skip!();
+        // m = 13: not a multiple of ROWS_PER_WG (4), exercises the partial
+        // last workgroup guard (global_row < params.m).
+        let m = 13;
+        let n = 1;
+        let k = 64;
+
+        let weight_f32: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.031).sin()).collect();
+        let weight_packed = pack_f32_to_bf16_u32(&weight_f32);
+        let weight_bf16_bytes: Vec<u8> = weight_f32
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+        let input: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.047).cos()).collect();
+
+        let expected = cpu_mul_mat(&weight_packed, &input, m, n, k);
+
+        let tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::BF16,
+            vec![m, k],
+            &weight_bf16_bytes,
+        )
+        .unwrap();
+        let gpu = MulMatWebgpu::new(&device, &queue, tv);
+        let in_buf = upload_f32(&device, &input);
+        let out_buf = create_f32_buffer(&device, n * m);
+        let sz = std::mem::size_of::<f32>() as u32;
+        gpu.forward(
+            &device,
+            &queue,
+            BufferView::new_2d_tight(&in_buf, n as u32, k as u32, sz),
+            BufferView::new_2d_tight(&out_buf, n as u32, m as u32, sz),
+        );
+        let actual = download_f32(&device, &queue, &out_buf, n * m);
+
+        assert_approx_eq(&actual, &expected, 1e-2);
+    }
+
+    /// Decode pipeline with odd K (the last u32 word's hi bf16 lane should be
+    /// zero-masked by the `k1 < params.k` guard on the input side and the
+    /// zero-pad on the weight side).
+    #[tokio::test]
+    async fn test_mul_mat_vec_decode_odd_k() {
+        let (device, queue) = subgroup_or_skip!();
+        let m = 8;
+        let n = 1;
+        let k = 13; // odd — exercises the k%2 edge case
+
+        let weight_f32: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.041).sin()).collect();
+        let weight_packed = pack_f32_to_bf16_u32(&weight_f32);
+        let weight_bf16_bytes: Vec<u8> = weight_f32
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+        let input: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.037).cos()).collect();
+
+        let expected = cpu_mul_mat(&weight_packed, &input, m, n, k);
+
+        let tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::BF16,
+            vec![m, k],
+            &weight_bf16_bytes,
+        )
+        .unwrap();
+        let gpu = MulMatWebgpu::new(&device, &queue, tv);
+        let in_buf = upload_f32(&device, &input);
+        let out_buf = create_f32_buffer(&device, n * m);
+        let sz = std::mem::size_of::<f32>() as u32;
+        gpu.forward(
+            &device,
+            &queue,
+            BufferView::new_2d_tight(&in_buf, n as u32, k as u32, sz),
+            BufferView::new_2d_tight(&out_buf, n as u32, m as u32, sz),
+        );
+        let actual = download_f32(&device, &queue, &out_buf, n * m);
+
+        assert_approx_eq(&actual, &expected, 1e-2);
+    }
+
+    /// Decode pipeline with large K (exercises multiple tile iterations and
+    /// the cross-subgroup reduction).  Uses model-realistic dimensions:
+    /// M = 1024, K = 3584 (MLP down-projection in the 0.8B Qwen3.5 variant).
+    #[tokio::test]
+    async fn test_mul_mat_vec_decode_large() {
+        let (device, queue) = subgroup_or_skip!();
+        let m = 128; // keep small so the test runs quickly; K exercises the tiles
+        let n = 1;
+        let k = 3584;
+
+        let weight_f32: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.003).sin()).collect();
+        let weight_packed = pack_f32_to_bf16_u32(&weight_f32);
+        let weight_bf16_bytes: Vec<u8> = weight_f32
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+        let input: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.007).cos()).collect();
+
+        let expected = cpu_mul_mat(&weight_packed, &input, m, n, k);
+
+        let tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::BF16,
+            vec![m, k],
+            &weight_bf16_bytes,
+        )
+        .unwrap();
+        let gpu = MulMatWebgpu::new(&device, &queue, tv);
+        let in_buf = upload_f32(&device, &input);
+        let out_buf = create_f32_buffer(&device, n * m);
+        let sz = std::mem::size_of::<f32>() as u32;
+        gpu.forward(
+            &device,
+            &queue,
+            BufferView::new_2d_tight(&in_buf, n as u32, k as u32, sz),
+            BufferView::new_2d_tight(&out_buf, n as u32, m as u32, sz),
+        );
+        let actual = download_f32(&device, &queue, &out_buf, n * m);
+
+        assert_approx_eq(&actual, &expected, 1e-2);
     }
 }

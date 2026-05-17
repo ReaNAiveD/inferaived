@@ -526,7 +526,7 @@ mod tests {
     /// Create a (device, queue) pair with SUBGROUP support requested, or return
     /// None if the adapter does not expose the feature.
     async fn create_subgroup_device_queue() -> Option<(wgpu::Device, wgpu::Queue)> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,

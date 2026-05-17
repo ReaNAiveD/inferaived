@@ -107,7 +107,7 @@ impl MulMatWebgpu {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
         let pipeline_reg_tile = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {

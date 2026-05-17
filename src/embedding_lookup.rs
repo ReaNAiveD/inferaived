@@ -46,7 +46,7 @@ impl EmbeddingLookupWebgpu {
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("embedding_lookup/shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "wgsl-shaders/get_rows.wgsl"
+                "kernels/wgsl-shaders/get_rows.wgsl"
             ))),
         });
         let src_bind_layout_entry = BindGroupLayoutEntry {

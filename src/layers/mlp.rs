@@ -1,7 +1,9 @@
 use safetensors::SafeTensors;
 
 use crate::{
-    buffer_view::BufferView, log_tensor, mul_mat::MulMatWebgpu, silu_mul::SiluMulInplaceWebgpu,
+    buffer_view::BufferView,
+    kernels::{mul_mat::MulMatWebgpu, silu_mul::SiluMulInplaceWebgpu},
+    log_tensor,
 };
 
 pub struct MultiLayerPerceptron {

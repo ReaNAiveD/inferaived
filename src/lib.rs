@@ -1,21 +1,10 @@
-pub mod attention;
-pub mod binary;
 pub mod buffer_view;
-pub mod conv_silu;
-pub mod delta_rule;
 pub mod embedding_lookup;
-pub mod gated_rms_norm;
+pub mod kernels;
 pub mod language_model;
-pub mod layer_loop;
+pub mod layers;
 pub mod lm_head;
-pub mod mamba_scan;
-pub mod mlp;
-pub mod mul_mat;
-pub mod norm;
-pub mod rope;
 pub mod sampler;
-pub mod sigmoid_mul;
-pub mod silu_mul;
 
 #[cfg(test)]
 pub(crate) mod gpu_test_utils;

@@ -3,13 +3,15 @@ use safetensors::SafeTensors;
 use crate::{
     buffer_view::BufferView,
     embedding_lookup::EmbeddingLookupCpu,
-    layer_loop::{
-        LayerConfig, LayerSession, LayerStack, LayerStackConfig, LayerStackSession,
-        LinearAttentionConfig, SelfAttentionConfig,
+    kernels::norm::RmsNormInplaceWebgpu,
+    layers::{
+        layer_session::LayerSession,
+        layer_stack::{LayerConfig, LayerStack, LayerStackConfig, LayerStackSession},
+        linear_attention::LinearAttentionConfig,
+        self_attention::SelfAttentionConfig,
     },
     lm_head::LmHeadCpu,
     log_tensor,
-    norm::RmsNormInplaceWebgpu,
     sampler::ArgmaxSamplerCpu,
 };
 

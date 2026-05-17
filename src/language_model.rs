@@ -13,6 +13,7 @@ use crate::{
     lm_head::LmHeadCpu,
     log_tensor,
     sampler::ArgmaxSamplerCpu,
+    scratch_pool::{ScratchPool, ScratchPoolConfig},
 };
 
 pub enum LayerType {
@@ -46,6 +47,10 @@ pub struct Qwen35Model<'data> {
     pub final_norm: RmsNormInplaceWebgpu,
     pub lm_head: LmHeadCpu<'data>,
     pub sampler: ArgmaxSamplerCpu,
+    /// `ScratchPoolConfig` template with `max_seq_len = 0`. The actual
+    /// pool is materialised in `Qwen35Session::new`, which overlays its
+    /// `max_seq_len` argument before calling `ScratchPool::new`.
+    scratch_pool_template: ScratchPoolConfig,
 }
 
 impl<'data> Qwen35Model<'data> {
@@ -102,6 +107,18 @@ impl<'data> Qwen35Model<'data> {
         let final_norm = RmsNormInplaceWebgpu::new(device, queue, final_norm_weight);
         let lm_head = LmHeadCpu::new(embed_tokens.clone());
         let sampler = ArgmaxSamplerCpu;
+        let scratch_pool_template = ScratchPoolConfig {
+            hidden_size: config.hidden_size as u32,
+            max_seq_len: 0,
+            q_gate_dim: (config.num_attention_heads * 2 * config.head_dim) as u32,
+            attn_output_self_dim: (config.num_attention_heads * config.head_dim) as u32,
+            qkv_dim: (config.linear_num_key_heads * config.linear_key_head_dim * 2
+                + config.linear_num_value_heads * config.linear_value_head_dim)
+                as u32,
+            linear_num_value_heads: config.linear_num_value_heads as u32,
+            v_dim: (config.linear_num_value_heads * config.linear_value_head_dim) as u32,
+            intermediate_size: config.intermediate_size as u32,
+        };
         Self {
             hidden_size: config.hidden_size,
             embedding_lookup,
@@ -109,6 +126,7 @@ impl<'data> Qwen35Model<'data> {
             final_norm,
             lm_head,
             sampler,
+            scratch_pool_template,
         }
     }
 }
@@ -116,6 +134,7 @@ impl<'data> Qwen35Model<'data> {
 pub struct Qwen35Session<'m, 'data> {
     model: &'m Qwen35Model<'data>,
     layer_session: LayerStackSession<'m>,
+    scratch: ScratchPool,
     hidden_states_buffer: wgpu::Buffer,
     last_hidden_readback_buffer: wgpu::Buffer,
     position: usize,
@@ -126,6 +145,13 @@ impl<'m, 'data> Qwen35Session<'m, 'data> {
     pub fn new(model: &'m Qwen35Model<'data>, device: &wgpu::Device, max_seq_len: usize) -> Self {
         debug_assert!(max_seq_len >= 1, "max_seq_len must be >= 1");
         let layer_session = LayerStackSession::new(&model.layer_stack, device, max_seq_len);
+        let scratch = ScratchPool::new(
+            device,
+            &ScratchPoolConfig {
+                max_seq_len: max_seq_len as u32,
+                ..model.scratch_pool_template
+            },
+        );
         let hidden_states_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("qwen35_session/hidden_states_buffer"),
             size: (max_seq_len * model.hidden_size * std::mem::size_of::<f32>())
@@ -144,6 +170,7 @@ impl<'m, 'data> Qwen35Session<'m, 'data> {
         Self {
             model,
             layer_session,
+            scratch,
             hidden_states_buffer,
             last_hidden_readback_buffer,
             position: 0,
@@ -200,7 +227,7 @@ impl<'m, 'data> Qwen35Session<'m, 'data> {
         .narrow(0, prev_position as u32, num_new as u32);
 
         self.layer_session
-            .forward(device, queue, new_token_rows, prev_position);
+            .forward(device, queue, &self.scratch, new_token_rows, prev_position);
         self.model.final_norm.forward(device, queue, new_token_rows);
 
         let last_row = prev_position + num_new - 1;

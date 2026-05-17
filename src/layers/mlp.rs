@@ -4,6 +4,7 @@ use crate::{
     buffer_view::BufferView,
     kernels::{mul_mat::MulMatWebgpu, silu_mul::SiluMulInplaceWebgpu},
     log_tensor,
+    scratch_pool::{ScratchPool, ScratchSlot},
 };
 
 pub struct MultiLayerPerceptron {
@@ -95,6 +96,7 @@ impl MultiLayerPerceptron {
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        scratch: &ScratchPool,
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) {
@@ -104,34 +106,13 @@ impl MultiLayerPerceptron {
             input.shape[0], output.shape[0],
         );
         let num_rows = input.shape[0];
-        let elem_size = std::mem::size_of::<f32>() as u32;
-        let intermediate_size = self.intermediate_size as u32;
-        let intermediate_total_bytes =
-            (intermediate_size as u64) * (elem_size as u64) * (num_rows as u64);
-        let mlp_gate_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mlp/gate_proj_buffer"),
-            size: intermediate_total_bytes,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let gate_view = BufferView::new_2d_tight(
-            &mlp_gate_proj_buffer,
-            num_rows,
-            intermediate_size,
-            elem_size,
+        debug_assert_eq!(
+            scratch.feature_dim(ScratchSlot::MlpGate),
+            self.intermediate_size as u32,
+            "mlp: ScratchPool MlpGate dim does not match layer intermediate_size",
         );
-        let mlp_up_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mlp/up_proj_buffer"),
-            size: intermediate_total_bytes,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let up_view =
-            BufferView::new_2d_tight(&mlp_up_proj_buffer, num_rows, intermediate_size, elem_size);
+        let gate_view = scratch.view_2d(ScratchSlot::MlpGate, num_rows);
+        let up_view = scratch.view_2d(ScratchSlot::MlpUp, num_rows);
         self.mlp_gate_proj_mul_mat
             .forward(device, queue, input, gate_view);
         self.mlp_up_proj_mul_mat

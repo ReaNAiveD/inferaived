@@ -1,4 +1,5 @@
 use crate::buffer_view::BufferView;
+use crate::scratch_pool::ScratchPool;
 
 /// Per-sequence forward interface for a transformer layer.
 pub trait LayerSession {
@@ -7,6 +8,10 @@ pub trait LayerSession {
     /// must reflect everything before `prev_position`; at exit it
     /// reflects everything before
     /// `prev_position + residual_slot.shape[0]`.
+    ///
+    /// `scratch` is a pool of transient `wgpu::Buffer`s shared across
+    /// every layer in the stack. Each layer's `forward` is free to use
+    /// any slot it needs; slot lifetimes are bounded by the call.
     ///
     /// * Cold prefill of an `N`-token prompt: `forward(slot, 0)` with
     ///   `slot.shape[0] == N`.
@@ -18,6 +23,7 @@ pub trait LayerSession {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        scratch: &ScratchPool,
         residual_slot: BufferView<'_>,
         prev_position: usize,
     );

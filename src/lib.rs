@@ -5,6 +5,7 @@ pub mod language_model;
 pub mod layers;
 pub mod lm_head;
 pub mod sampler;
+pub mod scratch_pool;
 
 #[cfg(test)]
 pub(crate) mod gpu_test_utils;

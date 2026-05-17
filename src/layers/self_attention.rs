@@ -12,6 +12,7 @@ use crate::{
     },
     layers::{layer_session::LayerSession, mlp::MultiLayerPerceptron},
     log_tensor,
+    scratch_pool::{ScratchPool, ScratchSlot},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -25,7 +26,6 @@ pub struct SelfAttentionConfig {
 }
 
 pub struct SelfAttentionLayer {
-    hidden_size: usize,
     num_attention_heads: usize,
     num_key_value_heads: usize,
     head_dim: usize,
@@ -187,7 +187,6 @@ impl SelfAttentionLayer {
         );
         let mlp_residual_add = ElementwiseAddInplaceWebgpu::new(&device, hidden_size);
         Self {
-            hidden_size,
             num_attention_heads: config.num_attention_heads,
             num_key_value_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
@@ -216,6 +215,7 @@ impl SelfAttentionLayer {
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        scratch: &ScratchPool,
         residual_slot: BufferView<'_>,
         prev_position: usize,
         k_cache_buffer: &wgpu::Buffer,
@@ -227,81 +227,32 @@ impl SelfAttentionLayer {
             "forward requires residual_slot.shape[0] >= 1, got {}",
             num_new_tokens,
         );
-        let q_dim = self.num_attention_heads * self.head_dim;
-        let q_gate_dim = q_dim * 2;
         let sz = std::mem::size_of::<f32>() as u32;
         let num_new_u32 = num_new_tokens as u32;
-        let hidden_size = self.hidden_size as u32;
         let kv_dim = self.num_key_value_heads * self.head_dim;
         let kv_prefix_rows = (prev_position + num_new_tokens) as u32;
 
-        let normed_embedding_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("self_attention_layer/normed_embedding_buffer"),
-            size: (num_new_tokens * self.hidden_size * std::mem::size_of::<f32>())
-                as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let normed =
-            BufferView::new_2d_tight(&normed_embedding_buffer, num_new_u32, hidden_size, sz);
-
-        let q_gate_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("self_attention_layer/q_gate_proj_buffer"),
-            size: (num_new_tokens * q_gate_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        // Scratch tensors live in the shared pool; each call narrows
+        // the slot's `max_seq_len`-sized buffer to a `num_new_tokens`
+        // view. No per-forward `device.create_buffer`.
+        let normed = scratch.view_2d(ScratchSlot::Normed, num_new_u32);
         let q_gate_view = BufferView::new_4d_tight(
-            &q_gate_proj_buffer,
+            scratch.buffer(ScratchSlot::QGate),
             num_new_u32,
             self.num_attention_heads as u32,
             2,
             self.head_dim as u32,
             sz,
         );
-
-        let attn_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("self_attention_layer/attn_output_buffer"),
-            size: (num_new_tokens * q_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
         let attn_out_view = BufferView::new_3d_tight(
-            &attn_output_buffer,
+            scratch.buffer(ScratchSlot::AttnOutputSelf),
             num_new_u32,
             self.num_attention_heads as u32,
             self.head_dim as u32,
             sz,
         );
-
-        let o_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("self_attention_layer/o_proj_buffer"),
-            size: (num_new_tokens * self.hidden_size * std::mem::size_of::<f32>())
-                as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let o_proj_view = BufferView::new_2d_tight(&o_proj_buffer, num_new_u32, hidden_size, sz);
-
-        let mlp_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("self_attention_layer/mlp_output_buffer"),
-            size: (num_new_tokens * self.hidden_size * std::mem::size_of::<f32>())
-                as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let mlp_out_view =
-            BufferView::new_2d_tight(&mlp_output_buffer, num_new_u32, hidden_size, sz);
+        let o_proj_view = scratch.view_2d(ScratchSlot::OProj, num_new_u32);
+        let mlp_out_view = scratch.view_2d(ScratchSlot::MlpOutput, num_new_u32);
 
         let max_seq_in_cache = (k_cache_buffer.size()
             / (kv_dim as wgpu::BufferAddress * sz as wgpu::BufferAddress))
@@ -356,7 +307,8 @@ impl SelfAttentionLayer {
             .forward(device, queue, residual_slot, o_proj_view);
         self.post_attention_layernorm
             .forward(device, queue, residual_slot, normed);
-        self.mlp.forward(device, queue, normed, mlp_out_view);
+        self.mlp
+            .forward(device, queue, scratch, normed, mlp_out_view);
         self.mlp_residual_add
             .forward(device, queue, residual_slot, mlp_out_view);
     }
@@ -403,12 +355,14 @@ impl<'m> LayerSession for SelfAttentionLayerSession<'m> {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        scratch: &ScratchPool,
         residual_slot: BufferView<'_>,
         prev_position: usize,
     ) {
         self.layer.forward(
             device,
             queue,
+            scratch,
             residual_slot,
             prev_position,
             &self.k_cache_buffer,

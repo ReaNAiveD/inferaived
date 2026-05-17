@@ -12,6 +12,7 @@ use crate::{
     },
     layers::{layer_session::LayerSession, mlp::MultiLayerPerceptron},
     log_tensor,
+    scratch_pool::{ScratchPool, ScratchSlot},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -24,10 +25,6 @@ pub struct LinearAttentionConfig {
 }
 
 pub struct LinearAttentionLayer {
-    hidden_size: usize,
-    linear_num_value_heads: usize,
-    qkv_dim: usize,
-    v_dim: usize,
     recurrent_state_size: usize,
     conv_state_size: usize,
     input_layernorm: RmsNormWebgpu,
@@ -230,10 +227,6 @@ impl LinearAttentionLayer {
         let mlp_residual_add = ElementwiseAddInplaceWebgpu::new(&device, hidden_size);
         let conv_state_size = conv_silu.conv_state_size();
         Self {
-            hidden_size,
-            linear_num_value_heads: config.linear_num_value_heads,
-            qkv_dim,
-            v_dim,
             recurrent_state_size,
             conv_state_size,
             input_layernorm,
@@ -260,6 +253,7 @@ impl LinearAttentionLayer {
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        scratch: &ScratchPool,
         residual_slot: BufferView<'_>,
         conv_state_buffer: &wgpu::Buffer,
         recurrent_state_buffer: &wgpu::Buffer,
@@ -270,117 +264,27 @@ impl LinearAttentionLayer {
             "forward requires residual_slot.shape[0] >= 1, got {}",
             num_new_tokens,
         );
-        let sz = std::mem::size_of::<f32>() as u32;
         let num_new_u32 = num_new_tokens as u32;
-        let hidden_size = self.hidden_size as u32;
-        let qkv_dim = self.qkv_dim as u32;
-        let v_dim = self.v_dim as u32;
-        let num_v_heads = self.linear_num_value_heads as u32;
 
-        // Each per-forward scratch is paired with its canonical view at
-        // the point of creation. conv_silu / delta_rule / gated_norm
-        // still consume raw `&wgpu::Buffer`s, so `conv_qkv_buffer`
-        // intentionally has no paired view.
-        let normed_embedding_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/normed_embedding_buffer"),
-            size: (num_new_tokens * self.hidden_size * std::mem::size_of::<f32>())
-                as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let normed_view =
-            BufferView::new_2d_tight(&normed_embedding_buffer, num_new_u32, hidden_size, sz);
+        // Scratch tensors live in the shared pool. Kernels that take a
+        // `BufferView` get a 2-D view; kernels that still take raw
+        // `&wgpu::Buffer` (`conv_silu`, `delta_rule`, `gated_norm`)
+        // borrow the slot's buffer directly.
+        let normed_view = scratch.view_2d(ScratchSlot::Normed, num_new_u32);
+        let qkv_view = scratch.view_2d(ScratchSlot::InProjQkv, num_new_u32);
+        let proj_a_view = scratch.view_2d(ScratchSlot::InProjA, num_new_u32);
+        let proj_b_view = scratch.view_2d(ScratchSlot::InProjB, num_new_u32);
+        let proj_z_view = scratch.view_2d(ScratchSlot::InProjZ, num_new_u32);
+        let attn_out_v_view = scratch.view_2d(ScratchSlot::AttnOutputLinear, num_new_u32);
+        let out_proj_view = scratch.view_2d(ScratchSlot::OutProj, num_new_u32);
+        let mlp_out_view = scratch.view_2d(ScratchSlot::MlpOutput, num_new_u32);
 
-        let in_proj_qkv_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/in_proj_qkv_buffer"),
-            size: (num_new_tokens * self.qkv_dim * std::mem::size_of::<f32>())
-                as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let qkv_view = BufferView::new_2d_tight(&in_proj_qkv_buffer, num_new_u32, qkv_dim, sz);
-
-        let in_proj_a_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/in_proj_a_buffer"),
-            size: (num_new_tokens * self.linear_num_value_heads * std::mem::size_of::<f32>())
-                as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let proj_a_view = BufferView::new_2d_tight(&in_proj_a_buffer, num_new_u32, num_v_heads, sz);
-
-        let in_proj_b_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/in_proj_b_buffer"),
-            size: (num_new_tokens * self.linear_num_value_heads * std::mem::size_of::<f32>())
-                as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let proj_b_view = BufferView::new_2d_tight(&in_proj_b_buffer, num_new_u32, num_v_heads, sz);
-
-        let in_proj_z_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/in_proj_z_buffer"),
-            size: (num_new_tokens * self.v_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let proj_z_view = BufferView::new_2d_tight(&in_proj_z_buffer, num_new_u32, v_dim, sz);
-
-        // conv1d output: consumed by delta_rule via raw `&wgpu::Buffer`,
-        // so no view is built for this scratch.
-        let conv_qkv_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/conv_qkv_buffer"),
-            size: (num_new_tokens * self.qkv_dim * std::mem::size_of::<f32>())
-                as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let attn_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/attn_output_buffer"),
-            size: (num_new_tokens * self.v_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let attn_out_v_view = BufferView::new_2d_tight(&attn_output_buffer, num_new_u32, v_dim, sz);
-
-        let out_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/out_proj_buffer"),
-            size: (num_new_tokens * self.hidden_size * std::mem::size_of::<f32>())
-                as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let out_proj_view =
-            BufferView::new_2d_tight(&out_proj_buffer, num_new_u32, hidden_size, sz);
-
-        let mlp_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("linear_attention_layer/mlp_output_buffer"),
-            size: (num_new_tokens * self.hidden_size * std::mem::size_of::<f32>())
-                as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let mlp_out_view =
-            BufferView::new_2d_tight(&mlp_output_buffer, num_new_u32, hidden_size, sz);
+        let in_proj_qkv_buffer = scratch.buffer(ScratchSlot::InProjQkv);
+        let in_proj_a_buffer = scratch.buffer(ScratchSlot::InProjA);
+        let in_proj_b_buffer = scratch.buffer(ScratchSlot::InProjB);
+        let in_proj_z_buffer = scratch.buffer(ScratchSlot::InProjZ);
+        let conv_qkv_buffer = scratch.buffer(ScratchSlot::ConvQkv);
+        let attn_output_buffer = scratch.buffer(ScratchSlot::AttnOutputLinear);
 
         self.input_layernorm
             .forward(device, queue, residual_slot, normed_view);
@@ -393,19 +297,19 @@ impl LinearAttentionLayer {
         self.conv_silu.forward(
             device,
             queue,
-            &in_proj_qkv_buffer,
-            &conv_qkv_buffer,
+            in_proj_qkv_buffer,
+            conv_qkv_buffer,
             conv_state_buffer,
             num_new_tokens,
         );
         self.delta_rule.forward(
             device,
             queue,
-            &conv_qkv_buffer,
-            &in_proj_a_buffer,
-            &in_proj_b_buffer,
+            conv_qkv_buffer,
+            in_proj_a_buffer,
+            in_proj_b_buffer,
             recurrent_state_buffer,
-            &attn_output_buffer,
+            attn_output_buffer,
             num_new_tokens,
         );
         self.in_proj_z_mul_mat
@@ -413,8 +317,8 @@ impl LinearAttentionLayer {
         self.gated_norm.forward(
             device,
             queue,
-            &attn_output_buffer,
-            &in_proj_z_buffer,
+            attn_output_buffer,
+            in_proj_z_buffer,
             num_new_tokens,
         );
         self.out_proj_mat_mul
@@ -423,7 +327,8 @@ impl LinearAttentionLayer {
             .forward(device, queue, residual_slot, out_proj_view);
         self.post_attention_layernorm
             .forward(device, queue, residual_slot, normed_view);
-        self.mlp.forward(device, queue, normed_view, mlp_out_view);
+        self.mlp
+            .forward(device, queue, scratch, normed_view, mlp_out_view);
         self.mlp_residual_add
             .forward(device, queue, residual_slot, mlp_out_view);
     }
@@ -472,12 +377,14 @@ impl<'m> LayerSession for LinearAttentionLayerSession<'m> {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        scratch: &ScratchPool,
         residual_slot: BufferView<'_>,
         _prev_position: usize,
     ) {
         self.layer.forward(
             device,
             queue,
+            scratch,
             residual_slot,
             &self.conv_state_buffer,
             &self.recurrent_state_buffer,

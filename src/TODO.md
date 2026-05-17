@@ -2,12 +2,14 @@
 
 Optimization directions for the Rust orchestration layer (kernels-side TODOs live in `wgsl-shaders/TODO.md`). Listed in rough priority order.
 
-## ScratchArena for per-forward scratch buffers
+## ScratchPool for per-forward scratch buffers  *(done — 2026-05)*
 
-- Every `LayerSession::forward` call still does ~10 `device.create_buffer` (×24 layers ⇒ ~240 buffer creates / token in decode). All of these have the same lifetime: from the start of `forward` to its end.
-- Naive direction (one big `wgpu::Buffer` + bump cursor handing out `BufferView`s) does **not** work under `wgpu`: usage is tracked at whole-buffer granularity, so binding disjoint byte ranges of the same arena buffer as `Storage(read_only=true)` + `Storage(read_only=false)` on the same dispatch is a validation error. See `docs/wgpu-single-buffer-arena.md` for the post-mortem on the prototype that was reverted.
-- Workable direction: `N` separate arena buffers + a graph coloring pass that assigns each scratch tensor to a bucket such that no kernel reads and writes tensors from the same bucket. The dispatch sequence is static, so coloring can be precomputed at session construction. `N=3` is likely enough for our forward.
-- Cheaper alternative: a per-size-class free list of `wgpu::Buffer`s (different buffers ⇒ no usage merge). Easier to ship but weaker memory locality and more API objects.
+- Implemented as `ScratchPool` in [`src/scratch_pool.rs`](scratch_pool.rs): one `wgpu::Buffer` per `ScratchSlot` (14 slots covering the union of self-attention, linear-attention, and MLP scratch tensors), each sized to `max_seq_len × feature_dim(slot) × 4`. Owned by `Qwen35Session`, plumbed through `LayerSession::forward` as `&ScratchPool`. Layers call `scratch.view_2d(slot, num_tokens)` or `scratch.buffer(slot)` instead of `device.create_buffer` — eliminates ~222 per-token buffer creates across the 24-layer stack.
+- Why named slots, not a bump arena: `wgpu`'s validation tracks buffer state at whole-buffer granularity, so a single arena with disjoint sub-ranges as read+write on the same dispatch trips `ResourceUsageCompatibilityError`. One distinct `wgpu::Buffer` per slot sidesteps the merge entirely. See [`docs/wgpu-single-buffer-arena.md`](../docs/wgpu-single-buffer-arena.md) for the failed bump-arena prototype.
+- Performance: decode tok/s unchanged within run-to-run noise on the test hardware — buffer creates were not the bottleneck on this driver (see `benches/baselines.local.csv` row `master-scratch-pool`). The change is structural prep for downstream items (bf16 scratch, pre-built bind groups, possible liveness coloring).
+- Deferred follow-ups:
+  - **Liveness coloring → N < 14 physical buffers.** Saves ~70% of scratch memory at large `max_seq_len`. Needs a hand-authored or recorded slot→bucket table and a debug-mode validator that walks an annotated dispatch sequence to assert no read+write conflicts per dispatch. Both layer types' dispatch sequences 3-color cleanly per the design report; the `view_2d()` / `buffer()` accessors are the choke point and would absorb the offset arithmetic transparently. Wait until scratch memory shows up in a real profile.
+  - **Pre-built bind groups.** Now that scratch buffers are session-lifetime, every kernel's bind group could also be built once at session construction instead of every dispatch — likely a bigger win than the buffer-create elimination itself.
 
 ## `BufferView` for strided / offset access  *(done — 2025)*
 

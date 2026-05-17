@@ -9,6 +9,7 @@ use crate::{
         },
         self_attention::{SelfAttentionConfig, SelfAttentionLayer, SelfAttentionLayerSession},
     },
+    scratch_pool::ScratchPool,
 };
 
 // TODO: consider unifying LinearAttentionLayer and SelfAttentionLayer into a single generic AttentionLayer with generic parameters for the various components
@@ -49,12 +50,17 @@ impl<'m> LayerSession for AttentionLayerSession<'m> {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        scratch: &ScratchPool,
         residual_slot: BufferView<'_>,
         prev_position: usize,
     ) {
         match self {
-            Self::Linear(session) => session.forward(device, queue, residual_slot, prev_position),
-            Self::Full(session) => session.forward(device, queue, residual_slot, prev_position),
+            Self::Linear(session) => {
+                session.forward(device, queue, scratch, residual_slot, prev_position)
+            }
+            Self::Full(session) => {
+                session.forward(device, queue, scratch, residual_slot, prev_position)
+            }
         }
     }
 }
@@ -139,11 +145,12 @@ impl<'m> LayerSession for LayerStackSession<'m> {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        scratch: &ScratchPool,
         residual_slot: BufferView<'_>,
         prev_position: usize,
     ) {
         for session in &mut self.sessions {
-            session.forward(device, queue, residual_slot, prev_position);
+            session.forward(device, queue, scratch, residual_slot, prev_position);
         }
     }
 }

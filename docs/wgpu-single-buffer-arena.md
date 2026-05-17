@@ -105,6 +105,29 @@ Layers continue to call `device.create_buffer` for per-forward scratch.
 This is the same behaviour we had before the BufferView work, just with
 nicer wrappers around the resulting buffers.
 
+## What we did next (2026-05)
+
+The eventual fix went the simpler route from the "what would actually
+work" list below — variant 2 (separate `wgpu::Buffer`s, pooled) taken
+to its degenerate case: **one named buffer per logical scratch tensor,
+not a true pool**. Lives in [`src/scratch_pool.rs`](../src/scratch_pool.rs)
+as `ScratchPool` + `ScratchSlot` enum, owned by `Qwen35Session`. The 14
+slots cover the union of self-attention, linear-attention and MLP
+scratch needs; each backing `wgpu::Buffer` is sized to
+`max_seq_len × feature_dim(slot) × 4` and reused across every layer
+and every forward call. Because each slot is a distinct
+`wgpu::Buffer`, the per-buffer usage tracker described above has
+nothing to merge — the validation issue is sidestepped entirely.
+
+This is **not** liveness coloring. Slot count = number of logical
+scratch tensors, not the chromatic number of the read/write conflict
+graph. The memory cost is a small constant multiple of the colored
+version (~14 buffers vs the ~3 a coloring pass would produce), which
+is fine at our current scales (under 200 MB at `max_seq_len = 2048`,
+small compared to ~1.5 GB of bf16 weights). The `view_2d()` /
+`buffer()` accessors are the choke point, so a future drop-in upgrade
+to coloring just changes their bodies — no caller-side churn.
+
 ## What would actually work
 
 Two viable directions, both deferred:

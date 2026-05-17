@@ -1,7 +1,5 @@
 struct Params {
-    hidden_offset: u32,
     hidden_token_stride: u32,
-    addend_offset: u32,
     addend_token_stride: u32,
 
     hidden_size: u32,
@@ -16,15 +14,15 @@ var<storage, read> addend: array<f32>;
 var<uniform> params: Params;
 
 fn get_hidden(token: u32, i: u32) -> f32 {
-    return hidden[params.hidden_offset + token * params.hidden_token_stride + i];
+    return hidden[token * params.hidden_token_stride + i];
 }
 
 fn set_hidden(token: u32, i: u32, value: f32) {
-    hidden[params.hidden_offset + token * params.hidden_token_stride + i] = value;
+    hidden[token * params.hidden_token_stride + i] = value;
 }
 
 fn get_addend(token: u32, i: u32) -> f32 {
-    return addend[params.addend_offset + token * params.addend_token_stride + i];
+    return addend[token * params.addend_token_stride + i];
 }
 
 override workgroup_size: u32;

@@ -1,8 +1,6 @@
 // In-place compute: hidden[token, i] *= silu(gate[token, i])
 struct Params {
-    hidden_offset: u32,
     hidden_token_stride: u32,
-    gate_offset: u32,
     gate_token_stride: u32,
 
     hidden_size: u32,
@@ -17,15 +15,15 @@ var<storage, read> gate: array<f32>;
 var<uniform> params: Params;
 
 fn get_hidden(token: u32, i: u32) -> f32 {
-    return hidden[params.hidden_offset + token * params.hidden_token_stride + i];
+    return hidden[token * params.hidden_token_stride + i];
 }
 
 fn set_hidden(token: u32, i: u32, value: f32) {
-    hidden[params.hidden_offset + token * params.hidden_token_stride + i] = value;
+    hidden[token * params.hidden_token_stride + i] = value;
 }
 
 fn get_gate(token: u32, i: u32) -> f32 {
-    return gate[params.gate_offset + token * params.gate_token_stride + i];
+    return gate[token * params.gate_token_stride + i];
 }
 
 fn silu(value: f32) -> f32 {

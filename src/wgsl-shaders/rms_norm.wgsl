@@ -1,6 +1,6 @@
 struct Params {
-    input_offset: u32,        // in elements
     input_row_stride: u32,    // in elements
+    output_row_stride: u32,   // in elements
 
     hidden_size: u32,
     seq_len: u32,
@@ -28,8 +28,8 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
     if (wg_id.x >= params.seq_len) {
         return;
     }
-    let input_row_offset = params.input_offset + wg_id.x * params.input_row_stride;
-    let output_row_offset = wg_id.x * params.hidden_size;
+    let input_row_offset = wg_id.x * params.input_row_stride;
+    let output_row_offset = wg_id.x * params.output_row_stride;
 
     var sum: f32 = 0.0;
     for (var i: u32 = local_id.x; i < params.hidden_size; i += workgroup_size) {

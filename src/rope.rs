@@ -1,10 +1,10 @@
+use crate::buffer_view::BufferView;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RopeParams {
-    q_offset: u32,
     q_token_stride: u32,
     q_head_stride: u32,
-    k_offset: u32,
     k_token_stride: u32,
     k_head_stride: u32,
 
@@ -118,26 +118,53 @@ impl RopeInplaceWebgpu {
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        q_buffer: &wgpu::Buffer,
-        k_buffer: &wgpu::Buffer,
-        q_start_row: usize,
-        k_start_row: usize,
-        num_rows: usize,
+        q: BufferView<'_>,
+        k: BufferView<'_>,
         position_offset: usize,
     ) {
-        let head_dim = self.head_dim as u32;
-        let q_token_stride = self.num_q_heads as u32 * head_dim;
-        let k_token_stride = self.num_k_heads as u32 * head_dim;
+        debug_assert_eq!(
+            q.rank, 3,
+            "RoPE: q must be rank-3 [seq, num_heads, head_dim]"
+        );
+        debug_assert_eq!(
+            k.rank, 3,
+            "RoPE: k must be rank-3 [seq, num_heads, head_dim]"
+        );
+        debug_assert_eq!(
+            q.shape[0], k.shape[0],
+            "RoPE: q.shape[0] ({}) must equal k.shape[0] ({})",
+            q.shape[0], k.shape[0],
+        );
+        debug_assert_eq!(
+            q.shape[1] as usize, self.num_q_heads,
+            "RoPE: q.shape[1] ({}) must equal num_q_heads ({})",
+            q.shape[1], self.num_q_heads,
+        );
+        debug_assert_eq!(
+            k.shape[1] as usize, self.num_k_heads,
+            "RoPE: k.shape[1] ({}) must equal num_k_heads ({})",
+            k.shape[1], self.num_k_heads,
+        );
+        debug_assert_eq!(
+            q.shape[2] as usize, self.head_dim,
+            "RoPE: q.shape[2] ({}) must equal head_dim ({})",
+            q.shape[2], self.head_dim,
+        );
+        debug_assert_eq!(
+            k.shape[2] as usize, self.head_dim,
+            "RoPE: k.shape[2] ({}) must equal head_dim ({})",
+            k.shape[2], self.head_dim,
+        );
+
+        let num_new_tokens = q.shape[0];
         let uniform_data = RopeParams {
-            q_offset: (q_start_row * q_token_stride as usize) as u32,
-            q_token_stride,
-            q_head_stride: head_dim,
-            k_offset: (k_start_row * k_token_stride as usize) as u32,
-            k_token_stride,
-            k_head_stride: head_dim,
+            q_token_stride: q.stride[0],
+            q_head_stride: q.stride[1],
+            k_token_stride: k.stride[0],
+            k_head_stride: k.stride[1],
             num_q_heads: self.num_q_heads as u32,
             num_k_heads: self.num_k_heads as u32,
-            seq_len: num_rows as u32,
+            seq_len: num_new_tokens,
             num_rotated_dims: self.num_rotated_dims as u32,
             theta_scale: self.theta_scale,
             position_offset: position_offset as u32,
@@ -153,11 +180,11 @@ impl RopeInplaceWebgpu {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: q_buffer.as_entire_binding(),
+                    resource: q.as_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: k_buffer.as_entire_binding(),
+                    resource: k.as_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -177,7 +204,7 @@ impl RopeInplaceWebgpu {
             compute_pass.set_bind_group(0, &bind_group, &[]);
             let max_heads = self.num_q_heads.max(self.num_k_heads);
             let total_invocations =
-                ((self.num_rotated_dims / 2) * max_heads * num_rows) as u32;
+                ((self.num_rotated_dims / 2) * max_heads * num_new_tokens as usize) as u32;
             let workgroup_count =
                 (total_invocations + Self::WORKGROUP_SIZE - 1) / Self::WORKGROUP_SIZE;
             compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
@@ -279,7 +306,24 @@ mod tests {
         );
         let q_buf = upload_f32(&device, &q);
         let k_buf = upload_f32(&device, &k);
-        gpu.forward(&device, &queue, &q_buf, &k_buf, 0, 0, seq_len, 0);
+        // Rank-3 views [seq, num_heads, head_dim] tight-packed. The
+        // kernel reads per-token and per-head strides from these views;
+        // no extra stride parameters needed.
+        let q_view = BufferView::new_3d_tight(
+            &q_buf,
+            seq_len as u32,
+            num_q_heads as u32,
+            head_dim as u32,
+            std::mem::size_of::<f32>() as u32,
+        );
+        let k_view = BufferView::new_3d_tight(
+            &k_buf,
+            seq_len as u32,
+            num_k_heads as u32,
+            head_dim as u32,
+            std::mem::size_of::<f32>() as u32,
+        );
+        gpu.forward(&device, &queue, q_view, k_view, 0);
         let actual_q = download_f32(&device, &queue, &q_buf, seq_len * num_q_heads * head_dim);
         let actual_k = download_f32(&device, &queue, &k_buf, seq_len * num_k_heads * head_dim);
 

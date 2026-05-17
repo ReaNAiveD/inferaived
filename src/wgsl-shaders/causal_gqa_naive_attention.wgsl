@@ -3,16 +3,12 @@
 // 3-pass safe softmax over kv_seq_len, then weighted sum of V. GQA index:
 // kv_head = q_head / (num_q_heads / num_kv_heads). No KV cache management.
 struct Params {
-    q_offset: u32,
     q_token_stride: u32,
     q_head_stride: u32,
-    k_offset: u32,
     k_token_stride: u32,
     k_head_stride: u32,
-    v_offset: u32,
     v_token_stride: u32,
     v_head_stride: u32,
-    output_offset: u32,
     output_token_stride: u32,
     output_head_stride: u32,
 
@@ -38,16 +34,16 @@ var<storage, read_write> output: array<f32>;
 var<uniform> params: Params;
 
 fn get_q(token: u32, head: u32, in_head_index: u32) -> f32 {
-    return q[params.q_offset + in_head_index + head * params.q_head_stride + token * params.q_token_stride];
+    return q[in_head_index + head * params.q_head_stride + token * params.q_token_stride];
 }
 fn get_k(token: u32, head: u32, in_head_index: u32) -> f32 {
-    return k[params.k_offset + in_head_index + head * params.k_head_stride + token * params.k_token_stride];
+    return k[in_head_index + head * params.k_head_stride + token * params.k_token_stride];
 }
 fn get_v(token: u32, head: u32, in_head_index: u32) -> f32 {
-    return v[params.v_offset + in_head_index + head * params.v_head_stride + token * params.v_token_stride];
+    return v[in_head_index + head * params.v_head_stride + token * params.v_token_stride];
 }
 fn set_output(token: u32, head: u32, in_head_index: u32, value: f32) {
-    output[params.output_offset + in_head_index + head * params.output_head_stride + token * params.output_token_stride] = value;
+    output[in_head_index + head * params.output_head_stride + token * params.output_token_stride] = value;
 }
 
 override workgroup_size: u32;

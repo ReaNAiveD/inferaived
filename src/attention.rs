@@ -1,16 +1,14 @@
+use crate::buffer_view::BufferView;
+
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct CausalGqaNaiveAttentionParams {
-    q_offset: u32,
     q_token_stride: u32,
     q_head_stride: u32,
-    k_offset: u32,
     k_token_stride: u32,
     k_head_stride: u32,
-    v_offset: u32,
     v_token_stride: u32,
     v_head_stride: u32,
-    output_offset: u32,
     output_token_stride: u32,
     output_head_stride: u32,
 
@@ -160,31 +158,54 @@ impl CausalGqaNaiveAttentionWebgpu {
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        q_buffer: &wgpu::Buffer,
-        k_buffer: &wgpu::Buffer,
-        v_buffer: &wgpu::Buffer,
-        output_buffer: &wgpu::Buffer,
-        num_q_rows: usize,
+        q: BufferView<'_>,
+        k: BufferView<'_>,
+        v: BufferView<'_>,
+        output: BufferView<'_>,
         q_position_offset: usize,
     ) {
+        debug_assert_eq!(q.rank, 3, "attention: q must be rank-3");
+        debug_assert_eq!(k.rank, 3, "attention: k must be rank-3");
+        debug_assert_eq!(v.rank, 3, "attention: v must be rank-3");
+        debug_assert_eq!(output.rank, 3, "attention: output must be rank-3");
+        debug_assert_eq!(
+            q.shape[0], output.shape[0],
+            "attention: q.shape[0] ({}) must equal output.shape[0] ({})",
+            q.shape[0], output.shape[0],
+        );
+        debug_assert_eq!(
+            k.shape[0], v.shape[0],
+            "attention: k.shape[0] ({}) must equal v.shape[0] ({})",
+            k.shape[0], v.shape[0],
+        );
+        debug_assert!(
+            k.shape[0] as usize >= q_position_offset + q.shape[0] as usize,
+            "attention: k/v rows ({}) must cover full prefix [0, {} + {})",
+            k.shape[0], q_position_offset, q.shape[0],
+        );
+        debug_assert_eq!(q.shape[1] as usize, self.num_q_heads);
+        debug_assert_eq!(output.shape[1] as usize, self.num_q_heads);
+        debug_assert_eq!(k.shape[1] as usize, self.num_kv_heads);
+        debug_assert_eq!(v.shape[1] as usize, self.num_kv_heads);
+        debug_assert_eq!(q.shape[2] as usize, self.qk_head_dim);
+        debug_assert_eq!(k.shape[2] as usize, self.qk_head_dim);
+        debug_assert_eq!(v.shape[2] as usize, self.v_head_dim);
+        debug_assert_eq!(output.shape[2] as usize, self.v_head_dim);
+        let num_q_rows = q.shape[0];
         let params = CausalGqaNaiveAttentionParams {
-            q_offset: 0,
-            q_token_stride: (self.num_q_heads * self.qk_head_dim) as u32,
-            q_head_stride: self.qk_head_dim as u32,
-            k_offset: 0,
-            k_token_stride: (self.num_kv_heads * self.qk_head_dim) as u32,
-            k_head_stride: self.qk_head_dim as u32,
-            v_offset: 0,
-            v_token_stride: (self.num_kv_heads * self.v_head_dim) as u32,
-            v_head_stride: self.v_head_dim as u32,
-            output_offset: 0,
-            output_token_stride: (self.num_q_heads * self.v_head_dim) as u32,
-            output_head_stride: self.v_head_dim as u32,
+            q_token_stride: q.stride[0],
+            q_head_stride: q.stride[1],
+            k_token_stride: k.stride[0],
+            k_head_stride: k.stride[1],
+            v_token_stride: v.stride[0],
+            v_head_stride: v.stride[1],
+            output_token_stride: output.stride[0],
+            output_head_stride: output.stride[1],
             num_q_heads: self.num_q_heads as u32,
             num_kv_heads: self.num_kv_heads as u32,
             q_dim: self.qk_head_dim as u32,
             v_dim: self.v_head_dim as u32,
-            seq_len: num_q_rows as u32,
+            seq_len: num_q_rows,
             q_position_offset: q_position_offset as u32,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[params]));
@@ -194,19 +215,19 @@ impl CausalGqaNaiveAttentionWebgpu {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: q_buffer.as_entire_binding(),
+                    resource: q.as_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: k_buffer.as_entire_binding(),
+                    resource: k.as_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: v_buffer.as_entire_binding(),
+                    resource: v.as_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: output_buffer.as_entire_binding(),
+                    resource: output.as_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -225,7 +246,7 @@ impl CausalGqaNaiveAttentionWebgpu {
             compute_pass.set_pipeline(&self.pipeline);
             compute_pass.set_bind_group(0, &bind_group, &[]);
             // One workgroup per (q_token, q_head).
-            let workgroup_count = (num_q_rows * self.num_q_heads) as u32;
+            let workgroup_count = num_q_rows * self.num_q_heads as u32;
             compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
         }
         queue.submit(Some(encoder.finish()));
@@ -315,7 +336,12 @@ mod tests {
         let k_buf = upload_f32(&device, &k);
         let v_buf = upload_f32(&device, &v);
         let out_buf = create_f32_buffer(&device, seq_len * num_q_heads * v_dim);
-        gpu.forward(&device, &queue, &q_buf, &k_buf, &v_buf, &out_buf, seq_len, 0);
+        let sz = std::mem::size_of::<f32>() as u32;
+        let q_view = BufferView::new_3d_tight(&q_buf, seq_len as u32, num_q_heads as u32, q_dim as u32, sz);
+        let k_view = BufferView::new_3d_tight(&k_buf, seq_len as u32, num_kv_heads as u32, q_dim as u32, sz);
+        let v_view = BufferView::new_3d_tight(&v_buf, seq_len as u32, num_kv_heads as u32, v_dim as u32, sz);
+        let out_view = BufferView::new_3d_tight(&out_buf, seq_len as u32, num_q_heads as u32, v_dim as u32, sz);
+        gpu.forward(&device, &queue, q_view, k_view, v_view, out_view, 0);
         let actual = download_f32(&device, &queue, &out_buf, seq_len * num_q_heads * v_dim);
 
         assert_approx_eq(&actual, &expected, 1e-3);
@@ -366,15 +392,19 @@ mod tests {
         let k_buf = upload_f32(&device, &k);
         let v_buf = upload_f32(&device, &v);
         let out_buf = create_f32_buffer(&device, num_q_heads * v_dim);
+        let sz = std::mem::size_of::<f32>() as u32;
+        let q_view = BufferView::new_3d_tight(&q_buf, 1, num_q_heads as u32, q_dim as u32, sz);
+        let k_view = BufferView::new_3d_tight(&k_buf, seq_len as u32, num_kv_heads as u32, q_dim as u32, sz);
+        let v_view = BufferView::new_3d_tight(&v_buf, seq_len as u32, num_kv_heads as u32, v_dim as u32, sz);
+        let out_view = BufferView::new_3d_tight(&out_buf, 1, num_q_heads as u32, v_dim as u32, sz);
         gpu.forward(
             &device,
             &queue,
-            &q_buf,
-            &k_buf,
-            &v_buf,
-            &out_buf,
-            /* num_q_rows         */ 1,
-            /* q_position_offset  */ seq_len - 1,
+            q_view,
+            k_view,
+            v_view,
+            out_view,
+            /* q_position_offset */ seq_len - 1,
         );
         let actual = download_f32(&device, &queue, &out_buf, num_q_heads * v_dim);
 

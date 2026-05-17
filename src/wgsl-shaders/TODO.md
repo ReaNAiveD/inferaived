@@ -45,16 +45,6 @@ Notes:
 - Should be a separate shader file (e.g. `causal_gqa_flash_attention.wgsl`) per the "many small single-purpose kernels" principle, not a flag on the existing kernel.
 - Validate against the naive kernel within a small epsilon before swapping in.
 
-## Eliminate `slice_copy` Q-extract pass
+## Eliminate `slice_copy` Q-extract pass  *(done — 2025)*
 
-**Affected shaders**: `slice_copy.wgsl`, `rms_norm_inplace.wgsl`, `rope.wgsl`, `causal_gqa_naive_attention.wgsl`.
-
-**Problem**: Qwen 3.5 / Qwen3-Next full attention sets `attn_output_gate=true`, so `q_proj` outputs `[seq, num_q_heads, head_dim * 2]` with Q and gate **interleaved per head**. Today `SelfAttentionLayer` runs a `slice_copy` dispatch to materialize a tight `[seq, num_q_heads, head_dim]` Q buffer before q_norm / RoPE / attention, because those three kernels assume tightly-packed Q.
-
-The copy itself is cheap (one extra read+write of `seq * num_q_heads * head_dim * 4` bytes per full-attention layer — for Qwen 3.5 0.8B at 4096 tokens that's ~50 MB total per forward, negligible), but it's a dispatch + memory bandwidth cost we don't strictly need.
-
-**Solution**: Add stride-aware variants (à la `SigmoidMulInplaceWebgpu::compute_strided`) to the three downstream kernels so they can read Q directly from `q_proj_buffer` with `q_head_stride = head_dim * 2`. Then drop the `slice_copy` dispatch and the `q_buffer` allocation in `SelfAttentionLayer`.
-
-Notes:
-- Only worth doing once the rest of the inference loop is stable and we have a CPU reference to validate against — the current copy approach keeps `RopeInplaceWebgpu` / `CausalGqaNaiveAttentionWebgpu` simple and correct.
-- The same q_extract code path is also a convenient place to insert KV-cache append logic later.
+**Resolution**: `RmsNormInplaceWebgpu`, `RopeInplaceWebgpu`, and `CausalGqaNaiveAttentionWebgpu` now take a `BufferView` for Q with a configurable per-head byte stride. `SelfAttentionLayerSession::forward` passes a strided view into the fused `q_gate_proj_buffer` with `q_head_byte_stride = 2 * head_dim * 4`, so Q is read directly out of the interleaved `[q_0|gate_0|q_1|gate_1|...]` layout. The `slice_copy` dispatch and its scratch `q_proj_buffer` are gone; the kernel + WGSL shader files have been deleted.

@@ -1,8 +1,5 @@
 // Matrix-vector multiply for the decode case (N = 1). One workgroup per
 // output row; threads split K and tree-reduce the partials.
-//
-// Weights are bf16 packed two-per-u32 (low bf16 in bits 0..15, high in 16..31).
-
 @group(0) @binding(0)
 var<storage, read> weight: array<u32>;
 
@@ -13,10 +10,6 @@ var<storage, read> input: array<f32>;
 var<storage, read_write> output: array<f32>;
 
 struct Params {
-    weight_offset: u32,        // bf16 elements
-    input_offset: u32,         // f32 elements
-    output_offset: u32,        // f32 elements
-
     m: u32,
     n: u32,                    // unused; assumed 1
     k: u32,
@@ -38,7 +31,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
     if (m_idx >= params.m) {
         return;
     }
-    let row_bf16_start = params.weight_offset + m_idx * params.weight_row_stride;
+    let row_bf16_start = m_idx * params.weight_row_stride;
 
     var partial: f32 = 0.0;
     for (var k: u32 = local_id.x; k < params.k; k += workgroup_size) {
@@ -50,7 +43,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
         } else {
             w = bitcast<f32>(packed & 0xFFFF0000u);
         }
-        partial += w * input[params.input_offset + k];
+        partial += w * input[k];
     }
 
     scratch[local_id.x] = partial;
@@ -67,6 +60,6 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
     }
 
     if (local_id.x == 0u) {
-        output[params.output_offset + m_idx] = scratch[0];
+        output[m_idx] = scratch[0];
     }
 }

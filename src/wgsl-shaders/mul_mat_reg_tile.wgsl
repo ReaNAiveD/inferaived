@@ -16,10 +16,6 @@ var<storage, read> input: array<f32>; // N rows, K columns, row-major (transpose
 var<storage, read_write> output: array<f32>; // N rows, M columns, column-major (M contiguous)
 
 struct Params {
-    weight_offset: u32,
-    input_offset: u32,
-    output_offset: u32,
-
     m: u32,
     n: u32,
     k: u32,
@@ -88,7 +84,7 @@ fn init_shmem_weight(wg_idx_m: u32, local_idx_m: u32, k_offset: u32, local_idx_n
                 shmem_weight[inner_k + inner_m * tile_k] = 0.0;
                 continue;
             }
-            let src_offset = params.weight_offset + global_m * params.weight_row_stride + global_k;
+            let src_offset = global_m * params.weight_row_stride + global_k;
             let packed = weight[src_offset / 2u];
             let target_offset = inner_k + inner_m * tile_k;
             if (src_offset % 2u == 0u) {
@@ -111,7 +107,7 @@ fn init_shmem_input(wg_idx_n: u32, local_idx_n: u32, k_offset: u32, local_idx_m:
                 shmem_input[inner_k + inner_n * tile_k] = 0.0;
                 continue;
             }
-            let src_offset = params.input_offset + global_n * params.input_row_stride + global_k;
+            let src_offset = global_n * params.input_row_stride + global_k;
             shmem_input[inner_k + inner_n * tile_k] = input[src_offset];
         }
     }
@@ -165,7 +161,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
             if (global_m >= params.m || global_n >= params.n) {
                 continue;
             }
-            let dst_offset = params.output_offset + global_n * params.m + global_m;
+            let dst_offset = global_n * params.m + global_m;
             output[dst_offset] = acc[inner_n * tile_m + inner_m];
         }
     }

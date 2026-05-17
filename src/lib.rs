@@ -1,5 +1,6 @@
 pub mod attention;
 pub mod binary;
+pub mod buffer_view;
 pub mod conv_silu;
 pub mod delta_rule;
 pub mod embedding_lookup;
@@ -15,7 +16,6 @@ pub mod rope;
 pub mod sampler;
 pub mod sigmoid_mul;
 pub mod silu_mul;
-pub mod slice_copy;
 
 #[cfg(test)]
 pub(crate) mod gpu_test_utils;

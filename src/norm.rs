@@ -1,11 +1,13 @@
 use safetensors::tensor::TensorView;
 use wgpu::{BindGroupLayout, Buffer, ComputePipeline};
 
+use crate::buffer_view::BufferView;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RmsNormParams {
-    input_offset: u32,
     input_row_stride: u32,
+    output_row_stride: u32,
     hidden_size: u32,
     seq_len: u32,
     eps: f32,
@@ -14,7 +16,6 @@ pub struct RmsNormParams {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RmsNormInplaceParams {
-    hidden_offset: u32,
     hidden_row_stride: u32,
     hidden_size: u32,
     seq_len: u32,
@@ -146,23 +147,25 @@ impl RmsNormWebgpu {
         }
     }
 
-    /// Normalize `num_rows` rows of `input_buffer` starting at row
-    /// `input_start_row` and write the normalized rows tight-packed from
-    /// row 0 of `dst_buffer`.
+    /// Normalize `input.shape[0]` rows from `input` into `dst`.
     pub fn forward(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        input_buffer: &Buffer,
-        dst_buffer: &Buffer,
-        input_start_row: usize,
-        num_rows: usize,
+        input: BufferView<'_>,
+        dst: BufferView<'_>,
     ) {
+        debug_assert_eq!(
+            input.shape[0], dst.shape[0],
+            "rms_norm: outer dim mismatch (input={}, dst={})",
+            input.shape[0], dst.shape[0],
+        );
+        let num_rows = input.shape[0];
         let uniform = RmsNormParams {
-            input_offset: (input_start_row * self.norm_dim) as u32,
-            input_row_stride: self.norm_dim as u32,
+            input_row_stride: input.stride[0],
+            output_row_stride: dst.stride[0],
             hidden_size: self.norm_dim as u32,
-            seq_len: num_rows as u32,
+            seq_len: num_rows,
             eps: 1e-6,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
@@ -172,11 +175,11 @@ impl RmsNormWebgpu {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: input_buffer.as_entire_binding(),
+                    resource: input.as_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: dst_buffer.as_entire_binding(),
+                    resource: dst.as_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -197,7 +200,7 @@ impl RmsNormWebgpu {
         });
         compute_pass.set_pipeline(&self.pipeline);
         compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups(num_rows as u32, 1, 1);
+        compute_pass.dispatch_workgroups(num_rows, 1, 1);
         drop(compute_pass);
         queue.submit(Some(command_encoder.finish()));
     }
@@ -318,21 +321,18 @@ impl RmsNormInplaceWebgpu {
         }
     }
 
-    /// In-place normalize `num_rows` rows of `src_buffer` starting at row
-    /// `start_row`. Each row is `self.norm_dim` f32 elements.
+    /// In-place normalize `hidden.shape[0]` rows of `hidden`.
     pub fn forward(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        src_buffer: &Buffer,
-        start_row: usize,
-        num_rows: usize,
+        hidden: BufferView<'_>,
     ) {
+        let num_rows = hidden.shape[0];
         let uniform = RmsNormInplaceParams {
-            hidden_offset: (start_row * self.norm_dim) as u32,
-            hidden_row_stride: self.norm_dim as u32,
+            hidden_row_stride: hidden.stride[0],
             hidden_size: self.norm_dim as u32,
-            seq_len: num_rows as u32,
+            seq_len: num_rows,
             eps: 1e-6,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
@@ -342,7 +342,7 @@ impl RmsNormInplaceWebgpu {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: src_buffer.as_entire_binding(),
+                    resource: hidden.as_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -363,7 +363,7 @@ impl RmsNormInplaceWebgpu {
         });
         compute_pass.set_pipeline(&self.pipeline);
         compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups(num_rows as u32, 1, 1);
+        compute_pass.dispatch_workgroups(num_rows, 1, 1);
         drop(compute_pass);
         queue.submit(Some(command_encoder.finish()));
     }
@@ -424,7 +424,12 @@ mod tests {
         let gpu = RmsNormWebgpu::new(&device, &queue, tv);
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, seq_len * hidden_size);
-        gpu.forward(&device, &queue, &in_buf, &out_buf, 0, seq_len);
+        let elem_size = std::mem::size_of::<f32>() as u32;
+        let in_view =
+            BufferView::new_2d_tight(&in_buf, seq_len as u32, hidden_size as u32, elem_size);
+        let out_view =
+            BufferView::new_2d_tight(&out_buf, seq_len as u32, hidden_size as u32, elem_size);
+        gpu.forward(&device, &queue, in_view, out_view);
         let actual = download_f32(&device, &queue, &out_buf, seq_len * hidden_size);
 
         assert_approx_eq(&actual, &expected, 1e-4);
@@ -434,13 +439,19 @@ mod tests {
     /// of a large input buffer (rows [input_start_row..input_start_row +
     /// num_rows)), write the normalized rows tight-packed starting at row
     /// 0 of a small output buffer sized for exactly num_rows.
+    ///
+    /// `hidden_size` is chosen so that `row_bytes = hidden_size * 4` is a
+    /// multiple of `min_storage_buffer_offset_alignment` (256 on most
+    /// adapters), which the binding-side offset encoding requires. Real
+    /// model dims (e.g. `hidden_size = 1024`, `head_dim = 256`) satisfy
+    /// this naturally; tests just have to pick aligned dims explicitly.
     #[tokio::test]
     async fn test_rms_norm_input_offset_decode_style() {
         let (device, queue) = gpu_or_skip!();
         let total_rows = 8;
         let input_start_row = 5;
         let num_rows = 1;
-        let hidden_size = 32;
+        let hidden_size = 64; // row_bytes = 256, aligned to all known adapters
 
         let input_full: Vec<f32> = (0..total_rows * hidden_size)
             .map(|i| ((i as f32) * 0.05).sin())
@@ -472,7 +483,13 @@ mod tests {
         // tight-packed from row 0 (not at the input offset, which would
         // be out of bounds here).
         let out_buf = create_f32_buffer(&device, num_rows * hidden_size);
-        gpu.forward(&device, &queue, &in_buf, &out_buf, input_start_row, num_rows);
+        let elem_size = std::mem::size_of::<f32>() as u32;
+        let in_view =
+            BufferView::new_2d_tight(&in_buf, total_rows as u32, hidden_size as u32, elem_size)
+                .narrow(0, input_start_row as u32, num_rows as u32);
+        let out_view =
+            BufferView::new_2d_tight(&out_buf, num_rows as u32, hidden_size as u32, elem_size);
+        gpu.forward(&device, &queue, in_view, out_view);
         let actual = download_f32(&device, &queue, &out_buf, num_rows * hidden_size);
 
         assert_approx_eq(&actual, &expected, 1e-4);
@@ -538,7 +555,9 @@ mod tests {
 
         let gpu = RmsNormInplaceWebgpu::new(&device, &queue, tv);
         let buf = upload_f32(&device, &data);
-        gpu.forward(&device, &queue, &buf, 0, seq_len);
+        let elem_size = std::mem::size_of::<f32>() as u32;
+        let view = BufferView::new_2d_tight(&buf, seq_len as u32, hidden_size as u32, elem_size);
+        gpu.forward(&device, &queue, view);
         let actual = download_f32(&device, &queue, &buf, seq_len * hidden_size);
 
         assert_approx_eq(&actual, &expected, 1e-4);

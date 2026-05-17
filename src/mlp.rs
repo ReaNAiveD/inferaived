@@ -1,6 +1,8 @@
 use safetensors::SafeTensors;
 
-use crate::{log_tensor, mul_mat::MulMatWebgpu, silu_mul::SiluMulInplaceWebgpu};
+use crate::{
+    buffer_view::BufferView, log_tensor, mul_mat::MulMatWebgpu, silu_mul::SiluMulInplaceWebgpu,
+};
 
 pub struct MultiLayerPerceptron {
     intermediate_size: usize,
@@ -37,8 +39,7 @@ impl MultiLayerPerceptron {
             "{} width does not match hidden_size",
             mlp_gate_proj_weight_name
         );
-        let mlp_gate_proj_mul_mat =
-            MulMatWebgpu::new(&device, &queue, mlp_gate_proj_weight);
+        let mlp_gate_proj_mul_mat = MulMatWebgpu::new(&device, &queue, mlp_gate_proj_weight);
         let mlp_up_proj_weight_name = format!("{}.mlp.up_proj.weight", weight_prefix);
         let mlp_up_proj_weight = tensor.tensor(&mlp_up_proj_weight_name).expect(&format!(
             "Failed to get tensor for {}",
@@ -57,8 +58,7 @@ impl MultiLayerPerceptron {
             "{} width does not match hidden_size",
             mlp_up_proj_weight_name
         );
-        let mlp_up_proj_mul_mat =
-            MulMatWebgpu::new(&device, &queue, mlp_up_proj_weight);
+        let mlp_up_proj_mul_mat = MulMatWebgpu::new(&device, &queue, mlp_up_proj_weight);
         let mlp_silu_mul = SiluMulInplaceWebgpu::new(&device, intermediate_size);
         let mlp_down_proj_weight_name = format!("{}.mlp.down_proj.weight", weight_prefix);
         let mlp_down_proj_weight = tensor.tensor(&mlp_down_proj_weight_name).expect(&format!(
@@ -78,8 +78,7 @@ impl MultiLayerPerceptron {
             "{} width does not match intermediate_size",
             mlp_down_proj_weight_name
         );
-        let mlp_down_proj_mul_mat =
-            MulMatWebgpu::new(&device, &queue, mlp_down_proj_weight);
+        let mlp_down_proj_mul_mat = MulMatWebgpu::new(&device, &queue, mlp_down_proj_weight);
         Self {
             intermediate_size,
             mlp_gate_proj_mul_mat,
@@ -89,61 +88,54 @@ impl MultiLayerPerceptron {
         }
     }
 
-    /// Run the SwiGLU MLP block over `num_rows` token rows of
-    /// `input_buffer` (read tight from row 0), writing the output to
-    /// `output_buffer` (also tight from row 0).
+    /// Run the SwiGLU MLP block over `input.row_count` token rows.
     pub fn forward(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        input_buffer: &wgpu::Buffer,
-        output_buffer: &wgpu::Buffer,
-        seq_len: usize,
+        input: BufferView<'_>,
+        output: BufferView<'_>,
     ) {
-        let intermediate_buffer_size =
-            (seq_len * self.intermediate_size * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
+        debug_assert_eq!(
+            input.shape[0], output.shape[0],
+            "mlp: outer dim mismatch (input={}, output={})",
+            input.shape[0], output.shape[0],
+        );
+        let num_rows = input.shape[0];
+        let elem_size = std::mem::size_of::<f32>() as u32;
+        let intermediate_size = self.intermediate_size as u32;
+        let intermediate_total_bytes =
+            (intermediate_size as u64) * (elem_size as u64) * (num_rows as u64);
         let mlp_gate_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mlp/gate_proj_buffer"),
-            size: intermediate_buffer_size,
+            size: intermediate_total_bytes,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let gate_view = BufferView::new_2d_tight(
+            &mlp_gate_proj_buffer,
+            num_rows,
+            intermediate_size,
+            elem_size,
+        );
         let mlp_up_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mlp/up_proj_buffer"),
-            size: intermediate_buffer_size,
+            size: intermediate_total_bytes,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        self.mlp_gate_proj_mul_mat.forward(
-            device,
-            queue,
-            input_buffer,
-            &mlp_gate_proj_buffer,
-            0,
-            0,
-            seq_len,
-        );
+        let up_view =
+            BufferView::new_2d_tight(&mlp_up_proj_buffer, num_rows, intermediate_size, elem_size);
+        self.mlp_gate_proj_mul_mat
+            .forward(device, queue, input, gate_view);
         self.mlp_up_proj_mul_mat
-            .forward(device, queue, input_buffer, &mlp_up_proj_buffer, 0, 0, seq_len);
-        self.mlp_silu_mul.compute(
-            device,
-            queue,
-            &mlp_up_proj_buffer,
-            &mlp_gate_proj_buffer,
-            seq_len,
-        );
-        self.mlp_down_proj_mul_mat.forward(
-            device,
-            queue,
-            &mlp_up_proj_buffer,
-            output_buffer,
-            0,
-            0,
-            seq_len,
-        );
+            .forward(device, queue, input, up_view);
+        self.mlp_silu_mul.forward(device, queue, up_view, gate_view);
+        self.mlp_down_proj_mul_mat
+            .forward(device, queue, up_view, output);
     }
 }

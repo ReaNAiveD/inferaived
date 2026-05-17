@@ -1,10 +1,8 @@
-// In-place compute: hidden[token, head, i] *= sigmoid(gate[token, head, i])
+// In-place: hidden[token, head, i] *= sigmoid(gate[token, head, i])
 struct Params {
-    hidden_offset: u32,
     hidden_token_stride: u32,
     hidden_head_stride: u32,
 
-    gate_offset: u32,
     gate_token_stride: u32,
     gate_head_stride: u32,
 
@@ -21,11 +19,11 @@ var<storage, read> gate: array<f32>;
 var<uniform> params: Params;
 
 fn hidden_index(token: u32, head: u32, i: u32) -> u32 {
-    return params.hidden_offset + token * params.hidden_token_stride + head * params.hidden_head_stride + i;
+    return token * params.hidden_token_stride + head * params.hidden_head_stride + i;
 }
 
 fn gate_index(token: u32, head: u32, i: u32) -> u32 {
-    return params.gate_offset + token * params.gate_token_stride + head * params.gate_head_stride + i;
+    return token * params.gate_token_stride + head * params.gate_head_stride + i;
 }
 
 fn sigmoid(value: f32) -> f32 {

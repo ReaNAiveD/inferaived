@@ -5,14 +5,15 @@ Optimization directions for the Rust orchestration layer (kernels-side TODOs liv
 ## ScratchArena for per-forward scratch buffers
 
 - Every `LayerSession::forward` call still does ~10 `device.create_buffer` (×24 layers ⇒ ~240 buffer creates / token in decode). All of these have the same lifetime: from the start of `forward` to its end.
-- Direction: a bump arena owned by `LayerStackSession`, sized for the worst-case `num_new_tokens`. Reset at the top of each `forward`. Layers borrow sub-buffers instead of allocating.
-- Open question: do we expose sub-buffers as `&wgpu::Buffer` + `(offset, size)` pairs, or as a `BufferView` type (see next item)? The arena's internals likely want to be one big `wgpu::Buffer` with bump-allocated offsets, which composes naturally with `BufferView`.
+- Naive direction (one big `wgpu::Buffer` + bump cursor handing out `BufferView`s) does **not** work under `wgpu`: usage is tracked at whole-buffer granularity, so binding disjoint byte ranges of the same arena buffer as `Storage(read_only=true)` + `Storage(read_only=false)` on the same dispatch is a validation error. See `docs/wgpu-single-buffer-arena.md` for the post-mortem on the prototype that was reverted.
+- Workable direction: `N` separate arena buffers + a graph coloring pass that assigns each scratch tensor to a bucket such that no kernel reads and writes tensors from the same bucket. The dispatch sequence is static, so coloring can be precomputed at session construction. `N=3` is likely enough for our forward.
+- Cheaper alternative: a per-size-class free list of `wgpu::Buffer`s (different buffers ⇒ no usage merge). Easier to ship but weaker memory locality and more API objects.
 
-## `BufferView` for strided / offset access
+## `BufferView` for strided / offset access  *(done — 2025)*
 
-- Primary motivation: `SelfAttentionLayer` projects a fused `q_gate_combined` tensor laid out as `[q_head_0 | gate_head_0 | q_head_1 | gate_head_1 | ...]`. Today we run `SliceCopyWebgpu` to materialize a contiguous q tensor for the attention kernel — a pure shuffle dispatch that produces no new information.
-- Direction: a `BufferView { buffer, offset, byte_stride_per_row, row_count, row_byte_size }` (or similar) that kernels accept in place of `&wgpu::Buffer`. RoPE / attention can then read `q` directly from the interleaved layout via per-head stride, killing the copy entirely.
-- Also unblocks: arena sub-buffers, cleaner partial-row dispatches across the codebase.
+- Implemented as `BufferView { buffer, byte_offset, row_byte_size, byte_stride_per_row, row_count }` in `src/buffer_arena.rs`, with `whole` / `rows` / `strided` constructors and an `as_binding()` that folds the byte offset into a `wgpu::BufferBinding`.
+- All kernels (`norm`, `sigmoid_mul`, `silu_mul`, `binary`, `mul_mat`, `rope`, `attention`) take `BufferView` arguments; offset/length arithmetic moved out of every shader uniform and into one place.
+- Resolution of the original q-extract motivation: `RmsNormInplaceWebgpu` / `RopeInplaceWebgpu` / `CausalGqaNaiveAttentionWebgpu` now take a `q_head_byte_stride: u32` and read Q directly from the fused `q_gate_proj_buffer` via a strided `BufferView`. `SliceCopyWebgpu` and its WGSL shader have been deleted.
 
 ## Load model dims from `config.json`
 
@@ -41,7 +42,7 @@ Optimization directions for the Rust orchestration layer (kernels-side TODOs liv
 
 ## File-structure reorganization
 
-- `src/` is currently flat with ~15 sibling files mixing orchestration (`language_model.rs`, `layer_loop.rs`, `main.rs`) with low-level kernels (`mul_mat.rs`, `norm.rs`, `rope.rs`, `delta_rule.rs`, `conv_silu.rs`, `gated_rms_norm.rs`, `sigmoid_mul.rs`, `slice_copy.rs`, `binary.rs`, `mamba_scan.rs`, …).
+- `src/` is currently flat with ~15 sibling files mixing orchestration (`language_model.rs`, `layer_loop.rs`, `main.rs`) with low-level kernels (`mul_mat.rs`, `norm.rs`, `rope.rs`, `delta_rule.rs`, `conv_silu.rs`, `gated_rms_norm.rs`, `sigmoid_mul.rs`, `binary.rs`, `mamba_scan.rs`, …).
 - Direction: pull kernels into `src/kernels/` (one file per pipeline), keep the top level for model / session / sampler / config. Likely also: `src/layers/` for `linear_attention.rs` + `self_attention.rs` + `layer_stack.rs` + `layer_session.rs` split out from the current `layer_loop.rs`. Best done before the bf16 churn so renames don't collide.
 
 ## Quantization of weights (long term)

@@ -147,7 +147,7 @@ pub fn assert_approx_eq(actual: &[f32], expected: &[f32], tol: f32) {
         let diff = (a - e).abs();
         let rel = if e.abs() > 1e-6 { diff / e.abs() } else { diff };
         assert!(
-            diff < tol || rel < tol,
+            diff <= tol || rel <= tol,
             "Mismatch at index {i}: actual={a} expected={e} (abs_diff={diff}, rel_diff={rel}, tol={tol})"
         );
     }

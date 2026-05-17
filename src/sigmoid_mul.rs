@@ -1,11 +1,11 @@
+use crate::buffer_view::BufferView;
+
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct SigmoidMulParams {
-    hidden_offset: u32,
     hidden_token_stride: u32,
     hidden_head_stride: u32,
 
-    gate_offset: u32,
     gate_token_stride: u32,
     gate_head_stride: u32,
 
@@ -96,28 +96,32 @@ impl SigmoidMulInplaceWebgpu {
         }
     }
 
+    /// In-place: `hidden[t, h, i] *= sigmoid(gate[t, h, i])`.
     pub fn forward(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        hidden_buffer: &wgpu::Buffer,
-        q_gate_combined_buffer: &wgpu::Buffer,
-        num_rows: usize,
+        hidden: BufferView<'_>,
+        gate: BufferView<'_>,
     ) {
-        let head_dim = self.head_dim as u32;
+        debug_assert_eq!(hidden.rank, 3, "sigmoid_mul: hidden must be rank-3");
+        debug_assert_eq!(gate.rank, 3, "sigmoid_mul: gate must be rank-3");
+        debug_assert_eq!(
+            hidden.shape, gate.shape,
+            "sigmoid_mul: hidden and gate shape mismatch (hidden={:?}, gate={:?})",
+            hidden.shape, gate.shape,
+        );
+        debug_assert_eq!(hidden.shape[1] as usize, self.num_heads);
+        debug_assert_eq!(hidden.shape[2] as usize, self.head_dim);
+        let num_rows = hidden.shape[0];
         let uniform = SigmoidMulParams {
-            hidden_offset: 0,
-            hidden_token_stride: (self.num_heads * self.head_dim) as u32,
-            hidden_head_stride: head_dim,
-            // Gate half is at offset `head_dim` within each head; the
-            // head stride is `2 * head_dim` because Q and gate are
-            // interleaved per head.
-            gate_offset: head_dim,
-            gate_token_stride: (self.num_heads * self.head_dim * 2) as u32,
-            gate_head_stride: (self.head_dim * 2) as u32,
+            hidden_token_stride: hidden.stride[0],
+            hidden_head_stride: hidden.stride[1],
+            gate_token_stride: gate.stride[0],
+            gate_head_stride: gate.stride[1],
             num_heads: self.num_heads as u32,
-            head_dim,
-            seq_len: num_rows as u32,
+            head_dim: self.head_dim as u32,
+            seq_len: num_rows,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -126,11 +130,11 @@ impl SigmoidMulInplaceWebgpu {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: hidden_buffer.as_entire_binding(),
+                    resource: hidden.as_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: q_gate_combined_buffer.as_entire_binding(),
+                    resource: gate.as_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -148,7 +152,7 @@ impl SigmoidMulInplaceWebgpu {
             });
             compute_pass.set_pipeline(&self.pipeline);
             compute_pass.set_bind_group(0, &bind_group, &[]);
-            compute_pass.dispatch_workgroups(num_rows as u32, 1, 1);
+            compute_pass.dispatch_workgroups(num_rows, 1, 1);
         }
         queue.submit(Some(encoder.finish()));
     }
@@ -192,7 +196,14 @@ mod tests {
         let (device, queue) = gpu_or_skip!();
         let seq_len = 3;
         let num_heads = 4;
-        let head_dim = 8;
+        // head_dim must be a multiple of `min_storage_buffer_offset_alignment / 4`
+        // (= 64 on typical desktop adapters) because `select(2, 1)` on
+        // the fused [seq, num_heads, 2, head_dim] view produces a
+        // BufferBinding starting at `head_dim * 4` bytes, which wgpu
+        // requires be a multiple of `min_storage_buffer_offset_alignment`.
+        // Real Qwen3 uses head_dim=256, which is aligned; the test
+        // matches that constraint.
+        let head_dim = 64;
         let hidden_size = num_heads * head_dim;
         let q_gate_size = num_heads * head_dim * 2;
         let hidden: Vec<f32> = (0..seq_len * hidden_size)
@@ -208,7 +219,29 @@ mod tests {
         let gpu = SigmoidMulInplaceWebgpu::new(&device, num_heads, head_dim);
         let h_buf = upload_f32(&device, &hidden);
         let g_buf = upload_f32(&device, &q_gate);
-        gpu.forward(&device, &queue, &h_buf, &g_buf, seq_len);
+        let sz = std::mem::size_of::<f32>() as u32;
+        // Hidden is tight [seq, num_heads, head_dim].
+        let h_view = BufferView::new_3d_tight(
+            &h_buf,
+            seq_len as u32,
+            num_heads as u32,
+            head_dim as u32,
+            sz,
+        );
+        // q_gate is the fused [seq, num_heads, 2, head_dim] layout.
+        // Selecting index 1 along the q/gate axis hands the kernel a
+        // rank-3 view of just the gate halves, with stride information
+        // baked into the view (per-head stride = 2 * head_dim * 4).
+        let g_view = BufferView::new_4d_tight(
+            &g_buf,
+            seq_len as u32,
+            num_heads as u32,
+            2,
+            head_dim as u32,
+            sz,
+        )
+        .select(2, 1);
+        gpu.forward(&device, &queue, h_view, g_view);
         let actual = download_f32(&device, &queue, &h_buf, seq_len * hidden_size);
 
         assert_approx_eq(&actual, &expected, 1e-5);

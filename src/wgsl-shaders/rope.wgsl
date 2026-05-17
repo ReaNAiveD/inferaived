@@ -1,17 +1,8 @@
 // Half-split (HF / Llama style) RoPE applied in-place to Q and K.
-//
-// Q and K live in distinct buffers with potentially different head counts
-// (GQA: num_q_heads >= num_k_heads). Each thread handles one (token, head, pair)
-// triple and rotates Q if `head < num_q_heads` and/or K if `head < num_k_heads`.
-//
-// Position layout is 1D (`token + position_offset`). 3D MRoPE is not yet
-// supported and is bit-exact equivalent to 1D for text-only inputs.
 
 struct Params {
-    q_offset: u32,
     q_token_stride: u32,
     q_head_stride: u32,
-    k_offset: u32,
     k_token_stride: u32,
     k_head_stride: u32,
 
@@ -32,11 +23,11 @@ var<storage, read_write> k: array<f32>;
 var<uniform> params: Params;
 
 fn q_index(token: u32, head: u32, i: u32) -> u32 {
-    return params.q_offset + token * params.q_token_stride + head * params.q_head_stride + i;
+    return token * params.q_token_stride + head * params.q_head_stride + i;
 }
 
 fn k_index(token: u32, head: u32, i: u32) -> u32 {
-    return params.k_offset + token * params.k_token_stride + head * params.k_head_stride + i;
+    return token * params.k_token_stride + head * params.k_head_stride + i;
 }
 
 @compute @workgroup_size(256)

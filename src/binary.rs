@@ -1,9 +1,9 @@
+use crate::buffer_view::BufferView;
+
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct ElementwiseAddParams {
-    hidden_offset: u32,
     hidden_token_stride: u32,
-    addend_offset: u32,
     addend_token_stride: u32,
 
     hidden_size: u32,
@@ -91,26 +91,25 @@ impl ElementwiseAddInplaceWebgpu {
         }
     }
 
-    /// Add `num_rows` rows of `other_buffer` (starting at row
-    /// `other_start_row`) onto `src_buffer` (starting at row
-    /// `src_start_row`), in place.
+    /// Add `addend` onto `hidden`, in place.
     pub fn forward(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        src_buffer: &wgpu::Buffer,
-        other_buffer: &wgpu::Buffer,
-        src_start_row: usize,
-        other_start_row: usize,
-        num_rows: usize,
+        hidden: BufferView<'_>,
+        addend: BufferView<'_>,
     ) {
+        debug_assert_eq!(
+            hidden.shape[0], addend.shape[0],
+            "elementwise_add: outer dim mismatch (hidden={}, addend={})",
+            hidden.shape[0], addend.shape[0],
+        );
+        let num_rows = hidden.shape[0];
         let uniform = ElementwiseAddParams {
-            hidden_offset: (src_start_row * self.vec_dim) as u32,
-            hidden_token_stride: self.vec_dim as u32,
-            addend_offset: (other_start_row * self.vec_dim) as u32,
-            addend_token_stride: self.vec_dim as u32,
+            hidden_token_stride: hidden.stride[0],
+            addend_token_stride: addend.stride[0],
             hidden_size: self.vec_dim as u32,
-            seq_len: num_rows as u32,
+            seq_len: num_rows,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -119,11 +118,11 @@ impl ElementwiseAddInplaceWebgpu {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: src_buffer.as_entire_binding(),
+                    resource: hidden.as_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: other_buffer.as_entire_binding(),
+                    resource: addend.as_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -141,7 +140,7 @@ impl ElementwiseAddInplaceWebgpu {
             });
             cpass.set_pipeline(&self.pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
-            cpass.dispatch_workgroups(num_rows as u32, 1, 1);
+            cpass.dispatch_workgroups(num_rows, 1, 1);
         }
         queue.submit(Some(encoder.finish()));
     }
@@ -179,7 +178,10 @@ mod tests {
         let gpu = ElementwiseAddInplaceWebgpu::new(&device, hidden_size);
         let h_buf = upload_f32(&device, &hidden);
         let a_buf = upload_f32(&device, &addend);
-        gpu.forward(&device, &queue, &h_buf, &a_buf, 0, 0, seq_len);
+        let elem_size = std::mem::size_of::<f32>() as u32;
+        let h_view = BufferView::new_2d_tight(&h_buf, seq_len as u32, hidden_size as u32, elem_size);
+        let a_view = BufferView::new_2d_tight(&a_buf, seq_len as u32, hidden_size as u32, elem_size);
+        gpu.forward(&device, &queue, h_view, a_view);
         let actual = download_f32(&device, &queue, &h_buf, seq_len * hidden_size);
 
         assert_approx_eq(&actual, &expected, 1e-5);

@@ -37,8 +37,7 @@ impl MulMatWebgpu {
     pub const WORKGROUP_SIZE_M: usize = 8;
     pub const WORKGROUP_SIZE_N: usize = 4;
     pub const WORKGROUP_SIZE_VEC: usize = 256;
-    // Decode-tuned GEMV: number of output rows per workgroup (matches the
-    // ROWS_PER_WG const in mul_mat_vec_decode.wgsl; update both if changed).
+    // Must match ROWS_PER_WG in mul_mat_vec_decode.wgsl.
     pub const ROWS_PER_WG_DECODE: usize = 4;
     pub const WORKGROUP_SIZE_DECODE: usize = 128;
 
@@ -143,8 +142,7 @@ impl MulMatWebgpu {
             },
             cache: None,
         });
-        // Decode-tuned GEMV pipeline: only created when the device exposes
-        // Features::SUBGROUP (required for `enable subgroups;` in WGSL).
+        // Created only when the device exposes Features::SUBGROUP.
         let pipeline_decode = if device
             .features()
             .contains(wgpu::Features::SUBGROUP)
@@ -238,8 +236,6 @@ impl MulMatWebgpu {
             input_row_stride: input.stride[0],
         };
         let (pipeline, workgroup_count, variant) = if num_rows == 1 {
-            // matvec: use the decode-tuned pipeline when available (subgroup
-            // support present), otherwise fall back to the plain vec pipeline.
             if let Some(ref p) = self.pipeline_decode {
                 let wg_count = (self.m_dim + Self::ROWS_PER_WG_DECODE - 1)
                     / Self::ROWS_PER_WG_DECODE;

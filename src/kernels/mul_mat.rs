@@ -20,6 +20,9 @@ pub struct MulMatWebgpu {
     // Decode-optimised GEMV pipeline (N == 1 only).  Present when the device
     // supports wgpu::Features::SUBGROUP.  Supersedes pipeline_vec when set.
     pipeline_decode: Option<wgpu::ComputePipeline>,
+    // Subgroup-optimised dense GEMM pipeline (N > 1).  Present when the device
+    // supports wgpu::Features::SUBGROUP.  Supersedes pipeline_reg_tile when set.
+    pipeline_reg_tile_subgroup: Option<wgpu::ComputePipeline>,
     uniform_buffer: wgpu::Buffer,
     mat_src0_buffer: wgpu::Buffer,
     m_dim: usize,
@@ -40,6 +43,12 @@ impl MulMatWebgpu {
     // Must match ROWS_PER_WG in mul_mat_vec_decode.wgsl.
     pub const ROWS_PER_WG_DECODE: usize = 4;
     pub const WORKGROUP_SIZE_DECODE: usize = 128;
+    // Must match ROWS_PER_WG / COLS_PER_WG in
+    // mul_mat_reg_tile_subgroup.wgsl.  ROWS_PER_WG_REG_SG *
+    // COLS_PER_WG_REG_SG must be <= WORKGROUP_SIZE_REG_SG.
+    pub const ROWS_PER_WG_REG_SG: usize = 4;
+    pub const COLS_PER_WG_REG_SG: usize = 4;
+    pub const WORKGROUP_SIZE_REG_SG: usize = 64;
 
     pub fn new<'data>(
         device: &wgpu::Device,
@@ -170,6 +179,35 @@ impl MulMatWebgpu {
         } else {
             None
         };
+        // Subgroup-optimised dense GEMM (N > 1).  Created only when the
+        // device exposes Features::SUBGROUP.
+        let pipeline_reg_tile_subgroup = if device
+            .features()
+            .contains(wgpu::Features::SUBGROUP)
+        {
+            let reg_tile_sg_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("mul_mat/reg_tile_subgroup_shader"),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
+                    "wgsl-shaders/mul_mat_reg_tile_subgroup.wgsl"
+                ))),
+            });
+            Some(device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("mul_mat/pipeline_reg_tile_subgroup"),
+                layout: Some(&pipeline_layout),
+                module: &reg_tile_sg_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &[(
+                        "workgroup_size",
+                        Self::WORKGROUP_SIZE_REG_SG as f64,
+                    )],
+                    zero_initialize_workgroup_memory: true,
+                },
+                cache: None,
+            }))
+        } else {
+            None
+        };
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mul_mat/uniform_buffer"),
             size: std::mem::size_of::<MulMatParams>() as u64,
@@ -203,6 +241,7 @@ impl MulMatWebgpu {
             pipeline_reg_tile,
             pipeline_vec,
             pipeline_decode,
+            pipeline_reg_tile_subgroup,
             uniform_buffer,
             mat_src0_buffer,
             m_dim,
@@ -243,6 +282,12 @@ impl MulMatWebgpu {
             } else {
                 (&self.pipeline_vec, self.m_dim as u32, "vec")
             }
+        } else if let Some(ref p) = self.pipeline_reg_tile_subgroup {
+            let wg_num_m =
+                (self.m_dim + Self::ROWS_PER_WG_REG_SG - 1) / Self::ROWS_PER_WG_REG_SG;
+            let wg_num_n =
+                (num_rows as usize + Self::COLS_PER_WG_REG_SG - 1) / Self::COLS_PER_WG_REG_SG;
+            (p, (wg_num_m * wg_num_n) as u32, "reg_tile_subgroup")
         } else {
             let wg_num_m = (self.m_dim + Self::WORKGROUP_SIZE_M * Self::TILE_M - 1)
                 / (Self::WORKGROUP_SIZE_M * Self::TILE_M);
@@ -693,6 +738,180 @@ mod tests {
         let (device, queue) = subgroup_or_skip!();
         let m = 128; // keep small so the test runs quickly; K exercises the tiles
         let n = 1;
+        let k = 3584;
+
+        let weight_f32: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.003).sin()).collect();
+        let weight_packed = pack_f32_to_bf16_u32(&weight_f32);
+        let weight_bf16_bytes: Vec<u8> = weight_f32
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+        let input: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.007).cos()).collect();
+
+        let expected = cpu_mul_mat(&weight_packed, &input, m, n, k);
+
+        let tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::BF16,
+            vec![m, k],
+            &weight_bf16_bytes,
+        )
+        .unwrap();
+        let gpu = MulMatWebgpu::new(&device, &queue, tv);
+        let in_buf = upload_f32(&device, &input);
+        let out_buf = create_f32_buffer(&device, n * m);
+        let sz = std::mem::size_of::<f32>() as u32;
+        gpu.forward(
+            &device,
+            &queue,
+            BufferView::new_2d_tight(&in_buf, n as u32, k as u32, sz),
+            BufferView::new_2d_tight(&out_buf, n as u32, m as u32, sz),
+        );
+        let actual = download_f32(&device, &queue, &out_buf, n * m);
+
+        assert_approx_eq(&actual, &expected, 1e-2);
+    }
+
+    // ── Subgroup reg-tile pipeline tests ───────────────────────────────────
+    // These tests require a device with Features::SUBGROUP enabled; they are
+    // skipped if the adapter does not expose that feature.
+
+    /// Typical prefill workload: M = 320, K = 512, N = 8.  Validates the
+    /// subgroup reg-tile pipeline matches the CPU reference.
+    #[tokio::test]
+    async fn test_mul_mat_reg_tile_subgroup_basic() {
+        let (device, queue) = subgroup_or_skip!();
+        let m = 320;
+        let n = 8;
+        let k = 512;
+
+        let weight_f32: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.013).sin()).collect();
+        let weight_packed = pack_f32_to_bf16_u32(&weight_f32);
+        let weight_bf16_bytes: Vec<u8> = weight_f32
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+        let input: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.021).cos()).collect();
+
+        let expected = cpu_mul_mat(&weight_packed, &input, m, n, k);
+
+        let tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::BF16,
+            vec![m, k],
+            &weight_bf16_bytes,
+        )
+        .unwrap();
+        let gpu = MulMatWebgpu::new(&device, &queue, tv);
+
+        // The subgroup reg-tile pipeline should be present when SUBGROUP is enabled.
+        assert!(
+            gpu.pipeline_reg_tile_subgroup.is_some(),
+            "pipeline_reg_tile_subgroup should be Some when SUBGROUP feature is available"
+        );
+
+        let in_buf = upload_f32(&device, &input);
+        let out_buf = create_f32_buffer(&device, n * m);
+        let sz = std::mem::size_of::<f32>() as u32;
+        gpu.forward(
+            &device,
+            &queue,
+            BufferView::new_2d_tight(&in_buf, n as u32, k as u32, sz),
+            BufferView::new_2d_tight(&out_buf, n as u32, m as u32, sz),
+        );
+        let actual = download_f32(&device, &queue, &out_buf, n * m);
+
+        assert_approx_eq(&actual, &expected, 1e-2);
+    }
+
+    /// Subgroup reg-tile pipeline with M and N both not multiples of the
+    /// per-workgroup tile (4 × 4), exercising the partial-tile guards
+    /// (global_row < params.m && global_col < params.n).
+    #[tokio::test]
+    async fn test_mul_mat_reg_tile_subgroup_non_multiple_mn() {
+        let (device, queue) = subgroup_or_skip!();
+        let m = 13; // not a multiple of ROWS_PER_WG_REG_SG (4)
+        let n = 7; // not a multiple of COLS_PER_WG_REG_SG (4)
+        let k = 64;
+
+        let weight_f32: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.031).sin()).collect();
+        let weight_packed = pack_f32_to_bf16_u32(&weight_f32);
+        let weight_bf16_bytes: Vec<u8> = weight_f32
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+        let input: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.047).cos()).collect();
+
+        let expected = cpu_mul_mat(&weight_packed, &input, m, n, k);
+
+        let tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::BF16,
+            vec![m, k],
+            &weight_bf16_bytes,
+        )
+        .unwrap();
+        let gpu = MulMatWebgpu::new(&device, &queue, tv);
+        let in_buf = upload_f32(&device, &input);
+        let out_buf = create_f32_buffer(&device, n * m);
+        let sz = std::mem::size_of::<f32>() as u32;
+        gpu.forward(
+            &device,
+            &queue,
+            BufferView::new_2d_tight(&in_buf, n as u32, k as u32, sz),
+            BufferView::new_2d_tight(&out_buf, n as u32, m as u32, sz),
+        );
+        let actual = download_f32(&device, &queue, &out_buf, n * m);
+
+        assert_approx_eq(&actual, &expected, 1e-2);
+    }
+
+    /// Subgroup reg-tile pipeline with odd K (the last u32 word's hi bf16
+    /// lane is zero-masked by the `k1 < params.k` guard on the input side
+    /// and the zero-pad on the weight side).
+    #[tokio::test]
+    async fn test_mul_mat_reg_tile_subgroup_odd_k() {
+        let (device, queue) = subgroup_or_skip!();
+        let m = 8;
+        let n = 3;
+        let k = 13; // odd — exercises the k%2 edge case
+
+        let weight_f32: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.041).sin()).collect();
+        let weight_packed = pack_f32_to_bf16_u32(&weight_f32);
+        let weight_bf16_bytes: Vec<u8> = weight_f32
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+        let input: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.037).cos()).collect();
+
+        let expected = cpu_mul_mat(&weight_packed, &input, m, n, k);
+
+        let tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::BF16,
+            vec![m, k],
+            &weight_bf16_bytes,
+        )
+        .unwrap();
+        let gpu = MulMatWebgpu::new(&device, &queue, tv);
+        let in_buf = upload_f32(&device, &input);
+        let out_buf = create_f32_buffer(&device, n * m);
+        let sz = std::mem::size_of::<f32>() as u32;
+        gpu.forward(
+            &device,
+            &queue,
+            BufferView::new_2d_tight(&in_buf, n as u32, k as u32, sz),
+            BufferView::new_2d_tight(&out_buf, n as u32, m as u32, sz),
+        );
+        let actual = download_f32(&device, &queue, &out_buf, n * m);
+
+        assert_approx_eq(&actual, &expected, 1e-2);
+    }
+
+    /// Subgroup reg-tile pipeline with model-realistic dims (large K
+    /// exercises multiple K-tile iterations and the cross-subgroup
+    /// reduction).
+    #[tokio::test]
+    async fn test_mul_mat_reg_tile_subgroup_large() {
+        let (device, queue) = subgroup_or_skip!();
+        let m = 128;
+        let n = 16;
         let k = 3584;
 
         let weight_f32: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.003).sin()).collect();

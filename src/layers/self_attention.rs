@@ -220,6 +220,7 @@ impl SelfAttentionLayer {
         prev_position: usize,
         k_cache_view: BufferView<'_>,
         v_cache_view: BufferView<'_>,
+        position_buffer: &wgpu::Buffer,
     ) {
         let num_new_tokens = residual_slot.shape[0] as usize;
         debug_assert!(
@@ -233,8 +234,14 @@ impl SelfAttentionLayer {
         let num_new_u32 = num_new_tokens as u32;
         let hidden_size = self.hidden_size as u32;
         let kv_prefix_rows = (prev_position + num_new_tokens) as u32;
-        debug_assert_eq!(k_cache_view.rank, 3, "self_attention: k_cache must be rank-3");
-        debug_assert_eq!(v_cache_view.rank, 3, "self_attention: v_cache must be rank-3");
+        debug_assert_eq!(
+            k_cache_view.rank, 3,
+            "self_attention: k_cache must be rank-3"
+        );
+        debug_assert_eq!(
+            v_cache_view.rank, 3,
+            "self_attention: v_cache must be rank-3"
+        );
         debug_assert_eq!(
             k_cache_view.shape[0], v_cache_view.shape[0],
             "self_attention: k/v cache max_seq mismatch (k={}, v={})",
@@ -263,7 +270,8 @@ impl SelfAttentionLayer {
         debug_assert!(
             kv_prefix_rows <= k_cache_view.shape[0],
             "self_attention: prev_position+num_new ({}) exceeds k_cache max_seq ({})",
-            kv_prefix_rows, k_cache_view.shape[0],
+            kv_prefix_rows,
+            k_cache_view.shape[0],
         );
 
         let normed_embedding_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -352,7 +360,7 @@ impl SelfAttentionLayer {
         self.q_norm.forward(device, queue, q_heads_flat_view);
         self.k_norm.forward(device, queue, k_new_heads);
         self.rope
-            .forward(device, queue, q_view, k_new, prev_position);
+            .forward(device, queue, q_view, k_new, position_buffer);
         self.gqa_attention.forward(
             device,
             queue,
@@ -360,7 +368,7 @@ impl SelfAttentionLayer {
             k_full_prefix,
             v_full_prefix,
             attn_out_view,
-            prev_position,
+            position_buffer,
         );
         self.sigmoid_mul
             .forward(device, queue, attn_out_view, gate_view);
@@ -380,6 +388,7 @@ pub struct SelfAttentionLayerSession<'m> {
     layer: &'m SelfAttentionLayer,
     k_cache_buffer: wgpu::Buffer,
     v_cache_buffer: wgpu::Buffer,
+    position_buffer: wgpu::Buffer,
 }
 
 impl<'m> SelfAttentionLayerSession<'m> {
@@ -408,6 +417,12 @@ impl<'m> SelfAttentionLayerSession<'m> {
             layer,
             k_cache_buffer,
             v_cache_buffer,
+            position_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("self_attention_layer/session/position_buffer"),
+                size: std::mem::size_of::<u32>() as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
         }
     }
 }
@@ -439,6 +454,8 @@ impl<'m> LayerSession for SelfAttentionLayerSession<'m> {
             self.layer.head_dim as u32,
             sz,
         );
+        let pos = prev_position as u32;
+        queue.write_buffer(&self.position_buffer, 0, bytemuck::bytes_of(&pos));
         self.layer.forward(
             device,
             queue,
@@ -446,6 +463,7 @@ impl<'m> LayerSession for SelfAttentionLayerSession<'m> {
             prev_position,
             k_cache_view,
             v_cache_view,
+            &self.position_buffer,
         );
     }
 }

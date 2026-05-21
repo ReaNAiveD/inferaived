@@ -1,5 +1,5 @@
 // Causal Grouped-Query Attention. One workgroup per (q_token, q_head); each Q
-// dots against all K up to its global position (q_token + q_token_offset),
+// dots against all K up to its global position (q_token + q_position_offset),
 // 3-pass safe softmax over kv_seq_len, then weighted sum of V. GQA index:
 // kv_head = q_head / (num_q_heads / num_kv_heads). No KV cache management.
 struct Params {
@@ -17,8 +17,6 @@ struct Params {
     q_dim: u32,
     v_dim: u32,
     seq_len: u32,
-
-    q_position_offset: u32,
 }
 
 @group(0) @binding(0)
@@ -32,6 +30,9 @@ var<storage, read_write> output: array<f32>;
 
 @group(0) @binding(4)
 var<uniform> params: Params;
+
+@group(0) @binding(5)
+var<uniform> q_position_offset: u32;
 
 fn get_q(token: u32, head: u32, in_head_index: u32) -> f32 {
     return q[in_head_index + head * params.q_head_stride + token * params.q_token_stride];
@@ -80,7 +81,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
     let kv_head = q_head / num_q_per_kv;
     let softmax_scale = inverseSqrt(f32(params.q_dim));
     // Absolute KV position this Q can attend up to (inclusive).
-    let k_token_max = q_token + params.q_position_offset;
+    let k_token_max = q_token + q_position_offset;
 
     // Scan max
     var max_score: f32 = -1e30;

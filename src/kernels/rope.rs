@@ -14,7 +14,6 @@ pub struct RopeParams {
     num_rotated_dims: u32,
 
     theta_scale: f32,
-    position_offset: u32,
 }
 
 pub struct RopeInplaceWebgpu {
@@ -78,6 +77,16 @@ impl RopeInplaceWebgpu {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -120,7 +129,7 @@ impl RopeInplaceWebgpu {
         queue: &wgpu::Queue,
         q: BufferView<'_>,
         k: BufferView<'_>,
-        position_offset: usize,
+        position_buffer: &wgpu::Buffer,
     ) {
         debug_assert_eq!(
             q.rank, 3,
@@ -167,7 +176,6 @@ impl RopeInplaceWebgpu {
             seq_len: num_new_tokens,
             num_rotated_dims: self.num_rotated_dims as u32,
             theta_scale: self.theta_scale,
-            position_offset: position_offset as u32,
         };
         queue.write_buffer(
             &self.uniform_buffer,
@@ -189,6 +197,10 @@ impl RopeInplaceWebgpu {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: self.uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: position_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -217,6 +229,17 @@ impl RopeInplaceWebgpu {
 mod tests {
     use super::*;
     use crate::gpu_test_utils::*;
+
+    fn make_position_buffer(device: &wgpu::Device, queue: &wgpu::Queue, pos: u32) -> wgpu::Buffer {
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rope_test/position_buffer"),
+            size: std::mem::size_of::<u32>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buffer, 0, bytemuck::bytes_of(&pos));
+        buffer
+    }
 
     /// CPU reference for half-split RoPE
     fn cpu_rope(
@@ -323,7 +346,8 @@ mod tests {
             head_dim as u32,
             std::mem::size_of::<f32>() as u32,
         );
-        gpu.forward(&device, &queue, q_view, k_view, 0);
+        let position_buffer = make_position_buffer(&device, &queue, 0);
+        gpu.forward(&device, &queue, q_view, k_view, &position_buffer);
         let actual_q = download_f32(&device, &queue, &q_buf, seq_len * num_q_heads * head_dim);
         let actual_k = download_f32(&device, &queue, &k_buf, seq_len * num_k_heads * head_dim);
 

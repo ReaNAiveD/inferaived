@@ -12,7 +12,6 @@ struct Params {
     num_rotated_dims: u32,
 
     theta_scale: f32,
-    position_offset: u32,
 }
 
 @group(0) @binding(0)
@@ -21,6 +20,9 @@ var<storage, read_write> q: array<f32>;
 var<storage, read_write> k: array<f32>;
 @group(0) @binding(2)
 var<uniform> params: Params;
+
+@group(0) @binding(3)
+var<uniform> position_offset: u32;
 
 fn q_index(token: u32, head: u32, i: u32) -> u32 {
     return token * params.q_token_stride + head * params.q_head_stride + i;
@@ -41,7 +43,7 @@ fn rope(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let head = (global_id.x % (pair_offset * max_heads)) / pair_offset;
     let pair = global_id.x % pair_offset;
 
-    let pos = token + params.position_offset;
+    let pos = token + position_offset;
     let theta = f32(pos) * pow(params.theta_scale, f32(pair));
     let cos_theta = cos(theta);
     let sin_theta = sin(theta);

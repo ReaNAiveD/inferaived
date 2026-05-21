@@ -2,6 +2,8 @@ use bytemuck;
 use safetensors::tensor::TensorView;
 use wgpu::util::DeviceExt;
 
+use crate::buffer_view::BufferView;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ConvSiluParams {
@@ -173,27 +175,60 @@ impl ConvSiluWebgpu {
         }
     }
 
-    /// Run depthwise causal conv1d + SiLU over `num_rows` token rows of
-    /// `src_buffer` (read tight from row 0), writing the activated
-    /// outputs to `dst_buffer` (also tight from row 0).
+    /// Run depthwise causal conv1d + SiLU over `src.shape[0]` token
+    /// rows of `src`, writing the activated outputs to `dst`. `state`
+    /// is the rolling conv-window cache of size
+    /// `(kernel_size - 1) * num_channels` f32 elements, treated as
+    /// tight `[K - 1, num_channels]` internally.
     pub fn forward(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        src_buffer: &wgpu::Buffer,
-        dst_buffer: &wgpu::Buffer,
-        state_buffer: &wgpu::Buffer,
-        seq_len: usize,
+        src: BufferView<'_>,
+        dst: BufferView<'_>,
+        state: BufferView<'_>,
     ) {
         let num_channels = self.q_dim + self.k_dim + self.v_dim;
+        let sz = std::mem::size_of::<f32>() as u32;
+        debug_assert_eq!(src.rank, 2, "conv_silu: src must be rank-2");
+        debug_assert_eq!(dst.rank, 2, "conv_silu: dst must be rank-2");
+        debug_assert_eq!(src.elem_size, sz, "conv_silu: src must be f32");
+        debug_assert_eq!(dst.elem_size, sz, "conv_silu: dst must be f32");
+        debug_assert_eq!(state.elem_size, sz, "conv_silu: state must be f32");
+        debug_assert_eq!(
+            src.shape[0], dst.shape[0],
+            "conv_silu: src/dst seq_len mismatch (src={}, dst={})",
+            src.shape[0], dst.shape[0],
+        );
+        debug_assert_eq!(
+            src.shape[1] as usize, num_channels,
+            "conv_silu: src inner dim ({}) must equal q+k+v_dim ({})",
+            src.shape[1], num_channels,
+        );
+        debug_assert_eq!(
+            dst.shape[1] as usize, num_channels,
+            "conv_silu: dst inner dim ({}) must equal q+k+v_dim ({})",
+            dst.shape[1], num_channels,
+        );
+        debug_assert_eq!(
+            src.stride[1], 1,
+            "conv_silu: src must be channel-contiguous (stride[1]={})",
+            src.stride[1],
+        );
+        debug_assert_eq!(
+            dst.stride[1], 1,
+            "conv_silu: dst must be channel-contiguous (stride[1]={})",
+            dst.stride[1],
+        );
+        let seq_len = src.shape[0] as usize;
         let params = ConvSiluParams {
             q_dim: self.q_dim as u32,
             k_dim: self.k_dim as u32,
             v_dim: self.v_dim as u32,
             seq_len: seq_len as u32,
             kernel_size: self.kernel_size as u32,
-            input_token_stride: num_channels as u32,
-            output_token_stride: num_channels as u32,
+            input_token_stride: src.stride[0],
+            output_token_stride: dst.stride[0],
             state_token_stride: num_channels as u32,
             q_apply_conv: self.q_mode as u32,
             k_apply_conv: self.k_mode as u32,
@@ -206,7 +241,7 @@ impl ConvSiluWebgpu {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: src_buffer.as_entire_binding(),
+                    resource: src.as_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -214,11 +249,11 @@ impl ConvSiluWebgpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: dst_buffer.as_entire_binding(),
+                    resource: dst.as_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: state_buffer.as_entire_binding(),
+                    resource: state.as_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -390,7 +425,12 @@ mod tests {
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, seq_len * nc);
         let state_buf = create_f32_buffer(&device, gpu.conv_state_size());
-        gpu.forward(&device, &queue, &in_buf, &out_buf, &state_buf, seq_len);
+        let sz = std::mem::size_of::<f32>() as u32;
+        let src_view = BufferView::new_2d_tight(&in_buf, seq_len as u32, nc as u32, sz);
+        let dst_view = BufferView::new_2d_tight(&out_buf, seq_len as u32, nc as u32, sz);
+        let state_view =
+            BufferView::new_1d(&state_buf, sz, gpu.conv_state_size() as u32);
+        gpu.forward(&device, &queue, src_view, dst_view, state_view);
         let actual = download_f32(&device, &queue, &out_buf, seq_len * nc);
 
         assert_approx_eq(&actual, &expected, 1e-2);

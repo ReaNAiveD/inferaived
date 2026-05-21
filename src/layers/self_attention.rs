@@ -218,8 +218,8 @@ impl SelfAttentionLayer {
         queue: &wgpu::Queue,
         residual_slot: BufferView<'_>,
         prev_position: usize,
-        k_cache_buffer: &wgpu::Buffer,
-        v_cache_buffer: &wgpu::Buffer,
+        k_cache_view: BufferView<'_>,
+        v_cache_view: BufferView<'_>,
     ) {
         let num_new_tokens = residual_slot.shape[0] as usize;
         debug_assert!(
@@ -232,8 +232,39 @@ impl SelfAttentionLayer {
         let sz = std::mem::size_of::<f32>() as u32;
         let num_new_u32 = num_new_tokens as u32;
         let hidden_size = self.hidden_size as u32;
-        let kv_dim = self.num_key_value_heads * self.head_dim;
         let kv_prefix_rows = (prev_position + num_new_tokens) as u32;
+        debug_assert_eq!(k_cache_view.rank, 3, "self_attention: k_cache must be rank-3");
+        debug_assert_eq!(v_cache_view.rank, 3, "self_attention: v_cache must be rank-3");
+        debug_assert_eq!(
+            k_cache_view.shape[0], v_cache_view.shape[0],
+            "self_attention: k/v cache max_seq mismatch (k={}, v={})",
+            k_cache_view.shape[0], v_cache_view.shape[0],
+        );
+        debug_assert_eq!(
+            k_cache_view.shape[1] as usize, self.num_key_value_heads,
+            "self_attention: k_cache shape[1] ({}) must equal num_key_value_heads ({})",
+            k_cache_view.shape[1], self.num_key_value_heads,
+        );
+        debug_assert_eq!(
+            v_cache_view.shape[1] as usize, self.num_key_value_heads,
+            "self_attention: v_cache shape[1] ({}) must equal num_key_value_heads ({})",
+            v_cache_view.shape[1], self.num_key_value_heads,
+        );
+        debug_assert_eq!(
+            k_cache_view.shape[2] as usize, self.head_dim,
+            "self_attention: k_cache shape[2] ({}) must equal head_dim ({})",
+            k_cache_view.shape[2], self.head_dim,
+        );
+        debug_assert_eq!(
+            v_cache_view.shape[2] as usize, self.head_dim,
+            "self_attention: v_cache shape[2] ({}) must equal head_dim ({})",
+            v_cache_view.shape[2], self.head_dim,
+        );
+        debug_assert!(
+            kv_prefix_rows <= k_cache_view.shape[0],
+            "self_attention: prev_position+num_new ({}) exceeds k_cache max_seq ({})",
+            kv_prefix_rows, k_cache_view.shape[0],
+        );
 
         let normed_embedding_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("self_attention_layer/normed_embedding_buffer"),
@@ -303,23 +334,6 @@ impl SelfAttentionLayer {
         let mlp_out_view =
             BufferView::new_2d_tight(&mlp_output_buffer, num_new_u32, hidden_size, sz);
 
-        let max_seq_in_cache = (k_cache_buffer.size()
-            / (kv_dim as wgpu::BufferAddress * sz as wgpu::BufferAddress))
-            as u32;
-        let k_cache_view = BufferView::new_3d_tight(
-            k_cache_buffer,
-            max_seq_in_cache,
-            self.num_key_value_heads as u32,
-            self.head_dim as u32,
-            sz,
-        );
-        let v_cache_view = BufferView::new_3d_tight(
-            v_cache_buffer,
-            max_seq_in_cache,
-            self.num_key_value_heads as u32,
-            self.head_dim as u32,
-            sz,
-        );
         let k_new = k_cache_view.narrow(0, prev_position as u32, num_new_u32);
         let v_new = v_cache_view.narrow(0, prev_position as u32, num_new_u32);
         let k_full_prefix = k_cache_view.narrow(0, 0, kv_prefix_rows);
@@ -406,13 +420,32 @@ impl<'m> LayerSession for SelfAttentionLayerSession<'m> {
         residual_slot: BufferView<'_>,
         prev_position: usize,
     ) {
+        let sz = std::mem::size_of::<f32>() as u32;
+        let kv_dim = self.layer.num_key_value_heads * self.layer.head_dim;
+        let max_seq_in_cache = (self.k_cache_buffer.size()
+            / (kv_dim as wgpu::BufferAddress * sz as wgpu::BufferAddress))
+            as u32;
+        let k_cache_view = BufferView::new_3d_tight(
+            &self.k_cache_buffer,
+            max_seq_in_cache,
+            self.layer.num_key_value_heads as u32,
+            self.layer.head_dim as u32,
+            sz,
+        );
+        let v_cache_view = BufferView::new_3d_tight(
+            &self.v_cache_buffer,
+            max_seq_in_cache,
+            self.layer.num_key_value_heads as u32,
+            self.layer.head_dim as u32,
+            sz,
+        );
         self.layer.forward(
             device,
             queue,
             residual_slot,
             prev_position,
-            &self.k_cache_buffer,
-            &self.v_cache_buffer,
+            k_cache_view,
+            v_cache_view,
         );
     }
 }

@@ -2,6 +2,8 @@ use half::bf16;
 use safetensors::tensor::TensorView;
 use wgpu::util::DeviceExt;
 
+use crate::buffer_view::BufferView;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DeltaRuleParams {
@@ -199,38 +201,117 @@ impl DeltaRuleWebgpu {
         }
     }
 
-    /// Run the gated-delta-rule SSM over `num_rows` token rows of the
-    /// QKV / projection buffers (all read tight from row 0).
+    /// Run the gated-delta-rule SSM over `qkv.shape[0]` token rows of
+    /// `qkv` / `proj_a` / `proj_b`, writing the per-head attention
+    /// output to `dst`. `state` is the per-session recurrent KV memory
+    /// of size `num_key_heads * key_head_dim * value_head_dim` f32
+    /// elements, treated as tight
+    /// `[num_key_heads, key_head_dim, value_head_dim]` internally.
     pub fn forward(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        qkv_buffer: &wgpu::Buffer,
-        proj_a_buffer: &wgpu::Buffer,
-        proj_b_buffer: &wgpu::Buffer,
-        state_buffer: &wgpu::Buffer,
-        dst_buffer: &wgpu::Buffer,
-        seq_len: usize,
+        qkv: BufferView<'_>,
+        proj_a: BufferView<'_>,
+        proj_b: BufferView<'_>,
+        state: BufferView<'_>,
+        dst: BufferView<'_>,
     ) {
+        let sz = std::mem::size_of::<f32>() as u32;
+        let expected_qkv_inner =
+            self.num_key_heads * self.key_head_dim * 2 + self.num_key_heads * self.value_head_dim;
+        let expected_dst_inner = self.num_key_heads * self.value_head_dim;
+        let expected_state = self.num_key_heads * self.key_head_dim * self.value_head_dim;
+        debug_assert_eq!(qkv.rank, 2, "delta_rule: qkv must be rank-2");
+        debug_assert_eq!(proj_a.rank, 2, "delta_rule: proj_a must be rank-2");
+        debug_assert_eq!(proj_b.rank, 2, "delta_rule: proj_b must be rank-2");
+        debug_assert_eq!(dst.rank, 2, "delta_rule: dst must be rank-2");
+        debug_assert_eq!(qkv.elem_size, sz, "delta_rule: qkv must be f32");
+        debug_assert_eq!(proj_a.elem_size, sz, "delta_rule: proj_a must be f32");
+        debug_assert_eq!(proj_b.elem_size, sz, "delta_rule: proj_b must be f32");
+        debug_assert_eq!(state.elem_size, sz, "delta_rule: state must be f32");
+        debug_assert_eq!(dst.elem_size, sz, "delta_rule: dst must be f32");
+        let seq_len = qkv.shape[0];
+        debug_assert_eq!(
+            proj_a.shape[0], seq_len,
+            "delta_rule: proj_a seq_len mismatch (proj_a={}, qkv={})",
+            proj_a.shape[0], seq_len,
+        );
+        debug_assert_eq!(
+            proj_b.shape[0], seq_len,
+            "delta_rule: proj_b seq_len mismatch (proj_b={}, qkv={})",
+            proj_b.shape[0], seq_len,
+        );
+        debug_assert_eq!(
+            dst.shape[0], seq_len,
+            "delta_rule: dst seq_len mismatch (dst={}, qkv={})",
+            dst.shape[0], seq_len,
+        );
+        debug_assert_eq!(
+            qkv.shape[1] as usize, expected_qkv_inner,
+            "delta_rule: qkv inner dim ({}) must equal 2*num_key_heads*key_head_dim + num_key_heads*value_head_dim ({})",
+            qkv.shape[1], expected_qkv_inner,
+        );
+        debug_assert_eq!(
+            proj_a.shape[1] as usize, self.num_key_heads,
+            "delta_rule: proj_a inner dim ({}) must equal num_key_heads ({})",
+            proj_a.shape[1], self.num_key_heads,
+        );
+        debug_assert_eq!(
+            proj_b.shape[1] as usize, self.num_key_heads,
+            "delta_rule: proj_b inner dim ({}) must equal num_key_heads ({})",
+            proj_b.shape[1], self.num_key_heads,
+        );
+        debug_assert_eq!(
+            dst.shape[1] as usize, expected_dst_inner,
+            "delta_rule: dst inner dim ({}) must equal num_key_heads*value_head_dim ({})",
+            dst.shape[1], expected_dst_inner,
+        );
+        debug_assert_eq!(
+            qkv.stride[1], 1,
+            "delta_rule: qkv must be inner-contiguous (stride[1]={})",
+            qkv.stride[1],
+        );
+        debug_assert_eq!(
+            proj_a.stride[1], 1,
+            "delta_rule: proj_a must be inner-contiguous (stride[1]={})",
+            proj_a.stride[1],
+        );
+        debug_assert_eq!(
+            proj_b.stride[1], 1,
+            "delta_rule: proj_b must be inner-contiguous (stride[1]={})",
+            proj_b.stride[1],
+        );
+        debug_assert_eq!(
+            dst.stride[1], 1,
+            "delta_rule: dst must be inner-contiguous (stride[1]={})",
+            dst.stride[1],
+        );
+        debug_assert_eq!(
+            state.total_byte_size() as usize,
+            expected_state * sz as usize,
+            "delta_rule: state byte size ({}) must equal num_key_heads*key_head_dim*value_head_dim*4 ({})",
+            state.total_byte_size(),
+            expected_state * sz as usize,
+        );
         let params = DeltaRuleParams {
             num_key_heads: self.num_key_heads as u32,
             key_head_dim: self.key_head_dim as u32,
             value_head_dim: self.value_head_dim as u32,
-            seq_len: seq_len as u32,
+            seq_len,
             q_offset: 0,
             k_offset: (self.key_head_dim * self.num_key_heads) as u32,
             v_offset: (self.key_head_dim * self.num_key_heads * 2) as u32,
             qk_head_stride: self.key_head_dim as u32,
             v_head_stride: self.value_head_dim as u32,
-            qkv_token_stride: (self.num_key_heads * self.key_head_dim * 2
-                + self.num_key_heads * self.value_head_dim) as u32,
+            qkv_token_stride: qkv.stride[0],
             proj_a_offset: 0,
-            proj_a_token_stride: self.num_key_heads as u32,
+            proj_a_token_stride: proj_a.stride[0],
             proj_b_offset: 0,
-            proj_b_token_stride: self.num_key_heads as u32,
+            proj_b_token_stride: proj_b.stride[0],
             dt_bias_offset: 0,
             a_log_offset: self.num_key_heads as u32,
-            output_token_stride: (self.num_key_heads * self.value_head_dim) as u32,
+            output_token_stride: dst.stride[0],
             output_head_stride: self.value_head_dim as u32,
             state_head_stride: (self.key_head_dim * self.value_head_dim) as u32,
             eps: 1e-6,
@@ -242,15 +323,15 @@ impl DeltaRuleWebgpu {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: qkv_buffer.as_entire_binding(),
+                    resource: qkv.as_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: proj_a_buffer.as_entire_binding(),
+                    resource: proj_a.as_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: proj_b_buffer.as_entire_binding(),
+                    resource: proj_b.as_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -258,11 +339,11 @@ impl DeltaRuleWebgpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: state_buffer.as_entire_binding(),
+                    resource: state.as_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: dst_buffer.as_entire_binding(),
+                    resource: dst.as_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
@@ -463,8 +544,34 @@ mod tests {
         let pb_buf = upload_f32(&device, &proj_b);
         let state_buf = upload_f32(&device, &vec![0.0f32; state_size]);
         let out_buf = create_f32_buffer(&device, seq_len * num_key_heads * value_head_dim);
+        let sz = std::mem::size_of::<f32>() as u32;
+        let qkv_view = BufferView::new_2d_tight(
+            &qkv_buf,
+            seq_len as u32,
+            qkv_token_stride as u32,
+            sz,
+        );
+        let pa_view = BufferView::new_2d_tight(
+            &pa_buf,
+            seq_len as u32,
+            num_key_heads as u32,
+            sz,
+        );
+        let pb_view = BufferView::new_2d_tight(
+            &pb_buf,
+            seq_len as u32,
+            num_key_heads as u32,
+            sz,
+        );
+        let state_view = BufferView::new_1d(&state_buf, sz, state_size as u32);
+        let out_view = BufferView::new_2d_tight(
+            &out_buf,
+            seq_len as u32,
+            (num_key_heads * value_head_dim) as u32,
+            sz,
+        );
         gpu.forward(
-            &device, &queue, &qkv_buf, &pa_buf, &pb_buf, &state_buf, &out_buf, seq_len,
+            &device, &queue, qkv_view, pa_view, pb_view, state_view, out_view,
         );
         let actual = download_f32(
             &device,

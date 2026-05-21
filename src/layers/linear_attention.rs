@@ -261,8 +261,8 @@ impl LinearAttentionLayer {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         residual_slot: BufferView<'_>,
-        conv_state_buffer: &wgpu::Buffer,
-        recurrent_state_buffer: &wgpu::Buffer,
+        conv_state: BufferView<'_>,
+        recurrent_state: BufferView<'_>,
     ) {
         let num_new_tokens = residual_slot.shape[0] as usize;
         debug_assert!(
@@ -276,11 +276,23 @@ impl LinearAttentionLayer {
         let qkv_dim = self.qkv_dim as u32;
         let v_dim = self.v_dim as u32;
         let num_v_heads = self.linear_num_value_heads as u32;
+        debug_assert_eq!(
+            conv_state.total_byte_size() as usize,
+            self.conv_state_size * std::mem::size_of::<f32>(),
+            "linear_attention: conv_state byte size ({}) must equal conv_state_size*4 ({})",
+            conv_state.total_byte_size(),
+            self.conv_state_size * std::mem::size_of::<f32>(),
+        );
+        debug_assert_eq!(
+            recurrent_state.total_byte_size() as usize,
+            self.recurrent_state_size * std::mem::size_of::<f32>(),
+            "linear_attention: recurrent_state byte size ({}) must equal recurrent_state_size*4 ({})",
+            recurrent_state.total_byte_size(),
+            self.recurrent_state_size * std::mem::size_of::<f32>(),
+        );
 
         // Each per-forward scratch is paired with its canonical view at
-        // the point of creation. conv_silu / delta_rule / gated_norm
-        // still consume raw `&wgpu::Buffer`s, so `conv_qkv_buffer`
-        // intentionally has no paired view.
+        // the point of creation.
         let normed_embedding_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("linear_attention_layer/normed_embedding_buffer"),
             size: (num_new_tokens * self.hidden_size * std::mem::size_of::<f32>())
@@ -336,8 +348,8 @@ impl LinearAttentionLayer {
         });
         let proj_z_view = BufferView::new_2d_tight(&in_proj_z_buffer, num_new_u32, v_dim, sz);
 
-        // conv1d output: consumed by delta_rule via raw `&wgpu::Buffer`,
-        // so no view is built for this scratch.
+        // conv1d output: paired with `conv_qkv_view` (same shape as the
+        // qkv input it replaces).
         let conv_qkv_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("linear_attention_layer/conv_qkv_buffer"),
             size: (num_new_tokens * self.qkv_dim * std::mem::size_of::<f32>())
@@ -347,6 +359,7 @@ impl LinearAttentionLayer {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let conv_qkv_view = BufferView::new_2d_tight(&conv_qkv_buffer, num_new_u32, qkv_dim, sz);
 
         let attn_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("linear_attention_layer/attn_output_buffer"),
@@ -390,33 +403,21 @@ impl LinearAttentionLayer {
             .forward(device, queue, normed_view, proj_a_view);
         self.in_proj_b_mul_mat
             .forward(device, queue, normed_view, proj_b_view);
-        self.conv_silu.forward(
-            device,
-            queue,
-            &in_proj_qkv_buffer,
-            &conv_qkv_buffer,
-            conv_state_buffer,
-            num_new_tokens,
-        );
+        self.conv_silu
+            .forward(device, queue, qkv_view, conv_qkv_view, conv_state);
         self.delta_rule.forward(
             device,
             queue,
-            &conv_qkv_buffer,
-            &in_proj_a_buffer,
-            &in_proj_b_buffer,
-            recurrent_state_buffer,
-            &attn_output_buffer,
-            num_new_tokens,
+            conv_qkv_view,
+            proj_a_view,
+            proj_b_view,
+            recurrent_state,
+            attn_out_v_view,
         );
         self.in_proj_z_mul_mat
             .forward(device, queue, normed_view, proj_z_view);
-        self.gated_norm.forward(
-            device,
-            queue,
-            &attn_output_buffer,
-            &in_proj_z_buffer,
-            num_new_tokens,
-        );
+        self.gated_norm
+            .forward(device, queue, attn_out_v_view, proj_z_view);
         self.out_proj_mat_mul
             .forward(device, queue, attn_out_v_view, out_proj_view);
         self.attn_residual_add
@@ -475,12 +476,20 @@ impl<'m> LayerSession for LinearAttentionLayerSession<'m> {
         residual_slot: BufferView<'_>,
         _prev_position: usize,
     ) {
+        let sz = std::mem::size_of::<f32>() as u32;
+        let conv_state_view =
+            BufferView::new_1d(&self.conv_state_buffer, sz, self.layer.conv_state_size as u32);
+        let recurrent_state_view = BufferView::new_1d(
+            &self.recurrent_state_buffer,
+            sz,
+            self.layer.recurrent_state_size as u32,
+        );
         self.layer.forward(
             device,
             queue,
             residual_slot,
-            &self.conv_state_buffer,
-            &self.recurrent_state_buffer,
+            conv_state_view,
+            recurrent_state_view,
         );
     }
 }

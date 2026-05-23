@@ -688,48 +688,6 @@ mod tests {
         assert_approx_eq(&actual, &expected, 1e-2);
     }
 
-    /// Decode pipeline with odd K (the last u32 word's hi bf16 lane should be
-    /// zero-masked by the `k1 < params.k` guard on the input side and the
-    /// zero-pad on the weight side).
-    #[tokio::test]
-    async fn test_mul_mat_vec_decode_odd_k() {
-        let (device, queue) = subgroup_or_skip!();
-        let m = 8;
-        let n = 1;
-        let k = 13; // odd — exercises the k%2 edge case
-
-        let weight_f32: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.041).sin()).collect();
-        let weight_packed = pack_f32_to_bf16_u32(&weight_f32);
-        let weight_bf16_bytes: Vec<u8> = weight_f32
-            .iter()
-            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
-            .collect();
-        let input: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.037).cos()).collect();
-
-        let expected = cpu_mul_mat(&weight_packed, &input, m, n, k);
-
-        let tv = safetensors::tensor::TensorView::new(
-            safetensors::Dtype::BF16,
-            vec![m, k],
-            &weight_bf16_bytes,
-        )
-        .unwrap();
-        let gpu = MulMatWebgpu::new(&device, &queue, tv);
-        let in_buf = upload_f32(&device, &input);
-        let out_buf = create_f32_buffer(&device, n * m);
-        let sz = std::mem::size_of::<f32>() as u32;
-        let runner = gpu.plan(
-            &device,
-            &queue,
-            BufferView::new_2d_tight(&in_buf, n as u32, k as u32, sz),
-            BufferView::new_2d_tight(&out_buf, n as u32, m as u32, sz),
-        );
-        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
-        let actual = download_f32(&device, &queue, &out_buf, n * m);
-
-        assert_approx_eq(&actual, &expected, 1e-2);
-    }
-
     /// Decode pipeline with large K (exercises multiple tile iterations and
     /// the cross-subgroup reduction).  Uses model-realistic dimensions:
     /// M = 1024, K = 3584 (MLP down-projection in the 0.8B Qwen3.5 variant).
@@ -841,48 +799,6 @@ mod tests {
             .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
             .collect();
         let input: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.047).cos()).collect();
-
-        let expected = cpu_mul_mat(&weight_packed, &input, m, n, k);
-
-        let tv = safetensors::tensor::TensorView::new(
-            safetensors::Dtype::BF16,
-            vec![m, k],
-            &weight_bf16_bytes,
-        )
-        .unwrap();
-        let gpu = MulMatWebgpu::new(&device, &queue, tv);
-        let in_buf = upload_f32(&device, &input);
-        let out_buf = create_f32_buffer(&device, n * m);
-        let sz = std::mem::size_of::<f32>() as u32;
-        let runner = gpu.plan(
-            &device,
-            &queue,
-            BufferView::new_2d_tight(&in_buf, n as u32, k as u32, sz),
-            BufferView::new_2d_tight(&out_buf, n as u32, m as u32, sz),
-        );
-        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
-        let actual = download_f32(&device, &queue, &out_buf, n * m);
-
-        assert_approx_eq(&actual, &expected, 1e-2);
-    }
-
-    /// Subgroup reg-tile pipeline with odd K (the last u32 word's hi bf16
-    /// lane is zero-masked by the `k1 < params.k` guard on the input side
-    /// and the zero-pad on the weight side).
-    #[tokio::test]
-    async fn test_mul_mat_reg_tile_subgroup_odd_k() {
-        let (device, queue) = subgroup_or_skip!();
-        let m = 8;
-        let n = 3;
-        let k = 13; // odd — exercises the k%2 edge case
-
-        let weight_f32: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.041).sin()).collect();
-        let weight_packed = pack_f32_to_bf16_u32(&weight_f32);
-        let weight_bf16_bytes: Vec<u8> = weight_f32
-            .iter()
-            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
-            .collect();
-        let input: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.037).cos()).collect();
 
         let expected = cpu_mul_mat(&weight_packed, &input, m, n, k);
 

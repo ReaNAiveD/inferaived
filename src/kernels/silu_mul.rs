@@ -13,7 +13,6 @@ pub struct SiluMulParams {
 pub struct SiluMulInplaceWebgpu {
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
-    uniform_buffer: wgpu::Buffer,
 
     vec_dim: usize,
 }
@@ -75,43 +74,43 @@ impl SiluMulInplaceWebgpu {
             },
             cache: None,
         });
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("silu_mul/uniform_buffer"),
-            size: std::mem::size_of::<SiluMulParams>() as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         Self {
             bind_group_layout,
             pipeline,
-            uniform_buffer,
             vec_dim,
         }
     }
 
-    /// In-place: `hidden[t, i] *= silu(gate[t, i])`.
-    pub fn forward(
+    /// Bake the per-buffer bindings into a [`SiluMulInplaceWebgpuRunner`]
+    /// for repeated dispatch into a caller-owned compute pass.
+    pub fn plan(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         hidden: BufferView<'_>,
         gate: BufferView<'_>,
-    ) {
+    ) -> SiluMulInplaceWebgpuRunner {
         debug_assert_eq!(
             hidden.shape[0], gate.shape[0],
             "silu_mul: outer dim mismatch (hidden={}, gate={})",
             hidden.shape[0], gate.shape[0],
         );
-        let num_rows = hidden.shape[0];
+        let seq_len = hidden.shape[0];
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("silu_mul_runner/uniform_buffer"),
+            size: std::mem::size_of::<SiluMulParams>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let uniform = SiluMulParams {
             hidden_token_stride: hidden.stride[0],
             gate_token_stride: gate.stride[0],
             hidden_size: self.vec_dim as u32,
-            seq_len: num_rows,
+            seq_len,
         };
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+        queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(&uniform));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("silu_mul/bind_group"),
+            label: Some("silu_mul_runner/bind_group"),
             layout: &self.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -124,23 +123,29 @@ impl SiluMulInplaceWebgpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: self.uniform_buffer.as_entire_binding(),
+                    resource: uniform_buffer.as_entire_binding(),
                 },
             ],
         });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("silu_mul/command_encoder"),
-        });
-        {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("silu_mul/compute_pass"),
-                timestamp_writes: None,
-            });
-            compute_pass.set_pipeline(&self.pipeline);
-            compute_pass.set_bind_group(0, &bind_group, &[]);
-            compute_pass.dispatch_workgroups(num_rows, 1, 1);
+        SiluMulInplaceWebgpuRunner {
+            pipeline: self.pipeline.clone(),
+            bind_group,
+            seq_len,
         }
-        queue.submit(Some(encoder.finish()));
+    }
+}
+
+pub struct SiluMulInplaceWebgpuRunner {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    seq_len: u32,
+}
+
+impl SiluMulInplaceWebgpuRunner {
+    pub fn forward(&self, cpass: &mut wgpu::ComputePass<'_>) {
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(self.seq_len, 1, 1);
     }
 }
 
@@ -186,7 +191,8 @@ mod tests {
             BufferView::new_2d_tight(&h_buf, seq_len as u32, hidden_size as u32, elem_size);
         let g_view =
             BufferView::new_2d_tight(&g_buf, seq_len as u32, hidden_size as u32, elem_size);
-        gpu.forward(&device, &queue, h_view, g_view);
+        let runner = gpu.plan(&device, &queue, h_view, g_view);
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
         let actual = download_f32(&device, &queue, &h_buf, seq_len * hidden_size);
 
         assert_approx_eq(&actual, &expected, 1e-5);

@@ -2,7 +2,10 @@ use safetensors::SafeTensors;
 
 use crate::{
     buffer_view::BufferView,
-    kernels::{mul_mat::MulMatWebgpu, silu_mul::SiluMulInplaceWebgpu},
+    kernels::{
+        mul_mat::{MulMatWebgpu, MulMatWebgpuRunner},
+        silu_mul::{SiluMulInplaceWebgpu, SiluMulInplaceWebgpuRunner},
+    },
     log_tensor,
 };
 
@@ -90,14 +93,13 @@ impl MultiLayerPerceptron {
         }
     }
 
-    /// Run the SwiGLU MLP block over `input.row_count` token rows.
-    pub fn forward(
+    pub fn plan(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         input: BufferView<'_>,
         output: BufferView<'_>,
-    ) {
+    ) -> MlpRunners {
         debug_assert_eq!(
             input.shape[0], output.shape[0],
             "mlp: outer dim mismatch (input={}, output={})",
@@ -108,36 +110,56 @@ impl MultiLayerPerceptron {
         let intermediate_size = self.intermediate_size as u32;
         let intermediate_total_bytes =
             (intermediate_size as u64) * (elem_size as u64) * (num_rows as u64);
-        let mlp_gate_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mlp/gate_proj_buffer"),
+        let gate_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mlp_runners/gate_proj_buffer"),
             size: intermediate_total_bytes,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let gate_view = BufferView::new_2d_tight(
-            &mlp_gate_proj_buffer,
-            num_rows,
-            intermediate_size,
-            elem_size,
-        );
-        let mlp_up_proj_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mlp/up_proj_buffer"),
+        let gate_view =
+            BufferView::new_2d_tight(&gate_buffer, num_rows, intermediate_size, elem_size);
+        let up_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mlp_runners/up_proj_buffer"),
             size: intermediate_total_bytes,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let up_view =
-            BufferView::new_2d_tight(&mlp_up_proj_buffer, num_rows, intermediate_size, elem_size);
-        self.mlp_gate_proj_mul_mat
-            .forward(device, queue, input, gate_view);
-        self.mlp_up_proj_mul_mat
-            .forward(device, queue, input, up_view);
-        self.mlp_silu_mul.forward(device, queue, up_view, gate_view);
-        self.mlp_down_proj_mul_mat
-            .forward(device, queue, up_view, output);
+        let up_view = BufferView::new_2d_tight(&up_buffer, num_rows, intermediate_size, elem_size);
+        let gate_runner = self
+            .mlp_gate_proj_mul_mat
+            .plan(device, queue, input, gate_view);
+        let up_runner = self.mlp_up_proj_mul_mat.plan(device, queue, input, up_view);
+        let silu_mul_runner = self.mlp_silu_mul.plan(device, queue, up_view, gate_view);
+        let down_runner = self
+            .mlp_down_proj_mul_mat
+            .plan(device, queue, up_view, output);
+        MlpRunners {
+            gate_runner,
+            up_runner,
+            silu_mul_runner,
+            down_runner,
+        }
+    }
+}
+
+/// Cached runners for one MLP forward pass. Buffer references live
+/// inside the wgpu bind groups; nothing extra to keep alive here.
+pub struct MlpRunners {
+    gate_runner: MulMatWebgpuRunner,
+    up_runner: MulMatWebgpuRunner,
+    silu_mul_runner: SiluMulInplaceWebgpuRunner,
+    down_runner: MulMatWebgpuRunner,
+}
+
+impl MlpRunners {
+    pub fn forward(&self, cpass: &mut wgpu::ComputePass<'_>) {
+        self.gate_runner.forward(cpass);
+        self.up_runner.forward(cpass);
+        self.silu_mul_runner.forward(cpass);
+        self.down_runner.forward(cpass);
     }
 }

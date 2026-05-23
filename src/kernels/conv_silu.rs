@@ -40,7 +40,6 @@ pub struct ConvSiluWebgpu {
     conv_pipeline: wgpu::ComputePipeline,
     state_update_pipeline: wgpu::ComputePipeline,
     weights_buffer: wgpu::Buffer,
-    uniform_buffer: wgpu::Buffer,
 
     // Model dimensions
     q_dim: usize,
@@ -140,31 +139,25 @@ impl ConvSiluWebgpu {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
-        let state_update_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("conv_silu/state_update_pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader_module,
-            entry_point: Some("conv_state_update"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
+        let state_update_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("conv_silu/state_update_pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader_module,
+                entry_point: Some("conv_state_update"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
         let weights_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("conv_silu/weights_buffer"),
             contents: bytemuck::cast_slice(weights.data()),
             usage: wgpu::BufferUsages::STORAGE,
-        });
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("conv_silu/uniform_buffer"),
-            size: std::mem::size_of::<ConvSiluParams>() as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
         });
         Self {
             bind_group_layout,
             conv_pipeline,
             state_update_pipeline,
             weights_buffer,
-            uniform_buffer,
             q_dim,
             k_dim,
             v_dim,
@@ -179,47 +172,30 @@ impl ConvSiluWebgpu {
     /// rows of `src`, writing the activated outputs to `dst`. `state`
     /// is the rolling conv-window cache of size
     /// `(kernel_size - 1) * num_channels` f32 elements, treated as
-    /// tight `[K - 1, num_channels]` internally.
-    pub fn forward(
+
+    /// Bake the per-buffer bindings into a
+    /// [`ConvSiluWebgpuRunner`] for repeated dispatch into a
+    /// caller-owned compute pass.
+    pub fn plan(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         src: BufferView<'_>,
         dst: BufferView<'_>,
         state: BufferView<'_>,
-    ) {
+    ) -> ConvSiluWebgpuRunner {
         let num_channels = self.q_dim + self.k_dim + self.v_dim;
         let sz = std::mem::size_of::<f32>() as u32;
-        debug_assert_eq!(src.rank, 2, "conv_silu: src must be rank-2");
-        debug_assert_eq!(dst.rank, 2, "conv_silu: dst must be rank-2");
-        debug_assert_eq!(src.elem_size, sz, "conv_silu: src must be f32");
-        debug_assert_eq!(dst.elem_size, sz, "conv_silu: dst must be f32");
-        debug_assert_eq!(state.elem_size, sz, "conv_silu: state must be f32");
-        debug_assert_eq!(
-            src.shape[0], dst.shape[0],
-            "conv_silu: src/dst seq_len mismatch (src={}, dst={})",
-            src.shape[0], dst.shape[0],
-        );
-        debug_assert_eq!(
-            src.shape[1] as usize, num_channels,
-            "conv_silu: src inner dim ({}) must equal q+k+v_dim ({})",
-            src.shape[1], num_channels,
-        );
-        debug_assert_eq!(
-            dst.shape[1] as usize, num_channels,
-            "conv_silu: dst inner dim ({}) must equal q+k+v_dim ({})",
-            dst.shape[1], num_channels,
-        );
-        debug_assert_eq!(
-            src.stride[1], 1,
-            "conv_silu: src must be channel-contiguous (stride[1]={})",
-            src.stride[1],
-        );
-        debug_assert_eq!(
-            dst.stride[1], 1,
-            "conv_silu: dst must be channel-contiguous (stride[1]={})",
-            dst.stride[1],
-        );
+        debug_assert_eq!(src.rank, 2);
+        debug_assert_eq!(dst.rank, 2);
+        debug_assert_eq!(src.elem_size, sz);
+        debug_assert_eq!(dst.elem_size, sz);
+        debug_assert_eq!(state.elem_size, sz);
+        debug_assert_eq!(src.shape[0], dst.shape[0]);
+        debug_assert_eq!(src.shape[1] as usize, num_channels);
+        debug_assert_eq!(dst.shape[1] as usize, num_channels);
+        debug_assert_eq!(src.stride[1], 1);
+        debug_assert_eq!(dst.stride[1], 1);
         let seq_len = src.shape[0] as usize;
         let params = ConvSiluParams {
             q_dim: self.q_dim as u32,
@@ -234,9 +210,15 @@ impl ConvSiluWebgpu {
             k_apply_conv: self.k_mode as u32,
             v_apply_conv: self.v_mode as u32,
         };
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[params]));
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("conv_silu_runner/uniform_buffer"),
+            size: std::mem::size_of::<ConvSiluParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[params]));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("conv_silu/bind_group"),
+            label: Some("conv_silu_runner/bind_group"),
             layout: &self.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -257,35 +239,26 @@ impl ConvSiluWebgpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: self.uniform_buffer.as_entire_binding(),
+                    resource: uniform_buffer.as_entire_binding(),
                 },
             ],
         });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("conv_silu/command_encoder"),
-        });
-        {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("conv_silu/compute_pass"),
-                timestamp_writes: None,
-            });
-            let workgroup_size = 256usize;
-            // Conv reads from state; safe because state writes happen in
-            // the next dispatch (consecutive dispatches in a compute pass
-            // are ordered by wgpu).
-            compute_pass.set_pipeline(&self.conv_pipeline);
-            compute_pass.set_bind_group(0, &bind_group, &[]);
-            let conv_workgroups =
-                (seq_len * num_channels + workgroup_size - 1) / workgroup_size;
-            compute_pass.dispatch_workgroups(conv_workgroups as u32, 1, 1);
-            // Refresh the rolling-window state for next call.
-            if self.kernel_size >= 2 {
-                compute_pass.set_pipeline(&self.state_update_pipeline);
-                let update_workgroups = (num_channels + workgroup_size - 1) / workgroup_size;
-                compute_pass.dispatch_workgroups(update_workgroups as u32, 1, 1);
-            }
+        let workgroup_size = 256usize;
+        let conv_workgroup_count =
+            ((seq_len * num_channels + workgroup_size - 1) / workgroup_size) as u32;
+        let state_update_workgroup_count = if self.kernel_size >= 2 {
+            ((num_channels + workgroup_size - 1) / workgroup_size) as u32
+        } else {
+            0
+        };
+        ConvSiluWebgpuRunner {
+            conv_pipeline: self.conv_pipeline.clone(),
+            state_update_pipeline: self.state_update_pipeline.clone(),
+            bind_group,
+            conv_workgroup_count,
+            state_update_workgroup_count,
+            has_state_update: self.kernel_size >= 2,
         }
-        queue.submit(Some(encoder.finish()));
     }
 
     /// f32 element count of the conv state buffer this kernel reads from
@@ -297,6 +270,28 @@ impl ConvSiluWebgpu {
             0
         } else {
             (self.kernel_size - 1) * num_channels
+        }
+    }
+}
+
+pub struct ConvSiluWebgpuRunner {
+    conv_pipeline: wgpu::ComputePipeline,
+    state_update_pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    conv_workgroup_count: u32,
+    state_update_workgroup_count: u32,
+    has_state_update: bool,
+}
+
+impl ConvSiluWebgpuRunner {
+    pub fn forward(&self, cpass: &mut wgpu::ComputePass<'_>) {
+        cpass.set_pipeline(&self.conv_pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(self.conv_workgroup_count, 1, 1);
+        if self.has_state_update {
+            cpass.set_pipeline(&self.state_update_pipeline);
+            // Same bind group is still bound.
+            cpass.dispatch_workgroups(self.state_update_workgroup_count, 1, 1);
         }
     }
 }
@@ -428,9 +423,9 @@ mod tests {
         let sz = std::mem::size_of::<f32>() as u32;
         let src_view = BufferView::new_2d_tight(&in_buf, seq_len as u32, nc as u32, sz);
         let dst_view = BufferView::new_2d_tight(&out_buf, seq_len as u32, nc as u32, sz);
-        let state_view =
-            BufferView::new_1d(&state_buf, sz, gpu.conv_state_size() as u32);
-        gpu.forward(&device, &queue, src_view, dst_view, state_view);
+        let state_view = BufferView::new_1d(&state_buf, sz, gpu.conv_state_size() as u32);
+        let runner = gpu.plan(&device, &queue, src_view, dst_view, state_view);
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
         let actual = download_f32(&device, &queue, &out_buf, seq_len * nc);
 
         assert_approx_eq(&actual, &expected, 1e-2);

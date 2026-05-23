@@ -27,7 +27,6 @@ pub struct GatedRmsNormInplaceWebgpu {
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
     weight_buffer: wgpu::Buffer,
-    uniform_buffer: wgpu::Buffer,
 
     num_value_heads: usize,
     value_head_dim: usize,
@@ -120,64 +119,36 @@ impl GatedRmsNormInplaceWebgpu {
             contents: bytemuck::cast_slice(&weight),
             usage: wgpu::BufferUsages::STORAGE,
         });
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("gated_rms_norm/uniform_buffer"),
-            size: std::mem::size_of::<GatedRmsNormParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         return Self {
             bind_group_layout,
             pipeline,
             weight_buffer,
-            uniform_buffer,
             num_value_heads,
             value_head_dim,
             epsilon,
         };
     }
 
-    /// In-place gated RMS-norm over `hidden.shape[0]` token rows of
-    /// `hidden` (modified in place) and `gate` (read only). Both views
-    /// are `[seq_len, num_value_heads * value_head_dim]`.
-    pub fn forward(
+    /// Bake the per-buffer bindings into a [`GatedRmsNormWebgpuRunner`]
+    /// for repeated dispatch into a caller-owned compute pass.
+    pub fn plan(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         hidden: BufferView<'_>,
         gate: BufferView<'_>,
-    ) {
+    ) -> GatedRmsNormWebgpuRunner {
         let sz = std::mem::size_of::<f32>() as u32;
         let expected_inner = self.num_value_heads * self.value_head_dim;
-        debug_assert_eq!(hidden.rank, 2, "gated_rms_norm: hidden must be rank-2");
-        debug_assert_eq!(gate.rank, 2, "gated_rms_norm: gate must be rank-2");
-        debug_assert_eq!(hidden.elem_size, sz, "gated_rms_norm: hidden must be f32");
-        debug_assert_eq!(gate.elem_size, sz, "gated_rms_norm: gate must be f32");
-        debug_assert_eq!(
-            hidden.shape[0], gate.shape[0],
-            "gated_rms_norm: hidden/gate seq_len mismatch (hidden={}, gate={})",
-            hidden.shape[0], gate.shape[0],
-        );
-        debug_assert_eq!(
-            hidden.shape[1] as usize, expected_inner,
-            "gated_rms_norm: hidden inner dim ({}) must equal num_value_heads*value_head_dim ({})",
-            hidden.shape[1], expected_inner,
-        );
-        debug_assert_eq!(
-            gate.shape[1] as usize, expected_inner,
-            "gated_rms_norm: gate inner dim ({}) must equal num_value_heads*value_head_dim ({})",
-            gate.shape[1], expected_inner,
-        );
-        debug_assert_eq!(
-            hidden.stride[1], 1,
-            "gated_rms_norm: hidden must be inner-contiguous (stride[1]={})",
-            hidden.stride[1],
-        );
-        debug_assert_eq!(
-            gate.stride[1], 1,
-            "gated_rms_norm: gate must be inner-contiguous (stride[1]={})",
-            gate.stride[1],
-        );
+        debug_assert_eq!(hidden.rank, 2);
+        debug_assert_eq!(gate.rank, 2);
+        debug_assert_eq!(hidden.elem_size, sz);
+        debug_assert_eq!(gate.elem_size, sz);
+        debug_assert_eq!(hidden.shape[0], gate.shape[0]);
+        debug_assert_eq!(hidden.shape[1] as usize, expected_inner);
+        debug_assert_eq!(gate.shape[1] as usize, expected_inner);
+        debug_assert_eq!(hidden.stride[1], 1);
+        debug_assert_eq!(gate.stride[1], 1);
         let seq_len = hidden.shape[0];
         let uniform = GatedRmsNormParams {
             num_heads: self.num_value_heads as u32,
@@ -192,9 +163,15 @@ impl GatedRmsNormInplaceWebgpu {
             weight_offset: 0,
             eps: self.epsilon,
         };
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gated_rms_norm_runner/uniform_buffer"),
+            size: std::mem::size_of::<GatedRmsNormParams>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(&uniform));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("gated_rms_norm/bind_group"),
+            label: Some("gated_rms_norm_runner/bind_group"),
             layout: &self.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -211,23 +188,30 @@ impl GatedRmsNormInplaceWebgpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: self.uniform_buffer.as_entire_binding(),
+                    resource: uniform_buffer.as_entire_binding(),
                 },
             ],
         });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("gated_rms_norm/command_encoder"),
-        });
-        {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("gated_rms_norm/compute_pass"),
-                timestamp_writes: None,
-            });
-            compute_pass.set_pipeline(&self.pipeline);
-            compute_pass.set_bind_group(0, &bind_group, &[]);
-            compute_pass.dispatch_workgroups(self.num_value_heads as u32 * seq_len, 1, 1);
+        let workgroup_count = self.num_value_heads as u32 * seq_len;
+        GatedRmsNormWebgpuRunner {
+            pipeline: self.pipeline.clone(),
+            bind_group,
+            workgroup_count,
         }
-        queue.submit(Some(encoder.finish()));
+    }
+}
+
+pub struct GatedRmsNormWebgpuRunner {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    workgroup_count: u32,
+}
+
+impl GatedRmsNormWebgpuRunner {
+    pub fn forward(&self, cpass: &mut wgpu::ComputePass<'_>) {
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(self.workgroup_count, 1, 1);
     }
 }
 
@@ -305,7 +289,8 @@ mod tests {
         let inner = (num_heads * head_dim) as u32;
         let h_view = BufferView::new_2d_tight(&h_buf, seq_len as u32, inner, sz);
         let g_view = BufferView::new_2d_tight(&g_buf, seq_len as u32, inner, sz);
-        gpu.forward(&device, &queue, h_view, g_view);
+        let runner = gpu.plan(&device, &queue, h_view, g_view);
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
         let actual = download_f32(&device, &queue, &h_buf, total);
 
         assert_approx_eq(&actual, &expected, 1e-3);

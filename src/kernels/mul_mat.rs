@@ -23,7 +23,6 @@ pub struct MulMatWebgpu {
     // Subgroup-optimised dense GEMM pipeline (N > 1).  Present when the device
     // supports wgpu::Features::SUBGROUP.  Supersedes pipeline_reg_tile when set.
     pipeline_reg_tile_subgroup: Option<wgpu::ComputePipeline>,
-    uniform_buffer: wgpu::Buffer,
     mat_src0_buffer: wgpu::Buffer,
     m_dim: usize,
     k_dim: usize,
@@ -152,68 +151,54 @@ impl MulMatWebgpu {
             cache: None,
         });
         // Created only when the device exposes Features::SUBGROUP.
-        let pipeline_decode = if device
-            .features()
-            .contains(wgpu::Features::SUBGROUP)
-        {
+        let pipeline_decode = if device.features().contains(wgpu::Features::SUBGROUP) {
             let decode_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("mul_mat/decode_shader"),
                 source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
                     "wgsl-shaders/mul_mat_vec_decode.wgsl"
                 ))),
             });
-            Some(device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("mul_mat/pipeline_decode"),
-                layout: Some(&pipeline_layout),
-                module: &decode_shader,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    constants: &[(
-                        "workgroup_size",
-                        Self::WORKGROUP_SIZE_DECODE as f64,
-                    )],
-                    zero_initialize_workgroup_memory: true,
-                },
-                cache: None,
-            }))
+            Some(
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("mul_mat/pipeline_decode"),
+                    layout: Some(&pipeline_layout),
+                    module: &decode_shader,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: &[("workgroup_size", Self::WORKGROUP_SIZE_DECODE as f64)],
+                        zero_initialize_workgroup_memory: true,
+                    },
+                    cache: None,
+                }),
+            )
         } else {
             None
         };
         // Subgroup-optimised dense GEMM (N > 1).  Created only when the
         // device exposes Features::SUBGROUP.
-        let pipeline_reg_tile_subgroup = if device
-            .features()
-            .contains(wgpu::Features::SUBGROUP)
-        {
+        let pipeline_reg_tile_subgroup = if device.features().contains(wgpu::Features::SUBGROUP) {
             let reg_tile_sg_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("mul_mat/reg_tile_subgroup_shader"),
                 source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
                     "wgsl-shaders/mul_mat_reg_tile_subgroup.wgsl"
                 ))),
             });
-            Some(device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("mul_mat/pipeline_reg_tile_subgroup"),
-                layout: Some(&pipeline_layout),
-                module: &reg_tile_sg_shader,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    constants: &[(
-                        "workgroup_size",
-                        Self::WORKGROUP_SIZE_REG_SG as f64,
-                    )],
-                    zero_initialize_workgroup_memory: true,
-                },
-                cache: None,
-            }))
+            Some(
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("mul_mat/pipeline_reg_tile_subgroup"),
+                    layout: Some(&pipeline_layout),
+                    module: &reg_tile_sg_shader,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: &[("workgroup_size", Self::WORKGROUP_SIZE_REG_SG as f64)],
+                        zero_initialize_workgroup_memory: true,
+                    },
+                    cache: None,
+                }),
+            )
         } else {
             None
         };
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mul_mat/uniform_buffer"),
-            size: std::mem::size_of::<MulMatParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let mat_src_bytes = mat_src0.data();
         // wgpu validates `write_buffer` lengths against COPY_BUFFER_ALIGNMENT
         // (= 4) at runtime, even though the Rust API doc only mentions
@@ -242,20 +227,22 @@ impl MulMatWebgpu {
             pipeline_vec,
             pipeline_decode,
             pipeline_reg_tile_subgroup,
-            uniform_buffer,
             mat_src0_buffer,
             m_dim,
             k_dim,
         }
     }
 
-    pub fn forward(
+    /// Bake the per-buffer bindings and pipeline-variant choice into a
+    /// [`MulMatWebgpuRunner`] for repeated dispatch into a caller-owned
+    /// compute pass.
+    pub fn plan(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         input: BufferView<'_>,
         dst: BufferView<'_>,
-    ) {
+    ) -> MulMatWebgpuRunner {
         debug_assert_eq!(
             input.shape[0], dst.shape[0],
             "mul_mat: outer dim mismatch (input={}, dst={})",
@@ -274,35 +261,35 @@ impl MulMatWebgpu {
             weight_row_stride: self.k_dim as u32,
             input_row_stride: input.stride[0],
         };
-        let (pipeline, workgroup_count, variant) = if num_rows == 1 {
+        let (pipeline, workgroup_count) = if num_rows == 1 {
             if let Some(ref p) = self.pipeline_decode {
-                let wg_count = (self.m_dim + Self::ROWS_PER_WG_DECODE - 1)
-                    / Self::ROWS_PER_WG_DECODE;
-                (p, wg_count as u32, "decode")
+                let wg_count =
+                    (self.m_dim + Self::ROWS_PER_WG_DECODE - 1) / Self::ROWS_PER_WG_DECODE;
+                (p, wg_count as u32)
             } else {
-                (&self.pipeline_vec, self.m_dim as u32, "vec")
+                (&self.pipeline_vec, self.m_dim as u32)
             }
         } else if let Some(ref p) = self.pipeline_reg_tile_subgroup {
-            let wg_num_m =
-                (self.m_dim + Self::ROWS_PER_WG_REG_SG - 1) / Self::ROWS_PER_WG_REG_SG;
+            let wg_num_m = (self.m_dim + Self::ROWS_PER_WG_REG_SG - 1) / Self::ROWS_PER_WG_REG_SG;
             let wg_num_n =
                 (num_rows as usize + Self::COLS_PER_WG_REG_SG - 1) / Self::COLS_PER_WG_REG_SG;
-            (p, (wg_num_m * wg_num_n) as u32, "reg_tile_subgroup")
+            (p, (wg_num_m * wg_num_n) as u32)
         } else {
             let wg_num_m = (self.m_dim + Self::WORKGROUP_SIZE_M * Self::TILE_M - 1)
                 / (Self::WORKGROUP_SIZE_M * Self::TILE_M);
             let wg_num_n = (num_rows as usize + Self::WORKGROUP_SIZE_N * Self::TILE_N - 1)
                 / (Self::WORKGROUP_SIZE_N * Self::TILE_N);
-            (
-                &self.pipeline_reg_tile,
-                (wg_num_m * wg_num_n) as u32,
-                "reg_tile",
-            )
+            (&self.pipeline_reg_tile, (wg_num_m * wg_num_n) as u32)
         };
-
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniform]));
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mul_mat_runner/uniform_buffer"),
+            size: std::mem::size_of::<MulMatParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniform]));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("mul_mat/bind_group"),
+            label: Some("mul_mat_runner/bind_group"),
             layout: &self.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -319,23 +306,29 @@ impl MulMatWebgpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: self.uniform_buffer.as_entire_binding(),
+                    resource: uniform_buffer.as_entire_binding(),
                 },
             ],
         });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some(&format!("mul_mat/command_encoder_{}", variant)),
-        });
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some(&format!("mul_mat/compute_pass_{}", variant)),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(pipeline);
-            cpass.set_bind_group(0, &bind_group, &[]);
-            cpass.dispatch_workgroups(workgroup_count, 1, 1);
+        MulMatWebgpuRunner {
+            pipeline: pipeline.clone(),
+            bind_group,
+            workgroup_count,
         }
-        queue.submit(Some(encoder.finish()));
+    }
+}
+
+pub struct MulMatWebgpuRunner {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    workgroup_count: u32,
+}
+
+impl MulMatWebgpuRunner {
+    pub fn forward(&self, cpass: &mut wgpu::ComputePass<'_>) {
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(self.workgroup_count, 1, 1);
     }
 }
 
@@ -390,12 +383,13 @@ mod tests {
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, n * m);
         let sz = std::mem::size_of::<f32>() as u32;
-        gpu.forward(
+        let runner = gpu.plan(
             &device,
             &queue,
             BufferView::new_2d_tight(&in_buf, n as u32, k as u32, sz),
             BufferView::new_2d_tight(&out_buf, n as u32, m as u32, sz),
         );
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
         let actual = download_f32(&device, &queue, &out_buf, n * m);
 
         assert_approx_eq(&actual, &expected, 1e-2);
@@ -432,12 +426,13 @@ mod tests {
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, n * m);
         let sz = std::mem::size_of::<f32>() as u32;
-        gpu.forward(
+        let runner = gpu.plan(
             &device,
             &queue,
             BufferView::new_2d_tight(&in_buf, n as u32, k as u32, sz),
             BufferView::new_2d_tight(&out_buf, n as u32, m as u32, sz),
         );
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
         let actual = download_f32(&device, &queue, &out_buf, n * m);
 
         assert_approx_eq(&actual, &expected, 1e-2);
@@ -473,12 +468,13 @@ mod tests {
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, n * m);
         let sz = std::mem::size_of::<f32>() as u32;
-        gpu.forward(
+        let runner = gpu.plan(
             &device,
             &queue,
             BufferView::new_2d_tight(&in_buf, n as u32, k as u32, sz),
             BufferView::new_2d_tight(&out_buf, n as u32, m as u32, sz),
         );
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
         let actual = download_f32(&device, &queue, &out_buf, n * m);
 
         assert_approx_eq(&actual, &expected, 1e-2);
@@ -524,7 +520,7 @@ mod tests {
         let sentinel: Vec<f32> = vec![-12345.0; n * m];
         let out_buf = upload_f32(&device, &sentinel);
 
-        gpu.forward(
+        let runner = gpu.plan(
             &device,
             &queue,
             BufferView::new_2d_tight(
@@ -542,6 +538,7 @@ mod tests {
             )
             .narrow(0, (n - 1) as u32, 1),
         );
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
         let actual = download_f32(&device, &queue, &out_buf, n * m);
 
         // Last row matches the reference.
@@ -637,12 +634,13 @@ mod tests {
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, n * m);
         let sz = std::mem::size_of::<f32>() as u32;
-        gpu.forward(
+        let runner = gpu.plan(
             &device,
             &queue,
             BufferView::new_2d_tight(&in_buf, n as u32, k as u32, sz),
             BufferView::new_2d_tight(&out_buf, n as u32, m as u32, sz),
         );
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
         let actual = download_f32(&device, &queue, &out_buf, n * m);
 
         assert_approx_eq(&actual, &expected, 1e-2);
@@ -678,12 +676,13 @@ mod tests {
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, n * m);
         let sz = std::mem::size_of::<f32>() as u32;
-        gpu.forward(
+        let runner = gpu.plan(
             &device,
             &queue,
             BufferView::new_2d_tight(&in_buf, n as u32, k as u32, sz),
             BufferView::new_2d_tight(&out_buf, n as u32, m as u32, sz),
         );
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
         let actual = download_f32(&device, &queue, &out_buf, n * m);
 
         assert_approx_eq(&actual, &expected, 1e-2);
@@ -719,12 +718,13 @@ mod tests {
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, n * m);
         let sz = std::mem::size_of::<f32>() as u32;
-        gpu.forward(
+        let runner = gpu.plan(
             &device,
             &queue,
             BufferView::new_2d_tight(&in_buf, n as u32, k as u32, sz),
             BufferView::new_2d_tight(&out_buf, n as u32, m as u32, sz),
         );
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
         let actual = download_f32(&device, &queue, &out_buf, n * m);
 
         assert_approx_eq(&actual, &expected, 1e-2);
@@ -760,12 +760,13 @@ mod tests {
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, n * m);
         let sz = std::mem::size_of::<f32>() as u32;
-        gpu.forward(
+        let runner = gpu.plan(
             &device,
             &queue,
             BufferView::new_2d_tight(&in_buf, n as u32, k as u32, sz),
             BufferView::new_2d_tight(&out_buf, n as u32, m as u32, sz),
         );
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
         let actual = download_f32(&device, &queue, &out_buf, n * m);
 
         assert_approx_eq(&actual, &expected, 1e-2);
@@ -811,12 +812,13 @@ mod tests {
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, n * m);
         let sz = std::mem::size_of::<f32>() as u32;
-        gpu.forward(
+        let runner = gpu.plan(
             &device,
             &queue,
             BufferView::new_2d_tight(&in_buf, n as u32, k as u32, sz),
             BufferView::new_2d_tight(&out_buf, n as u32, m as u32, sz),
         );
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
         let actual = download_f32(&device, &queue, &out_buf, n * m);
 
         assert_approx_eq(&actual, &expected, 1e-2);
@@ -852,12 +854,13 @@ mod tests {
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, n * m);
         let sz = std::mem::size_of::<f32>() as u32;
-        gpu.forward(
+        let runner = gpu.plan(
             &device,
             &queue,
             BufferView::new_2d_tight(&in_buf, n as u32, k as u32, sz),
             BufferView::new_2d_tight(&out_buf, n as u32, m as u32, sz),
         );
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
         let actual = download_f32(&device, &queue, &out_buf, n * m);
 
         assert_approx_eq(&actual, &expected, 1e-2);
@@ -893,12 +896,13 @@ mod tests {
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, n * m);
         let sz = std::mem::size_of::<f32>() as u32;
-        gpu.forward(
+        let runner = gpu.plan(
             &device,
             &queue,
             BufferView::new_2d_tight(&in_buf, n as u32, k as u32, sz),
             BufferView::new_2d_tight(&out_buf, n as u32, m as u32, sz),
         );
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
         let actual = download_f32(&device, &queue, &out_buf, n * m);
 
         assert_approx_eq(&actual, &expected, 1e-2);
@@ -934,12 +938,13 @@ mod tests {
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, n * m);
         let sz = std::mem::size_of::<f32>() as u32;
-        gpu.forward(
+        let runner = gpu.plan(
             &device,
             &queue,
             BufferView::new_2d_tight(&in_buf, n as u32, k as u32, sz),
             BufferView::new_2d_tight(&out_buf, n as u32, m as u32, sz),
         );
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
         let actual = download_f32(&device, &queue, &out_buf, n * m);
 
         assert_approx_eq(&actual, &expected, 1e-2);

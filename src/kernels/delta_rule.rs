@@ -45,7 +45,6 @@ pub struct DeltaRuleWebgpu {
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
     gate_params_buffer: wgpu::Buffer,
-    uniform_buffer: wgpu::Buffer,
 
     num_key_heads: usize,
     key_head_dim: usize,
@@ -184,17 +183,10 @@ impl DeltaRuleWebgpu {
             contents: bytemuck::cast_slice(&[dt_bias, a_log].concat()),
             usage: wgpu::BufferUsages::STORAGE,
         });
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("delta_rule/uniform_buffer"),
-            size: std::mem::size_of::<DeltaRuleParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         Self {
             bind_group_layout,
             pipeline,
             gate_params_buffer,
-            uniform_buffer,
             num_key_heads,
             key_head_dim,
             value_head_dim,
@@ -206,8 +198,10 @@ impl DeltaRuleWebgpu {
     /// output to `dst`. `state` is the per-session recurrent KV memory
     /// of size `num_key_heads * key_head_dim * value_head_dim` f32
     /// elements, treated as tight
-    /// `[num_key_heads, key_head_dim, value_head_dim]` internally.
-    pub fn forward(
+
+    /// Bake the per-buffer bindings into a [`DeltaRuleWebgpuRunner`]
+    /// for repeated dispatch into a caller-owned compute pass.
+    pub fn plan(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -216,83 +210,36 @@ impl DeltaRuleWebgpu {
         proj_b: BufferView<'_>,
         state: BufferView<'_>,
         dst: BufferView<'_>,
-    ) {
+    ) -> DeltaRuleWebgpuRunner {
         let sz = std::mem::size_of::<f32>() as u32;
         let expected_qkv_inner =
             self.num_key_heads * self.key_head_dim * 2 + self.num_key_heads * self.value_head_dim;
         let expected_dst_inner = self.num_key_heads * self.value_head_dim;
         let expected_state = self.num_key_heads * self.key_head_dim * self.value_head_dim;
-        debug_assert_eq!(qkv.rank, 2, "delta_rule: qkv must be rank-2");
-        debug_assert_eq!(proj_a.rank, 2, "delta_rule: proj_a must be rank-2");
-        debug_assert_eq!(proj_b.rank, 2, "delta_rule: proj_b must be rank-2");
-        debug_assert_eq!(dst.rank, 2, "delta_rule: dst must be rank-2");
-        debug_assert_eq!(qkv.elem_size, sz, "delta_rule: qkv must be f32");
-        debug_assert_eq!(proj_a.elem_size, sz, "delta_rule: proj_a must be f32");
-        debug_assert_eq!(proj_b.elem_size, sz, "delta_rule: proj_b must be f32");
-        debug_assert_eq!(state.elem_size, sz, "delta_rule: state must be f32");
-        debug_assert_eq!(dst.elem_size, sz, "delta_rule: dst must be f32");
+        debug_assert_eq!(qkv.rank, 2);
+        debug_assert_eq!(proj_a.rank, 2);
+        debug_assert_eq!(proj_b.rank, 2);
+        debug_assert_eq!(dst.rank, 2);
+        debug_assert_eq!(qkv.elem_size, sz);
+        debug_assert_eq!(proj_a.elem_size, sz);
+        debug_assert_eq!(proj_b.elem_size, sz);
+        debug_assert_eq!(state.elem_size, sz);
+        debug_assert_eq!(dst.elem_size, sz);
         let seq_len = qkv.shape[0];
-        debug_assert_eq!(
-            proj_a.shape[0], seq_len,
-            "delta_rule: proj_a seq_len mismatch (proj_a={}, qkv={})",
-            proj_a.shape[0], seq_len,
-        );
-        debug_assert_eq!(
-            proj_b.shape[0], seq_len,
-            "delta_rule: proj_b seq_len mismatch (proj_b={}, qkv={})",
-            proj_b.shape[0], seq_len,
-        );
-        debug_assert_eq!(
-            dst.shape[0], seq_len,
-            "delta_rule: dst seq_len mismatch (dst={}, qkv={})",
-            dst.shape[0], seq_len,
-        );
-        debug_assert_eq!(
-            qkv.shape[1] as usize, expected_qkv_inner,
-            "delta_rule: qkv inner dim ({}) must equal 2*num_key_heads*key_head_dim + num_key_heads*value_head_dim ({})",
-            qkv.shape[1], expected_qkv_inner,
-        );
-        debug_assert_eq!(
-            proj_a.shape[1] as usize, self.num_key_heads,
-            "delta_rule: proj_a inner dim ({}) must equal num_key_heads ({})",
-            proj_a.shape[1], self.num_key_heads,
-        );
-        debug_assert_eq!(
-            proj_b.shape[1] as usize, self.num_key_heads,
-            "delta_rule: proj_b inner dim ({}) must equal num_key_heads ({})",
-            proj_b.shape[1], self.num_key_heads,
-        );
-        debug_assert_eq!(
-            dst.shape[1] as usize, expected_dst_inner,
-            "delta_rule: dst inner dim ({}) must equal num_key_heads*value_head_dim ({})",
-            dst.shape[1], expected_dst_inner,
-        );
-        debug_assert_eq!(
-            qkv.stride[1], 1,
-            "delta_rule: qkv must be inner-contiguous (stride[1]={})",
-            qkv.stride[1],
-        );
-        debug_assert_eq!(
-            proj_a.stride[1], 1,
-            "delta_rule: proj_a must be inner-contiguous (stride[1]={})",
-            proj_a.stride[1],
-        );
-        debug_assert_eq!(
-            proj_b.stride[1], 1,
-            "delta_rule: proj_b must be inner-contiguous (stride[1]={})",
-            proj_b.stride[1],
-        );
-        debug_assert_eq!(
-            dst.stride[1], 1,
-            "delta_rule: dst must be inner-contiguous (stride[1]={})",
-            dst.stride[1],
-        );
+        debug_assert_eq!(proj_a.shape[0], seq_len);
+        debug_assert_eq!(proj_b.shape[0], seq_len);
+        debug_assert_eq!(dst.shape[0], seq_len);
+        debug_assert_eq!(qkv.shape[1] as usize, expected_qkv_inner);
+        debug_assert_eq!(proj_a.shape[1] as usize, self.num_key_heads);
+        debug_assert_eq!(proj_b.shape[1] as usize, self.num_key_heads);
+        debug_assert_eq!(dst.shape[1] as usize, expected_dst_inner);
+        debug_assert_eq!(qkv.stride[1], 1);
+        debug_assert_eq!(proj_a.stride[1], 1);
+        debug_assert_eq!(proj_b.stride[1], 1);
+        debug_assert_eq!(dst.stride[1], 1);
         debug_assert_eq!(
             state.total_byte_size() as usize,
-            expected_state * sz as usize,
-            "delta_rule: state byte size ({}) must equal num_key_heads*key_head_dim*value_head_dim*4 ({})",
-            state.total_byte_size(),
-            expected_state * sz as usize,
+            expected_state * sz as usize
         );
         let params = DeltaRuleParams {
             num_key_heads: self.num_key_heads as u32,
@@ -316,9 +263,15 @@ impl DeltaRuleWebgpu {
             state_head_stride: (self.key_head_dim * self.value_head_dim) as u32,
             eps: 1e-6,
         };
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[params]));
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("delta_rule_runner/uniform_buffer"),
+            size: std::mem::size_of::<DeltaRuleParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[params]));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("delta_rule/bind_group"),
+            label: Some("delta_rule_runner/bind_group"),
             layout: &self.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -347,23 +300,29 @@ impl DeltaRuleWebgpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
-                    resource: self.uniform_buffer.as_entire_binding(),
+                    resource: uniform_buffer.as_entire_binding(),
                 },
             ],
         });
-        let mut command_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("delta_rule/command_encoder"),
-        });
-        {
-            let mut cpass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("delta_rule/compute_pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.pipeline);
-            cpass.set_bind_group(0, &bind_group, &[]);
-            cpass.dispatch_workgroups(self.num_key_heads as u32, 1, 1);
+        DeltaRuleWebgpuRunner {
+            pipeline: self.pipeline.clone(),
+            bind_group,
+            workgroup_count: self.num_key_heads as u32,
         }
-        queue.submit(Some(command_encoder.finish()));
+    }
+}
+
+pub struct DeltaRuleWebgpuRunner {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    workgroup_count: u32,
+}
+
+impl DeltaRuleWebgpuRunner {
+    pub fn forward(&self, cpass: &mut wgpu::ComputePass<'_>) {
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(self.workgroup_count, 1, 1);
     }
 }
 
@@ -545,24 +504,10 @@ mod tests {
         let state_buf = upload_f32(&device, &vec![0.0f32; state_size]);
         let out_buf = create_f32_buffer(&device, seq_len * num_key_heads * value_head_dim);
         let sz = std::mem::size_of::<f32>() as u32;
-        let qkv_view = BufferView::new_2d_tight(
-            &qkv_buf,
-            seq_len as u32,
-            qkv_token_stride as u32,
-            sz,
-        );
-        let pa_view = BufferView::new_2d_tight(
-            &pa_buf,
-            seq_len as u32,
-            num_key_heads as u32,
-            sz,
-        );
-        let pb_view = BufferView::new_2d_tight(
-            &pb_buf,
-            seq_len as u32,
-            num_key_heads as u32,
-            sz,
-        );
+        let qkv_view =
+            BufferView::new_2d_tight(&qkv_buf, seq_len as u32, qkv_token_stride as u32, sz);
+        let pa_view = BufferView::new_2d_tight(&pa_buf, seq_len as u32, num_key_heads as u32, sz);
+        let pb_view = BufferView::new_2d_tight(&pb_buf, seq_len as u32, num_key_heads as u32, sz);
         let state_view = BufferView::new_1d(&state_buf, sz, state_size as u32);
         let out_view = BufferView::new_2d_tight(
             &out_buf,
@@ -570,9 +515,10 @@ mod tests {
             (num_key_heads * value_head_dim) as u32,
             sz,
         );
-        gpu.forward(
+        let runner = gpu.plan(
             &device, &queue, qkv_view, pa_view, pb_view, state_view, out_view,
         );
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
         let actual = download_f32(
             &device,
             &queue,

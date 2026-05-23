@@ -18,7 +18,6 @@ pub struct SigmoidMulParams {
 pub struct SigmoidMulInplaceWebgpu {
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
-    uniform_buffer: wgpu::Buffer,
 
     num_heads: usize,
     head_dim: usize,
@@ -81,29 +80,23 @@ impl SigmoidMulInplaceWebgpu {
             },
             cache: None,
         });
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("sigmoid_mul/uniform_buffer"),
-            size: std::mem::size_of::<SigmoidMulParams>() as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         Self {
             bind_group_layout,
             pipeline,
-            uniform_buffer,
             num_heads,
             head_dim,
         }
     }
 
-    /// In-place: `hidden[t, h, i] *= sigmoid(gate[t, h, i])`.
-    pub fn forward(
+    /// Bake the per-buffer bindings into a [`SigmoidMulInplaceWebgpuRunner`]
+    /// for repeated dispatch into a caller-owned compute pass.
+    pub fn plan(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         hidden: BufferView<'_>,
         gate: BufferView<'_>,
-    ) {
+    ) -> SigmoidMulInplaceWebgpuRunner {
         debug_assert_eq!(hidden.rank, 3, "sigmoid_mul: hidden must be rank-3");
         debug_assert_eq!(gate.rank, 3, "sigmoid_mul: gate must be rank-3");
         debug_assert_eq!(
@@ -113,7 +106,13 @@ impl SigmoidMulInplaceWebgpu {
         );
         debug_assert_eq!(hidden.shape[1] as usize, self.num_heads);
         debug_assert_eq!(hidden.shape[2] as usize, self.head_dim);
-        let num_rows = hidden.shape[0];
+        let seq_len = hidden.shape[0];
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sigmoid_mul_runner/uniform_buffer"),
+            size: std::mem::size_of::<SigmoidMulParams>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let uniform = SigmoidMulParams {
             hidden_token_stride: hidden.stride[0],
             hidden_head_stride: hidden.stride[1],
@@ -121,11 +120,11 @@ impl SigmoidMulInplaceWebgpu {
             gate_head_stride: gate.stride[1],
             num_heads: self.num_heads as u32,
             head_dim: self.head_dim as u32,
-            seq_len: num_rows,
+            seq_len,
         };
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+        queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(&uniform));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sigmoid_mul/bind_group"),
+            label: Some("sigmoid_mul_runner/bind_group"),
             layout: &self.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -138,23 +137,29 @@ impl SigmoidMulInplaceWebgpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: self.uniform_buffer.as_entire_binding(),
+                    resource: uniform_buffer.as_entire_binding(),
                 },
             ],
         });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("sigmoid_mul/command_encoder"),
-        });
-        {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("sigmoid_mul/compute_pass"),
-                timestamp_writes: None,
-            });
-            compute_pass.set_pipeline(&self.pipeline);
-            compute_pass.set_bind_group(0, &bind_group, &[]);
-            compute_pass.dispatch_workgroups(num_rows, 1, 1);
+        SigmoidMulInplaceWebgpuRunner {
+            pipeline: self.pipeline.clone(),
+            bind_group,
+            seq_len,
         }
-        queue.submit(Some(encoder.finish()));
+    }
+}
+
+pub struct SigmoidMulInplaceWebgpuRunner {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    seq_len: u32,
+}
+
+impl SigmoidMulInplaceWebgpuRunner {
+    pub fn forward(&self, cpass: &mut wgpu::ComputePass<'_>) {
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(self.seq_len, 1, 1);
     }
 }
 
@@ -241,7 +246,8 @@ mod tests {
             sz,
         )
         .select(2, 1);
-        gpu.forward(&device, &queue, h_view, g_view);
+        let runner = gpu.plan(&device, &queue, h_view, g_view);
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
         let actual = download_f32(&device, &queue, &h_buf, seq_len * hidden_size);
 
         assert_approx_eq(&actual, &expected, 1e-5);

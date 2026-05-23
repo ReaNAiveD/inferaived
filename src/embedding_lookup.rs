@@ -31,11 +31,7 @@ pub struct EmbeddingLookupWebgpu {
 
 impl EmbeddingLookupWebgpu {
     /// Creates a new GPU-based embedding lookup.
-    pub fn new<'data>(
-        device: &Device,
-        queue: &Queue,
-        embeddings: TensorView<'data>,
-    ) -> Self {
+    pub fn new<'data>(device: &Device, queue: &Queue, embeddings: TensorView<'data>) -> Self {
         debug_assert_eq!(
             embeddings.shape().len(),
             2,

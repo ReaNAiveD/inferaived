@@ -7,5 +7,6 @@ pub mod mamba_scan;
 pub mod mul_mat;
 pub mod norm;
 pub mod rope;
+pub mod scatter_row;
 pub mod sigmoid_mul;
 pub mod silu_mul;

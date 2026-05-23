@@ -120,20 +120,16 @@ async fn main() {
     // chat.
     let max_seq_len = 32;
     let num_generated = 5;
-    let mut session = Qwen35Session::new(&model, &device, max_seq_len);
+    let mut session = Qwen35Session::new(&model, &device, &queue, max_seq_len);
 
     // Cold prefill of the prompt; the top candidates are for the FIRST
     // token immediately after the prompt.
-    let prompt_top = session
-        .forward(&device, &queue, encoded.get_ids(), 5)
-        .await;
+    let prompt_top = session.forward(&device, &queue, encoded.get_ids(), 5).await;
     let first_token = prompt_top[0].0 as u32;
     println!(
         "Prefill picked token {}: {:?} (top 5: {:?})",
         first_token,
-        tokenizer
-            .decode(&[first_token], false)
-            .unwrap_or_default(),
+        tokenizer.decode(&[first_token], false).unwrap_or_default(),
         prompt_top,
     );
 

@@ -25,7 +25,6 @@ pub struct RmsNormInplaceParams {
 pub struct RmsNormWebgpu {
     bind_group_layout: BindGroupLayout,
     pipeline: ComputePipeline,
-    uniform_buffer: Buffer,
     weight_buffer: Buffer,
     norm_dim: usize,
 }
@@ -125,12 +124,6 @@ impl RmsNormWebgpu {
             },
             cache: None,
         });
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rms_norm/uniform_buffer"),
-            size: std::mem::size_of::<RmsNormParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let weight_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rms_norm/weight_buffer"),
             size: (weight_f32.len() * std::mem::size_of::<f32>()) as u64,
@@ -141,36 +134,42 @@ impl RmsNormWebgpu {
         Self {
             bind_group_layout,
             pipeline,
-            uniform_buffer,
             weight_buffer,
             norm_dim,
         }
     }
 
-    /// Normalize `input.shape[0]` rows from `input` into `dst`.
-    pub fn forward(
+    /// Bake the per-buffer bindings into a [`RmsNormWebgpuRunner`]
+    /// for repeated dispatch into a caller-owned compute pass.
+    pub fn plan(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         input: BufferView<'_>,
         dst: BufferView<'_>,
-    ) {
+    ) -> RmsNormWebgpuRunner {
         debug_assert_eq!(
             input.shape[0], dst.shape[0],
             "rms_norm: outer dim mismatch (input={}, dst={})",
             input.shape[0], dst.shape[0],
         );
-        let num_rows = input.shape[0];
+        let seq_len = input.shape[0];
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rms_norm_runner/uniform_buffer"),
+            size: std::mem::size_of::<RmsNormParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let uniform = RmsNormParams {
             input_row_stride: input.stride[0],
             output_row_stride: dst.stride[0],
             hidden_size: self.norm_dim as u32,
-            seq_len: num_rows,
+            seq_len,
             eps: 1e-6,
         };
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+        queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(&uniform));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rms_norm/bind_group"),
+            label: Some("rms_norm_runner/bind_group"),
             layout: &self.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -187,29 +186,35 @@ impl RmsNormWebgpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: self.uniform_buffer.as_entire_binding(),
+                    resource: uniform_buffer.as_entire_binding(),
                 },
             ],
         });
-        let mut command_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("rms_norm/command_encoder"),
-        });
-        let mut compute_pass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("rms_norm/compute_pass"),
-            timestamp_writes: None,
-        });
-        compute_pass.set_pipeline(&self.pipeline);
-        compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups(num_rows, 1, 1);
-        drop(compute_pass);
-        queue.submit(Some(command_encoder.finish()));
+        RmsNormWebgpuRunner {
+            pipeline: self.pipeline.clone(),
+            bind_group,
+            seq_len,
+        }
+    }
+}
+
+pub struct RmsNormWebgpuRunner {
+    pipeline: ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    seq_len: u32,
+}
+
+impl RmsNormWebgpuRunner {
+    pub fn forward(&self, cpass: &mut wgpu::ComputePass<'_>) {
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(self.seq_len, 1, 1);
     }
 }
 
 pub struct RmsNormInplaceWebgpu {
     bind_group_layout: BindGroupLayout,
     pipeline: ComputePipeline,
-    uniform_buffer: Buffer,
     weight_buffer: Buffer,
     norm_dim: usize,
 }
@@ -299,12 +304,6 @@ impl RmsNormInplaceWebgpu {
             },
             cache: None,
         });
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rms_norm_inplace/uniform_buffer"),
-            size: std::mem::size_of::<RmsNormInplaceParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let weight_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rms_norm_inplace/weight_buffer"),
             size: (weight_f32.len() * std::mem::size_of::<f32>()) as u64,
@@ -315,29 +314,35 @@ impl RmsNormInplaceWebgpu {
         Self {
             bind_group_layout,
             pipeline,
-            uniform_buffer,
             weight_buffer,
             norm_dim,
         }
     }
 
-    /// In-place normalize `hidden.shape[0]` rows of `hidden`.
-    pub fn forward(
+    /// Bake the per-buffer bindings into a [`RmsNormInplaceWebgpuRunner`]
+    /// for repeated dispatch into a caller-owned compute pass.
+    pub fn plan(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         hidden: BufferView<'_>,
-    ) {
-        let num_rows = hidden.shape[0];
+    ) -> RmsNormInplaceWebgpuRunner {
+        let seq_len = hidden.shape[0];
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rms_norm_inplace_runner/uniform_buffer"),
+            size: std::mem::size_of::<RmsNormInplaceParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let uniform = RmsNormInplaceParams {
             hidden_row_stride: hidden.stride[0],
             hidden_size: self.norm_dim as u32,
-            seq_len: num_rows,
+            seq_len,
             eps: 1e-6,
         };
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+        queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(&uniform));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rms_norm_inplace/bind_group"),
+            label: Some("rms_norm_inplace_runner/bind_group"),
             layout: &self.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -350,22 +355,29 @@ impl RmsNormInplaceWebgpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: self.uniform_buffer.as_entire_binding(),
+                    resource: uniform_buffer.as_entire_binding(),
                 },
             ],
         });
-        let mut command_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("rms_norm_inplace/command_encoder"),
-        });
-        let mut compute_pass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("rms_norm_inplace/compute_pass"),
-            timestamp_writes: None,
-        });
-        compute_pass.set_pipeline(&self.pipeline);
-        compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups(num_rows, 1, 1);
-        drop(compute_pass);
-        queue.submit(Some(command_encoder.finish()));
+        RmsNormInplaceWebgpuRunner {
+            pipeline: self.pipeline.clone(),
+            bind_group,
+            seq_len,
+        }
+    }
+}
+
+pub struct RmsNormInplaceWebgpuRunner {
+    pipeline: ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    seq_len: u32,
+}
+
+impl RmsNormInplaceWebgpuRunner {
+    pub fn forward(&self, cpass: &mut wgpu::ComputePass<'_>) {
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(self.seq_len, 1, 1);
     }
 }
 
@@ -429,7 +441,8 @@ mod tests {
             BufferView::new_2d_tight(&in_buf, seq_len as u32, hidden_size as u32, elem_size);
         let out_view =
             BufferView::new_2d_tight(&out_buf, seq_len as u32, hidden_size as u32, elem_size);
-        gpu.forward(&device, &queue, in_view, out_view);
+        let runner = gpu.plan(&device, &queue, in_view, out_view);
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
         let actual = download_f32(&device, &queue, &out_buf, seq_len * hidden_size);
 
         assert_approx_eq(&actual, &expected, 1e-4);
@@ -473,8 +486,8 @@ mod tests {
         )
         .unwrap();
 
-        let sliced_input = &input_full
-            [input_start_row * hidden_size..(input_start_row + num_rows) * hidden_size];
+        let sliced_input =
+            &input_full[input_start_row * hidden_size..(input_start_row + num_rows) * hidden_size];
         let expected = cpu_rms_norm(sliced_input, &weight_roundtrip, hidden_size, num_rows, 1e-6);
 
         let gpu = RmsNormWebgpu::new(&device, &queue, tv);
@@ -489,7 +502,8 @@ mod tests {
                 .narrow(0, input_start_row as u32, num_rows as u32);
         let out_view =
             BufferView::new_2d_tight(&out_buf, num_rows as u32, hidden_size as u32, elem_size);
-        gpu.forward(&device, &queue, in_view, out_view);
+        let runner = gpu.plan(&device, &queue, in_view, out_view);
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
         let actual = download_f32(&device, &queue, &out_buf, num_rows * hidden_size);
 
         assert_approx_eq(&actual, &expected, 1e-4);
@@ -557,7 +571,8 @@ mod tests {
         let buf = upload_f32(&device, &data);
         let elem_size = std::mem::size_of::<f32>() as u32;
         let view = BufferView::new_2d_tight(&buf, seq_len as u32, hidden_size as u32, elem_size);
-        gpu.forward(&device, &queue, view);
+        let runner = gpu.plan(&device, &queue, view);
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
         let actual = download_f32(&device, &queue, &buf, seq_len * hidden_size);
 
         assert_approx_eq(&actual, &expected, 1e-4);

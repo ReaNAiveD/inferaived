@@ -3,14 +3,17 @@ use safetensors::SafeTensors;
 use crate::{
     buffer_view::BufferView,
     kernels::{
-        attention::CausalGqaNaiveAttentionWebgpu,
-        binary::ElementwiseAddInplaceWebgpu,
-        mul_mat::MulMatWebgpu,
-        norm::{RmsNormInplaceWebgpu, RmsNormWebgpu},
-        rope::RopeInplaceWebgpu,
-        sigmoid_mul::SigmoidMulInplaceWebgpu,
+        attention::{CausalGqaNaiveAttentionWebgpu, CausalGqaNaiveAttentionWebgpuRunner},
+        binary::{ElementwiseAddInplaceWebgpu, ElementwiseAddInplaceWebgpuRunner},
+        mul_mat::{MulMatWebgpu, MulMatWebgpuRunner},
+        norm::{
+            RmsNormInplaceWebgpu, RmsNormInplaceWebgpuRunner, RmsNormWebgpu, RmsNormWebgpuRunner,
+        },
+        rope::{RopeInplaceWebgpu, RopeInplaceWebgpuRunner},
+        scatter_row::{ScatterRowWebgpu, ScatterRowWebgpuRunner},
+        sigmoid_mul::{SigmoidMulInplaceWebgpu, SigmoidMulInplaceWebgpuRunner},
     },
-    layers::{layer_session::LayerSession, mlp::MultiLayerPerceptron},
+    layers::mlp::{MlpRunners, MultiLayerPerceptron},
     log_tensor,
 };
 
@@ -37,6 +40,7 @@ pub struct SelfAttentionLayer {
     q_norm: RmsNormInplaceWebgpu,
     k_norm: RmsNormInplaceWebgpu,
     rope: RopeInplaceWebgpu,
+    kv_scatter: ScatterRowWebgpu,
     gqa_attention: CausalGqaNaiveAttentionWebgpu,
     sigmoid_mul: SigmoidMulInplaceWebgpu,
     o_proj_mul_mat: MulMatWebgpu,
@@ -146,6 +150,7 @@ impl SelfAttentionLayer {
             config.head_dim,
             config.head_dim,
         );
+        let kv_scatter = ScatterRowWebgpu::new(device, kv_dim);
         let sigmoid_mul =
             SigmoidMulInplaceWebgpu::new(device, config.num_attention_heads, config.head_dim);
         let o_proj_weight_name = format!("{}.self_attn.o_proj.weight", weight_prefix);
@@ -198,6 +203,7 @@ impl SelfAttentionLayer {
             q_norm,
             k_norm,
             rope,
+            kv_scatter,
             gqa_attention,
             sigmoid_mul,
             o_proj_mul_mat,
@@ -208,20 +214,17 @@ impl SelfAttentionLayer {
         }
     }
 
-    /// Run the full self-attention block (in-norm → q/k/v_proj →
-    /// q/k_norm → RoPE → causal GQA → output gate → o_proj → residual
-    /// + post-norm → MLP → residual) over the `[num_new, hidden_size]`
-    /// `residual_slot`, updating it in place.
-    pub fn forward(
+    /// Build a [`SelfAttentionLayerRunner`] that records this block's
+    /// dispatches into a caller-owned compute pass.
+    pub fn plan(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         residual_slot: BufferView<'_>,
-        prev_position: usize,
         k_cache_view: BufferView<'_>,
         v_cache_view: BufferView<'_>,
         position_buffer: &wgpu::Buffer,
-    ) {
+    ) -> SelfAttentionLayerRunner {
         let num_new_tokens = residual_slot.shape[0] as usize;
         debug_assert!(
             num_new_tokens >= 1,
@@ -233,7 +236,7 @@ impl SelfAttentionLayer {
         let sz = std::mem::size_of::<f32>() as u32;
         let num_new_u32 = num_new_tokens as u32;
         let hidden_size = self.hidden_size as u32;
-        let kv_prefix_rows = (prev_position + num_new_tokens) as u32;
+        let kv_dim = self.num_key_value_heads * self.head_dim;
         debug_assert_eq!(
             k_cache_view.rank, 3,
             "self_attention: k_cache must be rank-3"
@@ -266,12 +269,6 @@ impl SelfAttentionLayer {
             v_cache_view.shape[2] as usize, self.head_dim,
             "self_attention: v_cache shape[2] ({}) must equal head_dim ({})",
             v_cache_view.shape[2], self.head_dim,
-        );
-        debug_assert!(
-            kv_prefix_rows <= k_cache_view.shape[0],
-            "self_attention: prev_position+num_new ({}) exceeds k_cache max_seq ({})",
-            kv_prefix_rows,
-            k_cache_view.shape[0],
         );
 
         let normed_embedding_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -342,45 +339,191 @@ impl SelfAttentionLayer {
         let mlp_out_view =
             BufferView::new_2d_tight(&mlp_output_buffer, num_new_u32, hidden_size, sz);
 
-        let k_new = k_cache_view.narrow(0, prev_position as u32, num_new_u32);
-        let v_new = v_cache_view.narrow(0, prev_position as u32, num_new_u32);
-        let k_full_prefix = k_cache_view.narrow(0, 0, kv_prefix_rows);
-        let v_full_prefix = v_cache_view.narrow(0, 0, kv_prefix_rows);
-        let k_new_heads = k_new.flatten_outer(2);
+        let decode_kv_bytes =
+            (num_new_tokens * kv_dim * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
+        let decode_k_new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("self_attention_layer/decode_k_new_buffer"),
+            size: decode_kv_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let decode_v_new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("self_attention_layer/decode_v_new_buffer"),
+            size: decode_kv_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let decode_k_new_view = BufferView::new_3d_tight(
+            &decode_k_new_buffer,
+            num_new_u32,
+            self.num_key_value_heads as u32,
+            self.head_dim as u32,
+            sz,
+        );
+        let decode_v_new_view = BufferView::new_3d_tight(
+            &decode_v_new_buffer,
+            num_new_u32,
+            self.num_key_value_heads as u32,
+            self.head_dim as u32,
+            sz,
+        );
 
-        self.input_layernorm
-            .forward(device, queue, residual_slot, normed);
-        self.q_proj_mul_mat
-            .forward(device, queue, normed, q_gate_view);
+        let k_new_heads = decode_k_new_view.flatten_outer(2);
+
         let q_view = q_gate_view.select(2, 0);
         let gate_view = q_gate_view.select(2, 1);
         let q_heads_flat_view = q_view.flatten_outer(2);
-        self.k_proj_mul_mat.forward(device, queue, normed, k_new);
-        self.v_proj_mul_mat.forward(device, queue, normed, v_new);
-        self.q_norm.forward(device, queue, q_heads_flat_view);
-        self.k_norm.forward(device, queue, k_new_heads);
-        self.rope
-            .forward(device, queue, q_view, k_new, position_buffer);
-        self.gqa_attention.forward(
+
+        let input_layernorm_runner =
+            self.input_layernorm
+                .plan(device, queue, residual_slot, normed);
+        let q_proj_runner = self.q_proj_mul_mat.plan(device, queue, normed, q_gate_view);
+        let k_proj_runner = self
+            .k_proj_mul_mat
+            .plan(device, queue, normed, decode_k_new_view);
+        let v_proj_runner = self
+            .v_proj_mul_mat
+            .plan(device, queue, normed, decode_v_new_view);
+        let q_norm_runner = self.q_norm.plan(device, queue, q_heads_flat_view);
+        let k_norm_runner = self.k_norm.plan(device, queue, k_new_heads);
+        let rope_runner = self
+            .rope
+            .plan(device, queue, q_view, decode_k_new_view, position_buffer);
+        let scatter_k_runner = self.kv_scatter.plan(
+            device,
+            queue,
+            decode_k_new_view,
+            k_cache_view,
+            position_buffer,
+        );
+        let scatter_v_runner = self.kv_scatter.plan(
+            device,
+            queue,
+            decode_v_new_view,
+            v_cache_view,
+            position_buffer,
+        );
+        let attn_runner = self.gqa_attention.plan(
             device,
             queue,
             q_view,
-            k_full_prefix,
-            v_full_prefix,
+            k_cache_view,
+            v_cache_view,
             attn_out_view,
             position_buffer,
         );
-        self.sigmoid_mul
-            .forward(device, queue, attn_out_view, gate_view);
-        self.o_proj_mul_mat
-            .forward(device, queue, attn_out_view, o_proj_view);
-        self.attn_residual_add
-            .forward(device, queue, residual_slot, o_proj_view);
-        self.post_attention_layernorm
-            .forward(device, queue, residual_slot, normed);
-        self.mlp.forward(device, queue, normed, mlp_out_view);
-        self.mlp_residual_add
-            .forward(device, queue, residual_slot, mlp_out_view);
+        let sigmoid_mul_runner = self
+            .sigmoid_mul
+            .plan(device, queue, attn_out_view, gate_view);
+        let o_proj_runner = self
+            .o_proj_mul_mat
+            .plan(device, queue, attn_out_view, o_proj_view);
+        let attn_residual_runner =
+            self.attn_residual_add
+                .plan(device, queue, residual_slot, o_proj_view);
+        let post_attn_norm_runner =
+            self.post_attention_layernorm
+                .plan(device, queue, residual_slot, normed);
+        let mlp_runners = self.mlp.plan(device, queue, normed, mlp_out_view);
+        let mlp_residual_runner =
+            self.mlp_residual_add
+                .plan(device, queue, residual_slot, mlp_out_view);
+
+        SelfAttentionLayerRunner {
+            input_layernorm_runner,
+            q_proj_runner,
+            k_proj_runner,
+            v_proj_runner,
+            q_norm_runner,
+            k_norm_runner,
+            rope_runner,
+            scatter_k_runner,
+            scatter_v_runner,
+            attn_runner,
+            sigmoid_mul_runner,
+            o_proj_runner,
+            attn_residual_runner,
+            post_attn_norm_runner,
+            mlp_runners,
+            mlp_residual_runner,
+        }
+    }
+
+    pub fn forward(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        residual_slot: BufferView<'_>,
+        k_cache_view: BufferView<'_>,
+        v_cache_view: BufferView<'_>,
+        position_buffer: &wgpu::Buffer,
+    ) {
+        let runner = self.plan(
+            device,
+            queue,
+            residual_slot,
+            k_cache_view,
+            v_cache_view,
+            position_buffer,
+        );
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("self_attention_layer/command_encoder"),
+        });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("self_attention_layer/compute_pass"),
+                timestamp_writes: None,
+            });
+            runner.forward(&mut cpass);
+        }
+        queue.submit(Some(encoder.finish()));
+    }
+}
+
+/// Cached runners for one full-attention forward pass. Records its
+/// dispatches into a caller-owned compute pass via
+/// [`SelfAttentionLayerRunner::forward`].
+pub struct SelfAttentionLayerRunner {
+    input_layernorm_runner: RmsNormWebgpuRunner,
+    q_proj_runner: MulMatWebgpuRunner,
+    k_proj_runner: MulMatWebgpuRunner,
+    v_proj_runner: MulMatWebgpuRunner,
+    q_norm_runner: RmsNormInplaceWebgpuRunner,
+    k_norm_runner: RmsNormInplaceWebgpuRunner,
+    rope_runner: RopeInplaceWebgpuRunner,
+    scatter_k_runner: ScatterRowWebgpuRunner,
+    scatter_v_runner: ScatterRowWebgpuRunner,
+    attn_runner: CausalGqaNaiveAttentionWebgpuRunner,
+    sigmoid_mul_runner: SigmoidMulInplaceWebgpuRunner,
+    o_proj_runner: MulMatWebgpuRunner,
+    attn_residual_runner: ElementwiseAddInplaceWebgpuRunner,
+    post_attn_norm_runner: RmsNormWebgpuRunner,
+    mlp_runners: MlpRunners,
+    mlp_residual_runner: ElementwiseAddInplaceWebgpuRunner,
+}
+
+impl SelfAttentionLayerRunner {
+    pub fn forward(&self, cpass: &mut wgpu::ComputePass<'_>) {
+        self.input_layernorm_runner.forward(cpass);
+        self.q_proj_runner.forward(cpass);
+        self.k_proj_runner.forward(cpass);
+        self.v_proj_runner.forward(cpass);
+        self.q_norm_runner.forward(cpass);
+        self.k_norm_runner.forward(cpass);
+        self.rope_runner.forward(cpass);
+        self.scatter_k_runner.forward(cpass);
+        self.scatter_v_runner.forward(cpass);
+        self.attn_runner.forward(cpass);
+        self.sigmoid_mul_runner.forward(cpass);
+        self.o_proj_runner.forward(cpass);
+        self.attn_residual_runner.forward(cpass);
+        self.post_attn_norm_runner.forward(cpass);
+        self.mlp_runners.forward(cpass);
+        self.mlp_residual_runner.forward(cpass);
     }
 }
 
@@ -388,7 +531,6 @@ pub struct SelfAttentionLayerSession<'m> {
     layer: &'m SelfAttentionLayer,
     k_cache_buffer: wgpu::Buffer,
     v_cache_buffer: wgpu::Buffer,
-    position_buffer: wgpu::Buffer,
 }
 
 impl<'m> SelfAttentionLayerSession<'m> {
@@ -417,24 +559,16 @@ impl<'m> SelfAttentionLayerSession<'m> {
             layer,
             k_cache_buffer,
             v_cache_buffer,
-            position_buffer: device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("self_attention_layer/session/position_buffer"),
-                size: std::mem::size_of::<u32>() as wgpu::BufferAddress,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }),
         }
     }
-}
 
-impl<'m> LayerSession for SelfAttentionLayerSession<'m> {
-    fn forward(
-        &mut self,
+    pub fn plan(
+        &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         residual_slot: BufferView<'_>,
-        prev_position: usize,
-    ) {
+        position_buffer: &wgpu::Buffer,
+    ) -> SelfAttentionLayerRunner {
         let sz = std::mem::size_of::<f32>() as u32;
         let kv_dim = self.layer.num_key_value_heads * self.layer.head_dim;
         let max_seq_in_cache = (self.k_cache_buffer.size()
@@ -454,16 +588,13 @@ impl<'m> LayerSession for SelfAttentionLayerSession<'m> {
             self.layer.head_dim as u32,
             sz,
         );
-        let pos = prev_position as u32;
-        queue.write_buffer(&self.position_buffer, 0, bytemuck::bytes_of(&pos));
-        self.layer.forward(
+        self.layer.plan(
             device,
             queue,
             residual_slot,
-            prev_position,
             k_cache_view,
             v_cache_view,
-            &self.position_buffer,
-        );
+            position_buffer,
+        )
     }
 }

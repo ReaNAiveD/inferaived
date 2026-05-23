@@ -41,7 +41,6 @@ pub struct MambaScanWebgpu {
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
     ssm_params_buffer: wgpu::Buffer,
-    uniform_buffer: wgpu::Buffer,
 
     num_key_heads: u32,
     key_head_dim: u32,
@@ -189,24 +188,19 @@ impl MambaScanWebgpu {
             contents: bytemuck::cast_slice(&[dt_bias, a_log].concat()),
             usage: wgpu::BufferUsages::STORAGE,
         });
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mamba_scan/uniform_buffer"),
-            size: std::mem::size_of::<MambaScanParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         Self {
             bind_group_layout,
             pipeline,
             ssm_params_buffer,
-            uniform_buffer,
             num_key_heads,
             key_head_dim,
             value_head_dim,
         }
     }
 
-    pub fn compute(
+    /// Bake the per-buffer bindings into a [`MambaScanWebgpuRunner`]
+    /// for repeated dispatch into a caller-owned compute pass.
+    pub fn plan(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -216,7 +210,7 @@ impl MambaScanWebgpu {
         state_buffer: &wgpu::Buffer,
         dst_buffer: &wgpu::Buffer,
         seq_len: usize,
-    ) {
+    ) -> MambaScanWebgpuRunner {
         let params = MambaScanParams {
             num_key_heads: self.num_key_heads,
             key_head_dim: self.key_head_dim,
@@ -239,9 +233,15 @@ impl MambaScanWebgpu {
             output_head_stride: self.value_head_dim as u32,
             state_head_stride: (self.key_head_dim * self.value_head_dim) as u32,
         };
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[params]));
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mamba_scan_runner/uniform_buffer"),
+            size: std::mem::size_of::<MambaScanParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[params]));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("mamba_scan/bind_group"),
+            label: Some("mamba_scan_runner/bind_group"),
             layout: &self.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -270,23 +270,29 @@ impl MambaScanWebgpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
-                    resource: self.uniform_buffer.as_entire_binding(),
+                    resource: uniform_buffer.as_entire_binding(),
                 },
             ],
         });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("mamba_scan/command_encoder"),
-        });
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("mamba_scan/compute_pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.pipeline);
-            cpass.set_bind_group(0, &bind_group, &[]);
-            cpass.dispatch_workgroups(self.num_key_heads, 1, 1);
+        MambaScanWebgpuRunner {
+            pipeline: self.pipeline.clone(),
+            bind_group,
+            workgroup_count: self.num_key_heads,
         }
-        queue.submit(Some(encoder.finish()));
+    }
+}
+
+pub struct MambaScanWebgpuRunner {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    workgroup_count: u32,
+}
+
+impl MambaScanWebgpuRunner {
+    pub fn forward(&self, cpass: &mut wgpu::ComputePass<'_>) {
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(self.workgroup_count, 1, 1);
     }
 }
 
@@ -432,9 +438,10 @@ mod tests {
         let pb_buf = upload_f32(&device, &proj_b);
         let state_buf = upload_f32(&device, &vec![0.0f32; state_size]);
         let out_buf = create_f32_buffer(&device, seq_len * num_key_heads * value_head_dim);
-        gpu.compute(
+        let runner = gpu.plan(
             &device, &queue, &qkv_buf, &pa_buf, &pb_buf, &state_buf, &out_buf, seq_len,
         );
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
         let actual = download_f32(
             &device,
             &queue,

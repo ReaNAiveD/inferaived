@@ -3,11 +3,14 @@ use safetensors::SafeTensors;
 use crate::{
     buffer_view::BufferView,
     layers::{
-        layer_session::LayerSession,
         linear_attention::{
-            LinearAttentionConfig, LinearAttentionLayer, LinearAttentionLayerSession,
+            LinearAttentionConfig, LinearAttentionLayer, LinearAttentionLayerRunner,
+            LinearAttentionLayerSession,
         },
-        self_attention::{SelfAttentionConfig, SelfAttentionLayer, SelfAttentionLayerSession},
+        self_attention::{
+            SelfAttentionConfig, SelfAttentionLayer, SelfAttentionLayerRunner,
+            SelfAttentionLayerSession,
+        },
     },
 };
 
@@ -44,17 +47,39 @@ pub enum AttentionLayerSession<'m> {
     Full(SelfAttentionLayerSession<'m>),
 }
 
-impl<'m> LayerSession for AttentionLayerSession<'m> {
-    fn forward(
-        &mut self,
+impl<'m> AttentionLayerSession<'m> {
+    pub fn plan(
+        &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         residual_slot: BufferView<'_>,
-        prev_position: usize,
-    ) {
+        position_buffer: &wgpu::Buffer,
+    ) -> AttentionLayerRunner {
         match self {
-            Self::Linear(session) => session.forward(device, queue, residual_slot, prev_position),
-            Self::Full(session) => session.forward(device, queue, residual_slot, prev_position),
+            Self::Linear(session) => {
+                AttentionLayerRunner::Linear(session.plan(device, queue, residual_slot))
+            }
+            Self::Full(session) => AttentionLayerRunner::Full(session.plan(
+                device,
+                queue,
+                residual_slot,
+                position_buffer,
+            )),
+        }
+    }
+}
+
+/// Cached runners for one forward pass on a single transformer layer.
+pub enum AttentionLayerRunner {
+    Linear(LinearAttentionLayerRunner),
+    Full(SelfAttentionLayerRunner),
+}
+
+impl AttentionLayerRunner {
+    pub fn forward(&self, cpass: &mut wgpu::ComputePass<'_>) {
+        match self {
+            Self::Linear(d) => d.forward(cpass),
+            Self::Full(d) => d.forward(cpass),
         }
     }
 }
@@ -132,18 +157,32 @@ impl<'m> LayerStackSession<'m> {
             .collect();
         Self { sessions }
     }
-}
 
-impl<'m> LayerSession for LayerStackSession<'m> {
-    fn forward(
-        &mut self,
+    /// Build a [`LayerStackRunner`] holding one runner per layer.
+    pub fn plan(
+        &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         residual_slot: BufferView<'_>,
-        prev_position: usize,
-    ) {
-        for session in &mut self.sessions {
-            session.forward(device, queue, residual_slot, prev_position);
+        position_buffer: &wgpu::Buffer,
+    ) -> LayerStackRunner {
+        let runners = self
+            .sessions
+            .iter()
+            .map(|session| session.plan(device, queue, residual_slot, position_buffer))
+            .collect();
+        LayerStackRunner { runners }
+    }
+}
+
+pub struct LayerStackRunner {
+    runners: Vec<AttentionLayerRunner>,
+}
+
+impl LayerStackRunner {
+    pub fn forward(&self, cpass: &mut wgpu::ComputePass<'_>) {
+        for runner in &self.runners {
+            runner.forward(cpass);
         }
     }
 }

@@ -3,14 +3,14 @@ use safetensors::SafeTensors;
 use crate::{
     buffer_view::BufferView,
     kernels::{
-        binary::ElementwiseAddInplaceWebgpu,
-        conv_silu::{ChannelMode, ConvSiluWebgpu},
-        delta_rule::DeltaRuleWebgpu,
-        gated_rms_norm::GatedRmsNormInplaceWebgpu,
-        mul_mat::MulMatWebgpu,
-        norm::RmsNormWebgpu,
+        binary::{ElementwiseAddInplaceWebgpu, ElementwiseAddInplaceWebgpuRunner},
+        conv_silu::{ChannelMode, ConvSiluWebgpu, ConvSiluWebgpuRunner},
+        delta_rule::{DeltaRuleWebgpu, DeltaRuleWebgpuRunner},
+        gated_rms_norm::{GatedRmsNormInplaceWebgpu, GatedRmsNormWebgpuRunner},
+        mul_mat::{MulMatWebgpu, MulMatWebgpuRunner},
+        norm::{RmsNormWebgpu, RmsNormWebgpuRunner},
     },
-    layers::{layer_session::LayerSession, mlp::MultiLayerPerceptron},
+    layers::mlp::{MlpRunners, MultiLayerPerceptron},
     log_tensor,
 };
 
@@ -252,18 +252,18 @@ impl LinearAttentionLayer {
         }
     }
 
-    /// Run the linear-attention block (in-norm → in_proj_qkv/a/b/z →
-    /// conv-silu → delta-rule → gated-norm → out_proj → residual +
-    /// post-norm → MLP → residual) over the `[num_new, hidden_size]`
-    /// `residual_slot`, updating it in place.
-    pub fn forward(
+    /// Build a [`LinearAttentionLayerRunner`] that records this
+    /// block's dispatches into a caller-owned compute pass. All
+    /// scratch buffers and bind groups are allocated here and stay
+    /// alive via the runner.
+    pub fn plan(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         residual_slot: BufferView<'_>,
         conv_state: BufferView<'_>,
         recurrent_state: BufferView<'_>,
-    ) {
+    ) -> LinearAttentionLayerRunner {
         let num_new_tokens = residual_slot.shape[0] as usize;
         debug_assert!(
             num_new_tokens >= 1,
@@ -395,17 +395,22 @@ impl LinearAttentionLayer {
         let mlp_out_view =
             BufferView::new_2d_tight(&mlp_output_buffer, num_new_u32, hidden_size, sz);
 
-        self.input_layernorm
-            .forward(device, queue, residual_slot, normed_view);
-        self.in_proj_qkv_mul_mat
-            .forward(device, queue, normed_view, qkv_view);
-        self.in_proj_a_mul_mat
-            .forward(device, queue, normed_view, proj_a_view);
-        self.in_proj_b_mul_mat
-            .forward(device, queue, normed_view, proj_b_view);
-        self.conv_silu
-            .forward(device, queue, qkv_view, conv_qkv_view, conv_state);
-        self.delta_rule.forward(
+        let input_layernorm_runner =
+            self.input_layernorm
+                .plan(device, queue, residual_slot, normed_view);
+        let in_proj_qkv_runner =
+            self.in_proj_qkv_mul_mat
+                .plan(device, queue, normed_view, qkv_view);
+        let in_proj_a_runner = self
+            .in_proj_a_mul_mat
+            .plan(device, queue, normed_view, proj_a_view);
+        let in_proj_b_runner = self
+            .in_proj_b_mul_mat
+            .plan(device, queue, normed_view, proj_b_view);
+        let conv_silu_runner =
+            self.conv_silu
+                .plan(device, queue, qkv_view, conv_qkv_view, conv_state);
+        let delta_rule_runner = self.delta_rule.plan(
             device,
             queue,
             conv_qkv_view,
@@ -414,19 +419,100 @@ impl LinearAttentionLayer {
             recurrent_state,
             attn_out_v_view,
         );
-        self.in_proj_z_mul_mat
-            .forward(device, queue, normed_view, proj_z_view);
-        self.gated_norm
-            .forward(device, queue, attn_out_v_view, proj_z_view);
-        self.out_proj_mat_mul
-            .forward(device, queue, attn_out_v_view, out_proj_view);
-        self.attn_residual_add
-            .forward(device, queue, residual_slot, out_proj_view);
-        self.post_attention_layernorm
-            .forward(device, queue, residual_slot, normed_view);
-        self.mlp.forward(device, queue, normed_view, mlp_out_view);
-        self.mlp_residual_add
-            .forward(device, queue, residual_slot, mlp_out_view);
+        let in_proj_z_runner = self
+            .in_proj_z_mul_mat
+            .plan(device, queue, normed_view, proj_z_view);
+        let gated_norm_runner = self
+            .gated_norm
+            .plan(device, queue, attn_out_v_view, proj_z_view);
+        let out_proj_runner =
+            self.out_proj_mat_mul
+                .plan(device, queue, attn_out_v_view, out_proj_view);
+        let attn_residual_runner =
+            self.attn_residual_add
+                .plan(device, queue, residual_slot, out_proj_view);
+        let post_attn_norm_runner =
+            self.post_attention_layernorm
+                .plan(device, queue, residual_slot, normed_view);
+        let mlp_runners = self.mlp.plan(device, queue, normed_view, mlp_out_view);
+        let mlp_residual_runner =
+            self.mlp_residual_add
+                .plan(device, queue, residual_slot, mlp_out_view);
+
+        LinearAttentionLayerRunner {
+            input_layernorm_runner,
+            in_proj_qkv_runner,
+            in_proj_a_runner,
+            in_proj_b_runner,
+            conv_silu_runner,
+            delta_rule_runner,
+            in_proj_z_runner,
+            gated_norm_runner,
+            out_proj_runner,
+            attn_residual_runner,
+            post_attn_norm_runner,
+            mlp_runners,
+            mlp_residual_runner,
+        }
+    }
+
+    pub fn forward(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        residual_slot: BufferView<'_>,
+        conv_state: BufferView<'_>,
+        recurrent_state: BufferView<'_>,
+    ) {
+        let runner = self.plan(device, queue, residual_slot, conv_state, recurrent_state);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("linear_attention_layer/command_encoder"),
+        });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("linear_attention_layer/compute_pass"),
+                timestamp_writes: None,
+            });
+            runner.forward(&mut cpass);
+        }
+        queue.submit(Some(encoder.finish()));
+    }
+}
+
+/// Cached runners for one linear-attention forward pass. Records its
+/// dispatches into a caller-owned compute pass via
+/// [`LinearAttentionLayerRunner::forward`].
+pub struct LinearAttentionLayerRunner {
+    input_layernorm_runner: RmsNormWebgpuRunner,
+    in_proj_qkv_runner: MulMatWebgpuRunner,
+    in_proj_a_runner: MulMatWebgpuRunner,
+    in_proj_b_runner: MulMatWebgpuRunner,
+    conv_silu_runner: ConvSiluWebgpuRunner,
+    delta_rule_runner: DeltaRuleWebgpuRunner,
+    in_proj_z_runner: MulMatWebgpuRunner,
+    gated_norm_runner: GatedRmsNormWebgpuRunner,
+    out_proj_runner: MulMatWebgpuRunner,
+    attn_residual_runner: ElementwiseAddInplaceWebgpuRunner,
+    post_attn_norm_runner: RmsNormWebgpuRunner,
+    mlp_runners: MlpRunners,
+    mlp_residual_runner: ElementwiseAddInplaceWebgpuRunner,
+}
+
+impl LinearAttentionLayerRunner {
+    pub fn forward(&self, cpass: &mut wgpu::ComputePass<'_>) {
+        self.input_layernorm_runner.forward(cpass);
+        self.in_proj_qkv_runner.forward(cpass);
+        self.in_proj_a_runner.forward(cpass);
+        self.in_proj_b_runner.forward(cpass);
+        self.conv_silu_runner.forward(cpass);
+        self.delta_rule_runner.forward(cpass);
+        self.in_proj_z_runner.forward(cpass);
+        self.gated_norm_runner.forward(cpass);
+        self.out_proj_runner.forward(cpass);
+        self.attn_residual_runner.forward(cpass);
+        self.post_attn_norm_runner.forward(cpass);
+        self.mlp_runners.forward(cpass);
+        self.mlp_residual_runner.forward(cpass);
     }
 }
 
@@ -466,30 +552,32 @@ impl<'m> LinearAttentionLayerSession<'m> {
             recurrent_state_buffer,
         }
     }
-}
 
-impl<'m> LayerSession for LinearAttentionLayerSession<'m> {
-    fn forward(
-        &mut self,
+    /// Build a [`LinearAttentionLayerRunner`] for this session,
+    /// referencing the session-owned conv and recurrent state.
+    pub fn plan(
+        &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         residual_slot: BufferView<'_>,
-        _prev_position: usize,
-    ) {
+    ) -> LinearAttentionLayerRunner {
         let sz = std::mem::size_of::<f32>() as u32;
-        let conv_state_view =
-            BufferView::new_1d(&self.conv_state_buffer, sz, self.layer.conv_state_size as u32);
+        let conv_state_view = BufferView::new_1d(
+            &self.conv_state_buffer,
+            sz,
+            self.layer.conv_state_size as u32,
+        );
         let recurrent_state_view = BufferView::new_1d(
             &self.recurrent_state_buffer,
             sz,
             self.layer.recurrent_state_size as u32,
         );
-        self.layer.forward(
+        self.layer.plan(
             device,
             queue,
             residual_slot,
             conv_state_view,
             recurrent_state_view,
-        );
+        )
     }
 }

@@ -205,7 +205,7 @@ async fn main() {
     // hit a fresh cache, just like the measure phase).
     let mut results: Vec<RunResult> = Vec::with_capacity(runs);
     for run_idx in 0..runs {
-        let mut session = Qwen35Session::new(&model, &device, max_seq_len);
+        let mut session = Qwen35Session::new(&model, &device, &queue, max_seq_len);
 
         // Prefill: encode prompt + run first forward. We treat the entire
         // first call as TTFT, including its CPU readback (which is part of

@@ -105,6 +105,24 @@ pub fn download_f32(
     data
 }
 
+pub fn run_blocking_compute(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    record: impl FnOnce(&mut wgpu::ComputePass<'_>),
+) {
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("test/encoder"),
+    });
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("test/compute_pass"),
+            timestamp_writes: None,
+        });
+        record(&mut cpass);
+    }
+    queue.submit(Some(encoder.finish()));
+}
+
 /// Pack a slice of `f32` values into packed bf16 u32 pairs (2 bf16 per u32).
 /// Odd-length inputs are padded with a single zero bf16 in the high lane of
 /// the final u32 — this matches how `MulMatWebgpu` pads its weight buffer.

@@ -4,7 +4,7 @@ use crate::{
     buffer_view::BufferView,
     kernels::{
         attention::{CausalGqaNaiveAttentionWebgpu, CausalGqaNaiveAttentionWebgpuRunner},
-        binary::{ElementwiseAddInplaceWebgpu, ElementwiseAddInplaceWebgpuRunner},
+        elementwise_add::{ElementwiseAddInplaceWebgpu, ElementwiseAddInplaceWebgpuRunner},
         mul_mat::{MulMatWebgpu, MulMatWebgpuRunner},
         norm::{
             RmsNormInplaceWebgpu, RmsNormInplaceWebgpuRunner, RmsNormWebgpu, RmsNormWebgpuRunner,

@@ -3,9 +3,9 @@ use safetensors::SafeTensors;
 use crate::{
     buffer_view::BufferView,
     kernels::{
-        binary::{ElementwiseAddInplaceWebgpu, ElementwiseAddInplaceWebgpuRunner},
         conv_silu::{ChannelMode, ConvSiluWebgpu, ConvSiluWebgpuRunner},
         delta_rule::{DeltaRuleWebgpu, DeltaRuleWebgpuRunner},
+        elementwise_add::{ElementwiseAddInplaceWebgpu, ElementwiseAddInplaceWebgpuRunner},
         gated_rms_norm::{GatedRmsNormInplaceWebgpu, GatedRmsNormWebgpuRunner},
         mul_mat::{MulMatWebgpu, MulMatWebgpuRunner},
         norm::{RmsNormWebgpu, RmsNormWebgpuRunner},

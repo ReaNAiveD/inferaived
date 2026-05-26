@@ -1,10 +1,11 @@
 pub mod buffer_view;
 pub mod embedding_lookup;
+pub mod gpu_sampler;
 pub mod kernels;
 pub mod language_model;
 pub mod layers;
 pub mod lm_head;
-pub mod sampler;
+pub mod sampling;
 
 #[cfg(test)]
 pub(crate) mod gpu_test_utils;

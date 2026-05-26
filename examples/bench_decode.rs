@@ -22,7 +22,8 @@
 //! measured only over the `BENCH_MEASURE_TOKENS` post-warmup tokens, so it excludes
 //! both prefill and the warmup decode steps.
 
-use inferaived::language_model::{LayerType, Qwen35Config, Qwen35Model, Qwen35Session};
+use inferaived::language_model::{LayerType, Qwen35Config, Qwen35GpuModel, Qwen35GpuSession};
+use inferaived::sampling::SamplingParams;
 use safetensors::SafeTensors;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokenizers::Tokenizer;
@@ -197,7 +198,7 @@ async fn main() {
     );
 
     let config = qwen35_0_8b_config();
-    let model = Qwen35Model::new(&device, &queue, &tensors, &config);
+    let model = Qwen35GpuModel::new(&device, &queue, &tensors, &config);
 
     // -------- runs --------
     // Each run builds a fresh session so KV-cache state doesn't leak across
@@ -205,28 +206,29 @@ async fn main() {
     // hit a fresh cache, just like the measure phase).
     let mut results: Vec<RunResult> = Vec::with_capacity(runs);
     for run_idx in 0..runs {
-        let mut session = Qwen35Session::new(&model, &device, &queue, max_seq_len);
+        let mut session = Qwen35GpuSession::new(&model, &device, &queue, max_seq_len);
+        let params = SamplingParams::default();
 
         // Prefill: encode prompt + run first forward. We treat the entire
         // first call as TTFT, including its CPU readback (which is part of
         // the user-observable latency anyway).
         let t0 = Instant::now();
-        let top = session.forward(&device, &queue, &prompt_ids, 1).await;
+        let tok = session.step(&device, &queue, &prompt_ids, &params).await;
         let ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let mut next = top[0].0 as u32;
+        let mut next = tok.id;
 
         // Warmup decode steps (untimed): covers pipeline compilation that
         // wasn't triggered by prefill and any first-touch caching effects.
         for _ in 0..warmup_tokens {
-            let top = session.forward(&device, &queue, &[next], 1).await;
-            next = top[0].0 as u32;
+            let tok = session.step(&device, &queue, &[next], &params).await;
+            next = tok.id;
         }
 
         // Measured decode steps.
         let t1 = Instant::now();
         for _ in 0..measure_tokens {
-            let top = session.forward(&device, &queue, &[next], 1).await;
-            next = top[0].0 as u32;
+            let tok = session.step(&device, &queue, &[next], &params).await;
+            next = tok.id;
         }
         let decode_secs = t1.elapsed().as_secs_f64();
         let decode_tok_s = measure_tokens as f64 / decode_secs;

@@ -1,4 +1,5 @@
-use inferaived::language_model::{LayerType, Qwen35Config, Qwen35Model, Qwen35Session};
+use inferaived::language_model::{LayerType, Qwen35Config, Qwen35GpuModel, Qwen35GpuSession};
+use inferaived::sampling::SamplingParams;
 use safetensors::SafeTensors;
 use tokenizers::Tokenizer;
 use tokio;
@@ -112,7 +113,7 @@ async fn main() {
     info!("Device requested successfully");
 
     let config = qwen35_0_8b_config();
-    let model = Qwen35Model::new(&device, &queue, &tensors, &config);
+    let model = Qwen35GpuModel::new(&device, &queue, &tensors, &config);
     info!("Model constructed");
 
     // Small max_seq_len is enough for this smoke test (prompt + a few
@@ -120,35 +121,32 @@ async fn main() {
     // chat.
     let max_seq_len = 32;
     let num_generated = 5;
-    let mut session = Qwen35Session::new(&model, &device, &queue, max_seq_len);
+    let mut session = Qwen35GpuSession::new(&model, &device, &queue, max_seq_len);
+    let params = SamplingParams::default();
 
-    // Cold prefill of the prompt; the top candidates are for the FIRST
-    // token immediately after the prompt.
-    let prompt_top = session.forward(&device, &queue, encoded.get_ids(), 5).await;
-    let first_token = prompt_top[0].0 as u32;
-    println!(
-        "Prefill picked token {}: {:?} (top 5: {:?})",
-        first_token,
-        tokenizer.decode(&[first_token], false).unwrap_or_default(),
-        prompt_top,
-    );
-
-    // Decode loop: feed the previously-sampled token back into the session
-    // one at a time and take the greedy pick each step.
-    let mut generated: Vec<u32> = vec![first_token];
-    let mut next_input = first_token;
-    for _ in 0..(num_generated - 1) {
-        let top = session.forward(&device, &queue, &[next_input], 5).await;
-        let tok = top[0].0 as u32;
+    // One call drives prefill + the whole decode loop. No EOS stop here
+    // (the base model isn't instruct-tuned); we cap by `num_generated`.
+    let sampled = session
+        .generate(
+            &device,
+            &queue,
+            encoded.get_ids(),
+            &params,
+            num_generated,
+            &[],
+        )
+        .await;
+    for (i, tok) in sampled.iter().enumerate() {
+        let label = if i == 0 { "Prefill" } else { "Step" };
         println!(
-            "Step picked token {}: {:?} (top 5: {:?})",
-            tok,
-            tokenizer.decode(&[tok], false).unwrap_or_default(),
-            top,
+            "{} picked token {}: {:?} (logprob {:.4})",
+            label,
+            tok.id,
+            tokenizer.decode(&[tok.id], false).unwrap_or_default(),
+            tok.logprob,
         );
-        generated.push(tok);
-        next_input = tok;
     }
+    let generated: Vec<u32> = sampled.iter().map(|t| t.id).collect();
 
     let generated_text = tokenizer
         .decode(&generated, false)

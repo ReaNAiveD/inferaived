@@ -1,8 +1,10 @@
+pub mod argmax;
 pub mod attention;
-pub mod binary;
 pub mod conv_silu;
 pub mod delta_rule;
+pub mod elementwise_add;
 pub mod gated_rms_norm;
+pub mod get_rows;
 pub mod mamba_scan;
 pub mod mul_mat;
 pub mod norm;

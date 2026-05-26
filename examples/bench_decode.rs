@@ -27,6 +27,7 @@ use inferaived::sampling::SamplingParams;
 use safetensors::SafeTensors;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokenizers::Tokenizer;
+use tokio_stream::StreamExt;
 use tracing::info;
 use wgpu::{
     BackendOptions, Backends, DeviceDescriptor, ExperimentalFeatures, Features, Instance,
@@ -59,8 +60,8 @@ fn features(supported: Features) -> Features {
     required
 }
 
-/// Hardcoded Qwen 3.5 0.8B model config. Kept in sync with `main.rs`; TODO:
-/// load from `config.json` and share between binaries.
+/// Hardcoded Qwen 3.5 0.8B model config. Kept in sync with `generate.rs`; TODO:
+/// load from `config.json` and share between examples.
 fn qwen35_0_8b_config() -> Qwen35Config {
     let layer_types: Vec<LayerType> = (0..24)
         .map(|i| {
@@ -217,18 +218,24 @@ async fn main() {
         let ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let mut next = tok.id;
 
-        // Warmup decode steps (untimed): covers pipeline compilation that
-        // wasn't triggered by prefill and any first-touch caching effects.
-        for _ in 0..warmup_tokens {
-            let tok = session.step(&device, &queue, &[next], &params).await;
-            next = tok.id;
+        // Warmup decode (untimed): covers pipeline compilation and
+        // first-touch caching not exercised by prefill.
+        if warmup_tokens > 0 {
+            let warm: Vec<_> = session
+                .generate(&device, &queue, &[next], &params, warmup_tokens, &[])
+                .collect()
+                .await;
+            next = warm.last().expect("non-empty warmup").id;
         }
 
-        // Measured decode steps.
+        // Measured decode. Drive the stream by hand so we don't allocate
+        // a Vec we'll just throw away.
         let t1 = Instant::now();
-        for _ in 0..measure_tokens {
-            let tok = session.step(&device, &queue, &[next], &params).await;
-            next = tok.id;
+        {
+            let seed = [next];
+            let stream = session.generate(&device, &queue, &seed, &params, measure_tokens, &[]);
+            tokio::pin!(stream);
+            while stream.next().await.is_some() {}
         }
         let decode_secs = t1.elapsed().as_secs_f64();
         let decode_tok_s = measure_tokens as f64 / decode_secs;

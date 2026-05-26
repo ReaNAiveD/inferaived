@@ -1,8 +1,10 @@
+use std::io::Write;
+
 use inferaived::language_model::{LayerType, Qwen35Config, Qwen35GpuModel, Qwen35GpuSession};
-use inferaived::sampling::SamplingParams;
+use inferaived::sampling::{SamplingParams, StoppingCriteria};
 use safetensors::SafeTensors;
 use tokenizers::Tokenizer;
-use tokio;
+use tokio_stream::StreamExt;
 use tracing::{debug, info};
 use wgpu::{
     BackendOptions, Backends, DeviceDescriptor, ExperimentalFeatures, Features, Instance,
@@ -116,40 +118,47 @@ async fn main() {
     let model = Qwen35GpuModel::new(&device, &queue, &tensors, &config);
     info!("Model constructed");
 
-    // Small max_seq_len is enough for this smoke test (prompt + a few
-    // generated tokens). Bump this up for longer generation or multi-turn
-    // chat.
-    let max_seq_len = 32;
-    let num_generated = 5;
+    // Cap generation at 1000 tokens, or stop early when the model
+    // emits any of the configured EOS tokens. `<|im_end|>` is Qwen's
+    // chat-tuned EOS; `<|endoftext|>` is the base-model end-of-document
+    // marker and is the one most likely to fire for a non-instruct
+    // continuation prompt.
+    let max_tokens = 1000;
+    let max_seq_len = encoded.get_ids().len() + max_tokens;
     let mut session = Qwen35GpuSession::new(&model, &device, &queue, max_seq_len);
     let params = SamplingParams::default();
+    let eos_ids: Vec<u32> = ["<|im_end|>", "<|endoftext|>"]
+        .iter()
+        .filter_map(|s| tokenizer.token_to_id(s))
+        .collect();
+    let stopping = [StoppingCriteria::Eos(eos_ids)];
 
-    // One call drives prefill + the whole decode loop. No EOS stop here
-    // (the base model isn't instruct-tuned); we cap by `num_generated`.
-    let sampled = session
-        .generate(
-            &device,
-            &queue,
-            encoded.get_ids(),
-            &params,
-            num_generated,
-            &[],
-        )
-        .await;
-    for (i, tok) in sampled.iter().enumerate() {
-        let label = if i == 0 { "Prefill" } else { "Step" };
-        println!(
-            "{} picked token {}: {:?} (logprob {:.4})",
-            label,
-            tok.id,
-            tokenizer.decode(&[tok.id], false).unwrap_or_default(),
-            tok.logprob,
-        );
+    // Stream tokens as they arrive so the user gets visible progress
+    // instead of waiting ~30 s for 1000 tokens at ~30 tok/s.
+    print!("{}", prompt);
+    std::io::stdout().flush().ok();
+    let stream = session.generate(
+        &device,
+        &queue,
+        encoded.get_ids(),
+        &params,
+        max_tokens,
+        &stopping,
+    );
+    tokio::pin!(stream);
+    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
+    while let Some(tok) = stream.next().await {
+        let piece = tokenizer.decode(&[tok.id], false).unwrap_or_default();
+        print!("{}", piece);
+        std::io::stdout().flush().ok();
+        generated.push(tok.id);
     }
-    let generated: Vec<u32> = sampled.iter().map(|t| t.id).collect();
+    println!();
 
-    let generated_text = tokenizer
-        .decode(&generated, false)
-        .expect("Failed to decode generated tokens");
-    println!("Prompt + generated: {:?}{:?}", prompt, generated_text);
+    let hit_eos = generated
+        .last()
+        .map(|id| matches!(&stopping[0], StoppingCriteria::Eos(eos) if eos.contains(id)))
+        .unwrap_or(false);
+    let reason = if hit_eos { "EOS" } else { "max_tokens" };
+    println!("--- generated {} tokens (stopped on {}) ---", generated.len(), reason);
 }

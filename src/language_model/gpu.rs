@@ -1,3 +1,5 @@
+use async_stream::stream;
+use futures_core::Stream;
 use safetensors::SafeTensors;
 
 use crate::{
@@ -211,10 +213,13 @@ impl<'m> Qwen35GpuSession<'m> {
     }
 
     /// Append `input_ids` to the session, dispatch the GPU pipeline,
-    /// and return the token id the GPU sampler wrote to `current_token`.
+    /// and return the token id the sampler picked from the last
+    /// position's logits. `input_ids` is always honored verbatim.
     ///
-    /// `_params` is reserved for the temperature / top-k / top-p stages
-    /// landing in migration step 7; the current greedy kernel ignores it.
+    /// For a self-feeding generation loop, prefer
+    /// [`generate`](Self::generate) — it skips a per-step CPU→GPU
+    /// token write that is safe to elide only when the caller-supplied
+    /// id is guaranteed to match the previous sampler output.
     pub async fn step(
         &mut self,
         device: &wgpu::Device,
@@ -239,16 +244,10 @@ impl<'m> Qwen35GpuSession<'m> {
         );
 
         let token_id = if num_new == 1 {
-            // Decode: write the new token into `current_token`. The previous
-            // step's sampler may have already written the same value, but
-            // honoring `input_ids` lets the caller force an arbitrary token
-            // (e.g. speculative-decoding rejection path).
             queue.write_buffer(&self.current_token, 0, bytemuck::bytes_of(&input_ids[0]));
             self.run_and_read_back_token(device, queue, &self.decode_runner)
                 .await
         } else {
-            // Prefill: write input_ids into `prefill_tokens` at the right
-            // offset, build a one-shot runner that embeds num_new tokens.
             let u32_size = std::mem::size_of::<u32>() as wgpu::BufferAddress;
             let dst_byte_offset = prev_position as wgpu::BufferAddress * u32_size;
             queue.write_buffer(
@@ -262,40 +261,88 @@ impl<'m> Qwen35GpuSession<'m> {
 
         self.tokens.extend_from_slice(input_ids);
         self.position += num_new;
+        // GPU sampler doesn't compute logprob; use Qwen35CpuSession if needed.
         SampledToken {
             id: token_id,
-            // GPU sampler doesn't compute logprob yet (step 7 may add it).
-            // Consumers that need it should use Qwen35CpuSession.
             logprob: f32::NAN,
         }
     }
 
-    /// Repeatedly [`step`](Self::step) the session up to `max_tokens`
-    /// times, stopping early if any element of `stopping` fires. See
-    /// [`crate::language_model::Qwen35CpuSession::generate`] for the
-    /// shared rationale.
-    pub async fn generate(
+    /// Encode `input_ids` and continue sampling up to `max_tokens`
+    /// tokens (inclusive of the first), stopping early when any
+    /// element of `stopping` fires.
+    /// 
+    /// Returns a lazy `impl Stream`; tokens are produced as the
+    /// caller polls. Dropping the stream (or breaking the consumer
+    /// loop) aborts generation without launching further GPU work.
+    /// Use `tokio_stream::StreamExt` or `futures_util::StreamExt` to
+    /// drive it with `.next().await` / `.collect().await`.
+    pub fn generate<'a>(
+        &'a mut self,
+        device: &'a wgpu::Device,
+        queue: &'a wgpu::Queue,
+        input_ids: &'a [u32],
+        params: &SamplingParams,
+        max_tokens: usize,
+        stopping: &'a [StoppingCriteria],
+    ) -> impl Stream<Item = SampledToken> + Send + 'a {
+        debug_assert!(max_tokens >= 1, "generate: max_tokens must be >= 1");
+        debug_assert!(
+            !input_ids.is_empty(),
+            "generate: input_ids must be non-empty",
+        );
+        let params = *params;
+        stream! {
+            let mut tok = self.step(device, queue, input_ids, &params).await;
+            yield tok;
+            if stopping.iter().any(|s| s.is_done(&self.tokens, tok)) {
+                return;
+            }
+            for _ in 1..max_tokens {
+                tok = self.decode_next(device, queue, tok.id, &params).await;
+                yield tok;
+                if stopping.iter().any(|s| s.is_done(&self.tokens, tok)) {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// In-place decode step. Assumes `current_token` already holds
+    /// `prev_sampled_id`, so it skips the `write_buffer(current_token, …)`
+    /// that `step` performs. The precondition is impossible to check
+    /// at the API boundary, so this stays private and is only reachable
+    /// from [`generate`](Self::generate), which feeds back its own
+    /// previous return value.
+    async fn decode_next(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        input_ids: &[u32],
-        params: &SamplingParams,
-        max_tokens: usize,
-        stopping: &[StoppingCriteria],
-    ) -> Vec<SampledToken> {
-        debug_assert!(max_tokens >= 1, "generate: max_tokens must be >= 1");
-        let mut out = Vec::with_capacity(max_tokens);
-        let mut input: Vec<u32> = input_ids.to_vec();
-        for _ in 0..max_tokens {
-            let tok = self.step(device, queue, &input, params).await;
-            out.push(tok);
-            if stopping.iter().any(|s| s.is_done(&self.tokens, tok)) {
-                break;
-            }
-            input.clear();
-            input.push(tok.id);
+        prev_sampled_id: u32,
+        _params: &SamplingParams,
+    ) -> SampledToken {
+        let prev_position = self.position;
+        debug_assert!(
+            prev_position + 1 <= self.max_seq_len,
+            "session overflow: position {} + 1 exceeds max_seq_len {}",
+            prev_position,
+            self.max_seq_len,
+        );
+        queue.write_buffer(
+            &self.position_buffer,
+            0,
+            bytemuck::bytes_of(&(prev_position as u32)),
+        );
+        let token_id = self
+            .run_and_read_back_token(device, queue, &self.decode_runner)
+            .await;
+
+        self.tokens.push(prev_sampled_id);
+        self.position += 1;
+        SampledToken {
+            id: token_id,
+            logprob: f32::NAN,
         }
-        out
     }
 
     async fn run_and_read_back_token(

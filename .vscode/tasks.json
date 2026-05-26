@@ -8,8 +8,8 @@
             "args": [
                 "--package",
                 "inferaived",
-                "--bin",
-                "inferaived"
+                "--example",
+                "generate"
             ],
             "env": {
                 "RUST_LOG": "debug"
@@ -28,8 +28,8 @@
             "args": [
                 "--package",
                 "inferaived",
-                "--bin",
-                "inferaived"
+                "--example",
+                "generate"
             ],
             "env": {
                 "RUST_LOG": "info"

@@ -12,7 +12,7 @@ use crate::{
     sampling::{SampledToken, SamplingParams, StoppingCriteria},
 };
 
-use super::{Qwen35Config, Qwen35ModelCore};
+use super::{Qwen35ModelCore, Qwen35TextConfig};
 
 /// GPU-backend model: shared mid-stack + GPU embed lookup + GPU sampler
 /// kernel. Per-request configuration is just `SamplingParams`.
@@ -27,7 +27,7 @@ impl Qwen35GpuModel {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         tensors: &SafeTensors<'data>,
-        config: &Qwen35Config,
+        config: &Qwen35TextConfig,
     ) -> Self {
         let embed_tokens = tensors
             .tensor("model.language_model.embed_tokens.weight")

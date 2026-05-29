@@ -11,7 +11,7 @@ use crate::{
     log_tensor,
 };
 
-use super::{LayerType, Qwen35Config};
+use super::{AttentionType, Qwen35TextConfig};
 
 /// GPU mid-stack shared by both backends. Running the LM-head mat-mul
 /// on CPU is impractical (vocab × hidden = 248K × 1024 bf16 muls per
@@ -30,15 +30,15 @@ impl Qwen35ModelCore {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         tensors: &SafeTensors<'data>,
-        config: &Qwen35Config,
+        config: &Qwen35TextConfig,
         embed_tokens: TensorView<'data>,
     ) -> Self {
         let self_attention_config = SelfAttentionConfig {
             num_attention_heads: config.num_attention_heads,
             num_key_value_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
-            rope_theta: config.rope_theta,
-            partial_rotary_factor: config.partial_rotary_factor,
+            rope_theta: config.rope_parameters.rope_theta,
+            partial_rotary_factor: config.rope_parameters.partial_rotary_factor,
             intermediate_size: config.intermediate_size,
         };
         let linear_attention_config = LinearAttentionConfig {
@@ -52,8 +52,8 @@ impl Qwen35ModelCore {
             .layer_types
             .iter()
             .map(|layer_type| match layer_type {
-                LayerType::Linear => LayerConfig::Linear(linear_attention_config.clone()),
-                LayerType::Full => LayerConfig::Full(self_attention_config.clone()),
+                AttentionType::Linear => LayerConfig::Linear(linear_attention_config.clone()),
+                AttentionType::Full => LayerConfig::Full(self_attention_config.clone()),
             })
             .collect();
         let layer_stack_config = LayerStackConfig {

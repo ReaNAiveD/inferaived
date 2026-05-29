@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use inferaived::language_model::{LayerType, Qwen35Config, Qwen35GpuModel, Qwen35GpuSession};
+use inferaived::language_model::{Qwen35Config, Qwen35GpuModel, Qwen35GpuSession};
 use inferaived::sampling::{SamplingParams, StoppingCriteria};
 use safetensors::SafeTensors;
 use tokenizers::Tokenizer;
@@ -30,34 +30,6 @@ fn features(supported: Features) -> Features {
         required |= Features::SHADER_FLOAT32_ATOMIC;
     }
     required
-}
-
-/// Hardcoded Qwen 3.5 0.8B model config. TODO: load from `config.json`.
-fn qwen35_0_8b_config() -> Qwen35Config {
-    // 24 layers; full attention every 4th layer (indices 3, 7, 11, 15, 19, 23).
-    let layer_types: Vec<LayerType> = (0..24)
-        .map(|i| {
-            if (i + 1) % 4 == 0 {
-                LayerType::Full
-            } else {
-                LayerType::Linear
-            }
-        })
-        .collect();
-    Qwen35Config {
-        hidden_size: 1024,
-        layer_types,
-        num_attention_heads: 8,
-        num_key_value_heads: 2,
-        head_dim: 256,
-        rope_theta: 10_000_000.0,
-        partial_rotary_factor: 0.25,
-        linear_num_key_heads: 16,
-        linear_num_value_heads: 16,
-        linear_key_head_dim: 128,
-        linear_value_head_dim: 128,
-        intermediate_size: 3584,
-    }
 }
 
 #[tokio::main]
@@ -114,8 +86,9 @@ async fn main() {
         .expect("Failed to request device");
     info!("Device requested successfully");
 
-    let config = qwen35_0_8b_config();
-    let model = Qwen35GpuModel::new(&device, &queue, &tensors, &config);
+    let config = Qwen35Config::from_json_file("model/Qwen3.5-0.8B/config.json")
+        .expect("Failed to load model config");
+    let model = Qwen35GpuModel::new(&device, &queue, &tensors, &config.text_config);
     info!("Model constructed");
 
     // Cap generation at 1000 tokens, or stop early when the model

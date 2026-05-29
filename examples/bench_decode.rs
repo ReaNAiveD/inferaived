@@ -22,7 +22,7 @@
 //! measured only over the `BENCH_MEASURE_TOKENS` post-warmup tokens, so it excludes
 //! both prefill and the warmup decode steps.
 
-use inferaived::language_model::{LayerType, Qwen35Config, Qwen35GpuModel, Qwen35GpuSession};
+use inferaived::language_model::{Qwen35Config, Qwen35GpuModel, Qwen35GpuSession};
 use inferaived::sampling::SamplingParams;
 use safetensors::SafeTensors;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -39,6 +39,7 @@ const DEFAULT_PROMPT: &str = "Inferaived is a Rust library for running transform
 
 const MODEL_SAFETENSORS: &str = "model/Qwen3.5-0.8B/model.safetensors-00001-of-00001.safetensors";
 const MODEL_TOKENIZER: &str = "model/Qwen3.5-0.8B/tokenizer.json";
+const MODEL_CONFIG: &str = "model/Qwen3.5-0.8B/config.json";
 
 fn features(supported: Features) -> Features {
     let mut required = Features::empty();
@@ -58,34 +59,6 @@ fn features(supported: Features) -> Features {
         required |= Features::SHADER_FLOAT32_ATOMIC;
     }
     required
-}
-
-/// Hardcoded Qwen 3.5 0.8B model config. Kept in sync with `generate.rs`; TODO:
-/// load from `config.json` and share between examples.
-fn qwen35_0_8b_config() -> Qwen35Config {
-    let layer_types: Vec<LayerType> = (0..24)
-        .map(|i| {
-            if (i + 1) % 4 == 0 {
-                LayerType::Full
-            } else {
-                LayerType::Linear
-            }
-        })
-        .collect();
-    Qwen35Config {
-        hidden_size: 1024,
-        layer_types,
-        num_attention_heads: 8,
-        num_key_value_heads: 2,
-        head_dim: 256,
-        rope_theta: 10_000_000.0,
-        partial_rotary_factor: 0.25,
-        linear_num_key_heads: 16,
-        linear_num_value_heads: 16,
-        linear_key_head_dim: 128,
-        linear_value_head_dim: 128,
-        intermediate_size: 3584,
-    }
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
@@ -198,8 +171,9 @@ async fn main() {
         adapter.get_info().name
     );
 
-    let config = qwen35_0_8b_config();
-    let model = Qwen35GpuModel::new(&device, &queue, &tensors, &config);
+    let config =
+        Qwen35Config::from_json_file(MODEL_CONFIG).expect("Failed to load model config");
+    let model = Qwen35GpuModel::new(&device, &queue, &tensors, &config.text_config);
 
     // -------- runs --------
     // Each run builds a fresh session so KV-cache state doesn't leak across

@@ -14,11 +14,15 @@ futures-core = "0.3"
 half = "2.7.1"
 rand = { version = "0.9", features = ["small_rng"] }
 safetensors = "0.7.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1.52.3", default-features = false, features = ["sync"] }
 tracing = "0.1"
 wgpu = "29.0.3"
 
 [dev-dependencies]
+minijinja = "2"
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 tokenizers = "0.23.1"
 tokio = { version = "1.52.3", default-features = false, features = ["macros", "rt-multi-thread"] }
 tokio-stream = "0.1.18"

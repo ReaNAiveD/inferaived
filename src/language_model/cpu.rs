@@ -9,7 +9,7 @@ use crate::{
     sampling::{LogitsProcessor, SampledToken, Sampler, StoppingCriteria},
 };
 
-use super::{Qwen35Config, Qwen35ModelCore};
+use super::{Qwen35ModelCore, Qwen35TextConfig};
 
 /// CPU-backend model: shared mid-stack + CPU embed lookup. Sampler /
 /// processor chain is per-request (passed to [`Qwen35CpuSession::step`]).
@@ -23,7 +23,7 @@ impl<'data> Qwen35CpuModel<'data> {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         tensors: &SafeTensors<'data>,
-        config: &Qwen35Config,
+        config: &Qwen35TextConfig,
     ) -> Self {
         let embed_tokens = tensors
             .tensor("model.language_model.embed_tokens.weight")

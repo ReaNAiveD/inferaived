@@ -14,11 +14,10 @@ Optimization directions for the Rust orchestration layer (kernels-side TODOs liv
 - Direction: add temperature scaling, top-k, top-p (nucleus). Keep argmax as a `temperature == 0` special case. Sampler trait so the session takes `&mut dyn Sampler`.
 - Coordinate with item 1: if the GPU sampler lands first, this becomes a GPU-kernel task instead of a CPU one.
 
-## 3. Load model dims from `config.json`
+## 3. Load model dims from `config.json` — partial
 
-- `main.rs` hardcodes `hidden_size`, `intermediate_size`, head dims, rope theta, layer-type pattern, etc. — every one of these is a silent footgun if we ever load another Qwen3-Next checkpoint. `max_seq_len` is also a hardcoded constant (`32`).
-- Direction: parse `model/Qwen3.5-0.8B/config.json` via `serde_json` into a typed `Qwen35Config`, derive `LayerStackConfig` from it. Move `max_seq_len` into config / `Qwen35Session::new` arguments instead of a constant.
-- Small, mechanical, unblocks loading any other Qwen3-Next checkpoint.
+- **Done:** `Qwen35Config::from_json` / `from_json_file` in [language_model/config.rs](language_model/config.rs) parse `model/Qwen3.5-0.8B/config.json` via `serde_json` (`Qwen35Config` derives `Deserialize` directly, with a `ConfigLoadError` enum and a unit test against the shipped file). Both `examples/generate.rs` and `examples/bench_decode.rs` now load the config from disk instead of hardcoding it.
+- **Still to do:** `max_seq_len` lives on the caller (`Qwen35Session::new` argument); no change needed there, but a multi-arch refactor (per item 8a) will need to wrap `Qwen35Config` in a `ModelArch` enum.
 
 ## 4. bf16 / smaller KV cache and hidden states
 
@@ -41,10 +40,51 @@ Optimization directions for the Rust orchestration layer (kernels-side TODOs liv
 - The dump / validation harness lives on the `feat/per-layer-dump-validation` branch from earlier work and hasn't been forward-ported through the session refactor. Pull back when needed, not before.
 - Direction: when the next correctness-sensitive change comes (quantization, bf16 KV, new kernel), rebase / redo this on top of the current `LayerSession::forward` API so we can diff against a Hugging Face reference cheaply.
 
-## 8. Quantization of weights (long term)
+## 8. New-model adoption: MiniCPM5-1B → Ministral-3-3B
+
+Multi-model support, ordered by integration cost. Each step also exercises and hardens the generic loader/config scaffolding from items 3 and 5.
+
+### 8a. `openbmb/MiniCPM5-1B` (first)
+
+- Why first: pure `LlamaForCausalLM`, **strict subset** of what the engine already runs for Qwen3.5-0.8B. 24 layers × `hidden=1536` × `intermediate=4608`, GQA **16 Q / 2 KV** (same ratio as current Qwen3.5), `head_dim=128`, full RoPE θ=5M, RMSNorm + SwiGLU, vocab 130,560, bf16. Apache-2.0. Released May 2026 by OpenBMB (mid-tier but credible: MiniCPM-V lineage).
+- Engineering deltas vs current Qwen3.5 path:
+  - All 24 layers are `full_attention` → drop the linear-attention layer path; `delta_rule` / `mamba_scan` / `conv_silu` kernels go unused (still needed for Qwen3.5).
+  - No `attn_output_gate` → simpler attention block than current Qwen3.5 (which uses `attn_output_gate=true`).
+  - Full rotary, no `partial_rotary_factor` and no `mrope_interleaved` → simpler RoPE call.
+  - `tie_word_embeddings: false` → LM head needs its own weight tensor (current Qwen3.5 ties them); small loader change.
+  - Instruct-tuned with Jinja chat template + Think/No-Think modes → first model that will produce useful chat output (current smoke test degenerates to `"1    "`).
+- Hard prerequisites: item 3 (typed `config.json` loader, so `Qwen35Config` generalizes into a per-architecture config enum) and item 5 (chat template + tokenizer-side streaming detokenize, so the instruct + thinking modes actually pay off).
+- Step sequence:
+  1. Land item 3. Introduce a `ModelArch` enum (`Qwen35`, `MiniCPM5`) + per-arch `Config` struct that emits a `LayerStackConfig`.
+  2. Add `MiniCPM5Config` that emits 24 `full_attention` layers, no output gate, no partial rotary.
+  3. Wire untied LM head path (load `lm_head.weight` as a separate tensor instead of reusing `embed_tokens.weight`).
+  4. Land item 5 (chat template via minijinja + streaming detokenize).
+  5. Smoke-test generate + chat on MiniCPM5-1B, compare logits against HF reference at a few token positions (use item 7's dump harness).
+
+### 8b. `mistralai/Ministral-3-3B-Base-2512` (second)
+
+- Why second: tier-1 lab (Mistral AI, Dec 2025), validates the engine on a frontier checkpoint and breaks the "everything is Llama" assumption in a controlled way. Text decoder is still standard RMSNorm / SwiGLU / GQA / RoPE — no new attention variant — but ships wrapped in `Mistral3ForConditionalGeneration` (3.4B LM + 0.4B vision encoder), uses `mistral-common` tokenizer (not HF-style), 256k context, BF16 native.
+- Engineering deltas vs MiniCPM5-1B:
+  - Weight loader has to **skip the vision encoder tensors** in the safetensors index and load only the text-decoder shard.
+  - **`mistral-common` tokenizer**: either depend on a Rust port, or pre-tokenize with the official Python tokenizer and ship a fixed `tokenizer.json`-equivalent. Investigate before committing.
+  - Use the `*-Base-2512` checkpoint, not `*-Instruct-2512` (Instruct ships **FP8 only**, would require an FP8→BF16 dequant on load that the loader doesn't currently do). Defer the Instruct variant until item 8 (quantization) ships, then revisit native FP8 support.
+  - Base = no chat template, no thinking mode → demotes item-5-style chat UX work; this step is a "raw generate" milestone.
+- Step sequence:
+  1. Extend the `ModelArch` enum with `Ministral3Base`.
+  2. Loader: read `safetensors.index.json`, ignore all tensors whose name doesn't start with the text-decoder prefix.
+  3. Tokenizer: spike `mistral-common`-compatible tokenization (Rust port vs pre-tokenize offline). Pick one based on what's available at adoption time.
+  4. Smoke-test continuation generation on the base model; compare logits against HF reference.
+
+### 8c. Stretch goal: `google/gemma-4-E2B-it`
+
+- Tier-1 (Google DeepMind), May 2026, but architecturally novel: per-layer embeddings (PLE), interleaved sliding+global attention with **different RoPE per layer-type** (sliding θ=10k vs global p-RoPE θ=1M, partial 0.25), `num_kv_shared_layers=20` (cross-layer KV cache sharing), `gelu_pytorch_tanh` MLP, double-wide MLP, GQA 8:1, final logit softcapping, multimodal (text+image+audio).
+- Each of those is a new kernel or new orchestration mechanism. Land 8a and 8b first to validate the multi-arch scaffolding under non-trivial but tractable architectures before taking this on.
+
+## 9. Quantization of weights (long term)
 
 - bf16 weights = ~1.5 GB. Int8 sym halves it; int4 quarters it. Biggest absolute VRAM win, biggest engineering cost — defer until everything above either ships or is consciously skipped.
 - Direction: per-row symmetric quantization for `MulMatWebgpu` and the GPU LM head. Needs new shader variants and a weight-loading path that quantizes on the fly (or consumes pre-quantized files).
+- Connects to item 8b: native FP8 weight loading would unblock the `Ministral-3-3B-Instruct-2512` checkpoint (currently FP8-only, deferred to base for that reason).
 
 ---
 

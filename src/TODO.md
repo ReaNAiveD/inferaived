@@ -31,8 +31,9 @@ Optimization directions for the Rust orchestration layer (kernels-side TODOs liv
 
 ## 6. Cached prefill runner
 
-- `build_prefill_runner` in [language_model.rs](language_model.rs) re-runs `LayerStackSession::plan` on every prefill call (~240 `create_buffer` per call, since each layer's `plan` allocates ~10 scratch buffers sized to `num_new_tokens`). One-shot per chat turn rather than per token, so not on the hot path, but easy to drop.
-- Direction: cache one prefill runner sized to `max_seq_len` and have each prefill call narrow the `BufferView` slot to the actual `num_new_tokens` instead of rebuilding the plan.
+- `build_prefill_runner` re-runs `LayerStackSession::plan` on every prefill call (~240 `create_buffer` per call, since each layer's `plan` allocates ~10 scratch buffers sized to `num_new_tokens`). One-shot per chat turn rather than per token, so not on the hot path, but easy to drop.
+- ~~Previous direction:~~ "cache one prefill runner sized to `max_seq_len` and have each prefill call narrow the `BufferView` slot to the actual `num_new_tokens`". This is now blocked because `min_storage_buffer_offset_alignment` (32 on most desktop GPUs) makes narrowing into a strided sub-slice fail bind-group validation when the offset isn't 32-aligned (see the offset-0 fix in `Qwen35GpuSession::step` and the `prefill_tokens` / `prefill_hidden` field docs). The prefill staging buffers are now allocated per-call at the delta's actual size, which also makes the cached-runner idea less attractive (the buffers it would hold would still need to match `num_new`).
+- Current direction (if worth pursuing): cache the per-layer scratch *shapes* and re-bind on each prefill, rather than re-planning. Most of the per-call cost is in the ~240 layer-scratch `create_buffer` calls, not in the plan logic itself.
 - Subsumes the residual "share scratch across layers" idea from the old ScratchArena entry — at the session/prefill-runner level there is no read/write aliasing problem because every layer's scratch is private to that layer.
 
 ## 7. Per-layer hidden-state dump infrastructure

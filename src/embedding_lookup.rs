@@ -43,7 +43,6 @@ impl<'data> EmbeddingLookupCpu<'data> {
     }
 }
 
-
 pub struct EmbeddingLookupWebgpu {
     hidden_size: usize,
     kernel: GetRows,

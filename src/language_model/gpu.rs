@@ -68,20 +68,10 @@ pub struct Qwen35GpuSession<'m> {
     model: &'m Qwen35GpuModel,
     layer_session: LayerStackSession<'m>,
     position_buffer: wgpu::Buffer,
-    /// 1 × u32. Sampler writes; decode embed reads. Persistent across
-    /// the entire conversation.
+    /// 1 × u32. Sampler writes; decode embed reads. Persistent across the entire conversation.
     current_token: wgpu::Buffer,
-    /// max_seq_len × u32. Caller writes prompt tokens here at
-    /// `prev_position` byte offset per prefill call.
-    prefill_tokens: wgpu::Buffer,
     /// 1 × u32, mappable. Copied from `current_token` each step.
     token_readback: wgpu::Buffer,
-    /// max_seq_len × hidden × f32; written by the GPU embed kernel.
-    prefill_hidden: wgpu::Buffer,
-    /// 1 × hidden × f32. Owned to keep the underlying GPU buffer alive
-    /// for the bind group that references it inside `decode_runner`.
-    #[allow(dead_code)]
-    decode_hidden: wgpu::Buffer,
     /// 1 × vocab × f32. Sampler kernel reads this (no readback).
     logits: wgpu::Buffer,
     decode_runner: GpuModelRunner,
@@ -119,24 +109,10 @@ impl<'m> Qwen35GpuSession<'m> {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let prefill_tokens = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("qwen35_gpu_session/prefill_tokens"),
-            size: max_seq_len as wgpu::BufferAddress * u32_size_u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let token_readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("qwen35_gpu_session/token_readback"),
             size: u32_size_u64,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let prefill_hidden = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("qwen35_gpu_session/prefill_hidden"),
-            size: (max_seq_len * hidden_size) as wgpu::BufferAddress * f32_size_u64,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let decode_hidden = device.create_buffer(&wgpu::BufferDescriptor {
@@ -193,10 +169,7 @@ impl<'m> Qwen35GpuSession<'m> {
             layer_session,
             position_buffer,
             current_token,
-            prefill_tokens,
             token_readback,
-            prefill_hidden,
-            decode_hidden,
             logits,
             decode_runner,
             position: 0,
@@ -210,6 +183,18 @@ impl<'m> Qwen35GpuSession<'m> {
     }
     pub fn max_seq_len(&self) -> usize {
         self.max_seq_len
+    }
+
+    /// Erase per-conversation state so the session is indistinguishable
+    /// from one returned by [`Self::new`].
+    pub fn reset(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("qwen35_gpu_session/reset_encoder"),
+        });
+        self.layer_session.reset(&mut encoder);
+        queue.submit(Some(encoder.finish()));
+        self.position = 0;
+        self.tokens.clear();
     }
 
     /// Append `input_ids` to the session, dispatch the GPU pipeline,
@@ -248,14 +233,8 @@ impl<'m> Qwen35GpuSession<'m> {
             self.run_and_read_back_token(device, queue, &self.decode_runner)
                 .await
         } else {
-            let u32_size = std::mem::size_of::<u32>() as wgpu::BufferAddress;
-            let dst_byte_offset = prev_position as wgpu::BufferAddress * u32_size;
-            queue.write_buffer(
-                &self.prefill_tokens,
-                dst_byte_offset,
-                bytemuck::cast_slice(input_ids),
-            );
-            let runner = self.build_prefill_runner(device, queue, prev_position, num_new);
+            // Prefill scratch (token + hidden staging) is allocated per call, sized to this turn's delta.
+            let runner = self.build_prefill_runner(device, queue, input_ids);
             self.run_and_read_back_token(device, queue, &runner).await
         };
 
@@ -271,7 +250,7 @@ impl<'m> Qwen35GpuSession<'m> {
     /// Encode `input_ids` and continue sampling up to `max_tokens`
     /// tokens (inclusive of the first), stopping early when any
     /// element of `stopping` fires.
-    /// 
+    ///
     /// Returns a lazy `impl Stream`; tokens are produced as the
     /// caller polls. Dropping the stream (or breaking the consumer
     /// loop) aborts generation without launching further GPU work.
@@ -388,29 +367,38 @@ impl<'m> Qwen35GpuSession<'m> {
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        prev_position: usize,
-        num_new: usize,
+        input_ids: &[u32],
     ) -> GpuModelRunner {
+        let num_new = input_ids.len();
         let hidden_size = self.model.core.hidden_size;
         let vocab_size = self.model.core.vocab_size;
         let f32_size = std::mem::size_of::<f32>() as u32;
         let u32_size = std::mem::size_of::<u32>() as u32;
 
-        // Token slice: prefill_tokens[prev_position .. prev_position+num_new]
-        let new_tokens = BufferView::new_1d(
-            &self.prefill_tokens,
-            u32_size,
-            self.max_seq_len as u32,
-        )
-        .narrow(0, prev_position as u32, num_new as u32);
-        // Hidden slice: prefill_hidden[prev_position .. prev_position+num_new, :]
+        // Per-prefill scratch.
+        let prefill_tokens = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("qwen35_gpu_session/prefill_tokens"),
+            size: num_new as wgpu::BufferAddress * u32_size as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&prefill_tokens, 0, bytemuck::cast_slice(input_ids));
+        let prefill_hidden = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("qwen35_gpu_session/prefill_hidden"),
+            size: (num_new * hidden_size) as wgpu::BufferAddress * f32_size as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let new_tokens = BufferView::new_1d(&prefill_tokens, u32_size, num_new as u32);
         let new_token_rows = BufferView::new_2d_tight(
-            &self.prefill_hidden,
-            self.max_seq_len as u32,
+            &prefill_hidden,
+            num_new as u32,
             hidden_size as u32,
             f32_size,
-        )
-        .narrow(0, prev_position as u32, num_new as u32);
+        );
         let last_row = new_token_rows.narrow(0, num_new as u32 - 1, 1);
         let logits_view = BufferView::new_2d_tight(&self.logits, 1, vocab_size as u32, f32_size);
         let logits_1d = BufferView::new_1d(&self.logits, f32_size, vocab_size as u32);

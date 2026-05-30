@@ -580,4 +580,11 @@ impl<'m> LinearAttentionLayerSession<'m> {
             recurrent_state_view,
         )
     }
+
+    /// Zero the per-sequence recurrent + conv state. After this the
+    /// layer behaves as if no tokens had been seen.
+    pub fn reset(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.clear_buffer(&self.conv_state_buffer, 0, None);
+        encoder.clear_buffer(&self.recurrent_state_buffer, 0, None);
+    }
 }

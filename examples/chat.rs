@@ -8,17 +8,29 @@
 //!     /exit    quit
 //!
 //! Env vars:
-//!     CHAT_SYSTEM_PROMPT      override the default system prompt
-//!     CHAT_MAX_NEW_TOKENS     cap per-turn generation (default 512)
-//!     CHAT_DEBUG_RENDER=1     log the rendered template before each turn
+//!     CHAT_SYSTEM_PROMPT           override the default system prompt
+//!     CHAT_MAX_NEW_TOKENS          cap per-turn generation (default 512)
+//!     CHAT_MAX_CONTEXT_TOKENS      session KV-cache budget (default 8192)
+//!     CHAT_DEBUG_RENDER=1          log the rendered template before each turn
 //!
-//! Design note: a fresh `Qwen35GpuSession` is built per turn rather than
-//! extending one across turns. The Qwen chat template strips past
-//! `<think>` blocks from prior assistant turns, so the rendered turn-N
-//! prompt does not line up with what an across-turn session's KV cache
-//! has already seen at the end of turn N-1. Delta-based reuse would
-//! corrupt context. Per-turn rebuild is the honest baseline; smarter
-//! cross-turn reuse is a separate optimization.
+//! ## Why token-stream instead of "render each turn from scratch"
+//!
+//! The Qwen chat template strips `<think>` blocks from past assistant
+//! turns when re-rendering. So a re-render-each-turn loop would have to
+//! discard the entire KV cache between turns (because what the cache
+//! holds for turn N-1 doesn't line up with what the new render of past
+//! turns claims happened). Instead, we render the template **only on
+//! the first turn (or right after `/reset`)**, then append per-turn
+//! deltas — `<|im_end|>\n<|im_start|>user\n{u}<|im_end|>\n
+//! <|im_start|>assistant\n<think>\n\n</think>\n\n` — verbatim. This is
+//! how production engines (vLLM, llama.cpp, TGI) all handle multi-turn
+//! chat: the token stream is the source of truth, not the message list.
+//!
+//! `Qwen35GpuSession::reset(&device, &queue)` exists for the `/reset`
+//! command — it zeros the recurrent state in every linear-attention
+//! layer (full-attention KV cache is implicitly invalidated by setting
+//! `position = 0`). See `Qwen35GpuSession::reset` docs for why
+//! "rewind to position N > 0" is not supported on this hybrid stack.
 
 use std::io::{BufRead, Write};
 
@@ -45,6 +57,7 @@ const MODEL_CHAT_TEMPLATE: &str = "model/Qwen3.5-0.8B/chat_template.jinja";
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 const DEFAULT_MAX_NEW_TOKENS: usize = 512;
+const DEFAULT_MAX_CONTEXT_TOKENS: usize = 8192;
 
 #[derive(Serialize, Clone)]
 struct Message {
@@ -77,6 +90,21 @@ fn features(supported: Features) -> Features {
 /// template error so the caller sees a meaningful message.
 fn raise_exception(msg: String) -> Result<Value, minijinja::Error> {
     Err(minijinja::Error::new(ErrorKind::InvalidOperation, msg))
+}
+
+/// The literal turn-boundary string the chat template emits for a new
+/// user/assistant pair when `add_generation_prompt=true` and
+/// `enable_thinking=false`. Used to build per-turn deltas without
+/// re-rendering the whole conversation.
+///
+/// Built from the template's literal output:
+///   - close-out of the previous assistant turn: `<|im_end|>\n`
+///   - new user message: `<|im_start|>user\n{u}<|im_end|>\n`
+///   - generation prompt: `<|im_start|>assistant\n<think>\n\n</think>\n\n`
+fn render_turn_delta(user_input: &str) -> String {
+    format!(
+        "<|im_end|>\n<|im_start|>user\n{user_input}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    )
 }
 
 #[tokio::main]
@@ -154,16 +182,28 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_NEW_TOKENS);
+    let max_context_tokens = std::env::var("CHAT_MAX_CONTEXT_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_CONTEXT_TOKENS);
     let debug_render = std::env::var("CHAT_DEBUG_RENDER")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false);
 
+    // One session for the entire process lifetime. Sized to a chat
+    // budget rather than the model's full max_position_embeddings
+    // (262,144 here) — the latter would cost ~12 GB just for KV cache.
+    let mut session = Qwen35GpuSession::new(&model, &device, &queue, max_context_tokens);
+    let params = SamplingParams::default();
+
     let mut messages: Vec<Message> = vec![Message {
         role: "system".into(),
-        content: system_prompt,
+        content: system_prompt.clone(),
     }];
 
-    println!("\nChat with Qwen3.5-0.8B. Commands: /reset, /exit. Ctrl-D / Ctrl-Z+Enter also exits.");
+    println!(
+        "\nChat with Qwen3.5-0.8B. Commands: /reset, /exit. Ctrl-D / Ctrl-Z+Enter also exits."
+    );
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -187,47 +227,68 @@ async fn main() {
         match user_input {
             "/exit" | "/quit" => break,
             "/reset" => {
+                session.reset(&device, &queue);
                 messages.truncate(1);
                 println!("(history reset)");
                 continue;
             }
             _ => {}
         }
-        messages.push(Message {
-            role: "user".into(),
-            content: user_input.to_string(),
-        });
 
-        // Render the entire conversation through the chat template.
-        let tmpl = env.get_template("chat").unwrap();
-        let rendered = match tmpl.render(context! {
-            messages => &messages,
-            add_generation_prompt => true,
-            // `false` makes the template emit an empty `<think></think>` so
-            // the model can produce the answer directly. Flip to true for
-            // self-thinking; the response stream will then start with the
-            // thinking trace before `</think>`.
-            enable_thinking => false,
-        }) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("template render error: {e}");
-                messages.pop();
-                continue;
+        // First turn (session is empty) → render full template. Subsequent
+        // turns → tokenize just the user/assistant delta and append. This
+        // avoids the template's past-assistant-turn `<think>` stripping
+        // which would otherwise invalidate the KV cache.
+        let prompt = if session.position() == 0 {
+            messages.push(Message {
+                role: "user".into(),
+                content: user_input.to_string(),
+            });
+            let tmpl = env.get_template("chat").unwrap();
+            match tmpl.render(context! {
+                messages => &messages,
+                add_generation_prompt => true,
+                enable_thinking => false,
+            }) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("template render error: {e}");
+                    messages.pop();
+                    continue;
+                }
             }
+        } else {
+            messages.push(Message {
+                role: "user".into(),
+                content: user_input.to_string(),
+            });
+            render_turn_delta(user_input)
         };
+
         if debug_render {
-            debug!("rendered prompt:\n{rendered}");
+            debug!("turn input:\n{prompt}");
         }
 
         let encoded = tokenizer
-            .encode(rendered.as_str(), false)
+            .encode(prompt.as_str(), false)
             .expect("Failed to tokenize prompt");
         let prompt_ids = encoded.get_ids();
-        let max_seq_len = prompt_ids.len() + max_new_tokens;
 
-        let mut session = Qwen35GpuSession::new(&model, &device, &queue, max_seq_len);
-        let params = SamplingParams::default();
+        // Bound check before we feed the delta. If this turn would
+        // exceed the session budget, force a reset so the user gets a
+        // useful error rather than a panic deep in the kernel.
+        if session.position() + prompt_ids.len() + max_new_tokens > session.max_seq_len() {
+            eprintln!(
+                "(context budget exhausted: position={} + prompt={} + max_new={} > max_context={}; \
+                 use /reset or raise CHAT_MAX_CONTEXT_TOKENS)",
+                session.position(),
+                prompt_ids.len(),
+                max_new_tokens,
+                session.max_seq_len()
+            );
+            messages.pop();
+            continue;
+        }
 
         write!(stdout, "Assistant> ").ok();
         stdout.flush().ok();

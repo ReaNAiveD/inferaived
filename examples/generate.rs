@@ -133,5 +133,9 @@ async fn main() {
         .map(|id| matches!(&stopping[0], StoppingCriteria::Eos(eos) if eos.contains(id)))
         .unwrap_or(false);
     let reason = if hit_eos { "EOS" } else { "max_tokens" };
-    println!("--- generated {} tokens (stopped on {}) ---", generated.len(), reason);
+    println!(
+        "--- generated {} tokens (stopped on {}) ---",
+        generated.len(),
+        reason
+    );
 }

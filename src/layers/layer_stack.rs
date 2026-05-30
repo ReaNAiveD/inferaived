@@ -67,6 +67,15 @@ impl<'m> AttentionLayerSession<'m> {
             )),
         }
     }
+
+    /// Erase per-sequence cached state so this layer is indistinguishable
+    /// from a freshly-constructed session.
+    pub fn reset(&self, encoder: &mut wgpu::CommandEncoder) {
+        match self {
+            Self::Linear(session) => session.reset(encoder),
+            Self::Full(_) => {}
+        }
+    }
 }
 
 /// Cached runners for one forward pass on a single transformer layer.
@@ -172,6 +181,13 @@ impl<'m> LayerStackSession<'m> {
             .map(|session| session.plan(device, queue, residual_slot, position_buffer))
             .collect();
         LayerStackRunner { runners }
+    }
+
+    /// Erase per-sequence cached state across every layer.
+    pub fn reset(&self, encoder: &mut wgpu::CommandEncoder) {
+        for session in &self.sessions {
+            session.reset(encoder);
+        }
     }
 }
 

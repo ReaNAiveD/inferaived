@@ -171,8 +171,7 @@ async fn main() {
         adapter.get_info().name
     );
 
-    let config =
-        Qwen35Config::from_json_file(MODEL_CONFIG).expect("Failed to load model config");
+    let config = Qwen35Config::from_json_file(MODEL_CONFIG).expect("Failed to load model config");
     let model = Qwen35GpuModel::new(&device, &queue, &tensors, &config.text_config);
 
     // -------- runs --------

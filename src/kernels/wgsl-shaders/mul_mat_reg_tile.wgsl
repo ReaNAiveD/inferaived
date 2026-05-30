@@ -119,8 +119,12 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
         @builtin(num_workgroups) num_wg: vec3<u32>) {
     let wg_num_m = (params.m + workgroup_size_m * tile_m - 1u) / (workgroup_size_m * tile_m);
     let wg_num_n = (params.n + workgroup_size_n * tile_n - 1u) / (workgroup_size_n * tile_n);
-    let wg_idx_n = wg_id.x / wg_num_m;
-    let wg_idx_m = wg_id.x % wg_num_m;
+    let linear_wg = wg_id.y * num_wg.x + wg_id.x;
+    if (linear_wg >= wg_num_m * wg_num_n) {
+        return;
+    }
+    let wg_idx_n = linear_wg / wg_num_m;
+    let wg_idx_m = linear_wg % wg_num_m;
 
     let local_idx_m = local_id.x % workgroup_size_m;
     let local_idx_n = local_id.x / workgroup_size_m;

@@ -9,15 +9,6 @@
 //   3. subgroupAdd partial-sum reduction across the K-split + short
 //      cross-subgroup tree reduction for the final write-back.
 //
-// Same bind-group layout as mul_mat_reg_tile.wgsl. Output is column-major
-// with M contiguous: output[n * M + m].
-//
-// Dispatch:
-//   wg_count_m = ceil(M / ROWS_PER_WG)
-//   wg_count_n = ceil(N / COLS_PER_WG)
-//   dispatch_workgroups(wg_count_m * wg_count_n, 1, 1)
-//   wg_id.x = wg_idx_n * wg_count_m + wg_idx_m   (m varies fastest)
-//
 // Requires Features::SUBGROUP on the device; the `enable subgroups;`
 // directive must be OMITTED on native wgpu (see
 // https://github.com/gfx-rs/wgpu/issues/5555).
@@ -54,6 +45,7 @@ var<workgroup> reduce_shmem: array<f32, workgroup_size * ROWS_PER_WG * COLS_PER_
 fn main(
     @builtin(workgroup_id)          wg_id:    vec3<u32>,
     @builtin(local_invocation_id)   local_id: vec3<u32>,
+    @builtin(num_workgroups)        num_wg:   vec3<u32>,
     @builtin(subgroup_id)           sg_id:    u32,
     @builtin(subgroup_invocation_id) sg_lane: u32,
     @builtin(subgroup_size)         sg_size:  u32,
@@ -61,8 +53,13 @@ fn main(
     let thread_id    = local_id.x;
 
     let wg_count_m   = (params.m + ROWS_PER_WG - 1u) / ROWS_PER_WG;
-    let wg_idx_m     = wg_id.x % wg_count_m;
-    let wg_idx_n     = wg_id.x / wg_count_m;
+    let wg_count_n   = (params.n + COLS_PER_WG - 1u) / COLS_PER_WG;
+    let linear_wg    = wg_id.y * num_wg.x + wg_id.x;
+    if (linear_wg >= wg_count_m * wg_count_n) {
+        return;
+    }
+    let wg_idx_m     = linear_wg % wg_count_m;
+    let wg_idx_n     = linear_wg / wg_count_m;
     let wg_row_base  = wg_idx_m * ROWS_PER_WG;
     let wg_col_base  = wg_idx_n * COLS_PER_WG;
 

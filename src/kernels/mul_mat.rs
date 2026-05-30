@@ -281,6 +281,7 @@ impl MulMatWebgpu {
                 / (Self::WORKGROUP_SIZE_N * Self::TILE_N);
             (&self.pipeline_reg_tile, (wg_num_m * wg_num_n) as u32)
         };
+        let dispatch_grid = crate::dispatch::split_1d_into_2d(workgroup_count);
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mul_mat_runner/uniform_buffer"),
             size: std::mem::size_of::<MulMatParams>() as u64,
@@ -313,7 +314,7 @@ impl MulMatWebgpu {
         MulMatWebgpuRunner {
             pipeline: pipeline.clone(),
             bind_group,
-            workgroup_count,
+            dispatch_grid,
         }
     }
 }
@@ -321,14 +322,15 @@ impl MulMatWebgpu {
 pub struct MulMatWebgpuRunner {
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
-    workgroup_count: u32,
+    dispatch_grid: (u32, u32),
 }
 
 impl MulMatWebgpuRunner {
     pub fn forward(&self, cpass: &mut wgpu::ComputePass<'_>) {
         cpass.set_pipeline(&self.pipeline);
         cpass.set_bind_group(0, &self.bind_group, &[]);
-        cpass.dispatch_workgroups(self.workgroup_count, 1, 1);
+        let (x, y) = self.dispatch_grid;
+        cpass.dispatch_workgroups(x, y, 1);
     }
 }
 

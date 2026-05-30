@@ -193,10 +193,11 @@ impl GatedRmsNormInplaceWebgpu {
             ],
         });
         let workgroup_count = self.num_value_heads as u32 * seq_len;
+        let dispatch_grid = crate::dispatch::split_1d_into_2d(workgroup_count);
         GatedRmsNormWebgpuRunner {
             pipeline: self.pipeline.clone(),
             bind_group,
-            workgroup_count,
+            dispatch_grid,
         }
     }
 }
@@ -204,14 +205,15 @@ impl GatedRmsNormInplaceWebgpu {
 pub struct GatedRmsNormWebgpuRunner {
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
-    workgroup_count: u32,
+    dispatch_grid: (u32, u32),
 }
 
 impl GatedRmsNormWebgpuRunner {
     pub fn forward(&self, cpass: &mut wgpu::ComputePass<'_>) {
         cpass.set_pipeline(&self.pipeline);
         cpass.set_bind_group(0, &self.bind_group, &[]);
-        cpass.dispatch_workgroups(self.workgroup_count, 1, 1);
+        let (x, y) = self.dispatch_grid;
+        cpass.dispatch_workgroups(x, y, 1);
     }
 }
 

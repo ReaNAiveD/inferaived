@@ -71,12 +71,15 @@ fn workgroup_reduce_sum(local_id: vec3<u32>) -> f32 {
 }
 
 @compute @workgroup_size(workgroup_size)
-fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) local_id: vec3<u32>) {
-    if (wg_id.x >= params.seq_len * params.num_q_heads) {
+fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>,
+        @builtin(num_workgroups) num_wg: vec3<u32>) {
+    let linear_wg = wg_id.y * num_wg.x + wg_id.x;
+    if (linear_wg >= params.seq_len * params.num_q_heads) {
         return;
     }
-    let q_token = wg_id.x / params.num_q_heads;
-    let q_head = wg_id.x % params.num_q_heads;
+    let q_token = linear_wg / params.num_q_heads;
+    let q_head = linear_wg % params.num_q_heads;
     let num_q_per_kv = params.num_q_heads / params.num_kv_heads;
     let kv_head = q_head / num_q_per_kv;
     let softmax_scale = inverseSqrt(f32(params.q_dim));

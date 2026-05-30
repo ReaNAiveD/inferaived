@@ -78,14 +78,17 @@ fn get_weight(channel: u32, k: u32) -> f32 {
 }
 
 @compute @workgroup_size(256)
-fn conv1d_silu(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn conv1d_silu(@builtin(global_invocation_id) global_id: vec3<u32>,
+               @builtin(num_workgroups) num_wg: vec3<u32>) {
+    let threads_per_row = num_wg.x * 256u;
+    let linear_wg = global_id.y * threads_per_row + global_id.x;
     let total = params.seq_len * num_channels();
-    if (global_id.x >= total) {
+    if (linear_wg >= total) {
         return;
     }
     let nc = num_channels();
-    let token = global_id.x / nc;
-    let channel = global_id.x % nc;
+    let token = linear_wg / nc;
+    let channel = linear_wg % nc;
 
     // Determine flag for this channel's group
     var apply_conv: u32;

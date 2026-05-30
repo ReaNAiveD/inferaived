@@ -45,13 +45,16 @@ override workgroup_size: u32;
 var<workgroup> scratch: array<f32, workgroup_size>;
 
 @compute @workgroup_size(workgroup_size)
-fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) local_id: vec3<u32>) {
-    if (wg_id.x >= params.seq_len * params.num_heads) {
+fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>,
+        @builtin(num_workgroups) num_wg: vec3<u32>) {
+    let linear_wg = wg_id.y * num_wg.x + wg_id.x;
+    if (linear_wg >= params.seq_len * params.num_heads) {
         return;
     }
 
-    let token = wg_id.x / params.num_heads;
-    let head = wg_id.x % params.num_heads;
+    let token = linear_wg / params.num_heads;
+    let head = linear_wg % params.num_heads;
 
     var sum: f32 = 0.0;
     for (var i: u32 = local_id.x; i < params.head_dim; i += workgroup_size) {

@@ -251,12 +251,15 @@ impl ConvSiluWebgpu {
         } else {
             0
         };
+        let conv_dispatch_grid = crate::dispatch::split_1d_into_2d(conv_workgroup_count);
+        let state_update_dispatch_grid =
+            crate::dispatch::split_1d_into_2d(state_update_workgroup_count);
         ConvSiluWebgpuRunner {
             conv_pipeline: self.conv_pipeline.clone(),
             state_update_pipeline: self.state_update_pipeline.clone(),
             bind_group,
-            conv_workgroup_count,
-            state_update_workgroup_count,
+            conv_dispatch_grid,
+            state_update_dispatch_grid,
             has_state_update: self.kernel_size >= 2,
         }
     }
@@ -278,8 +281,8 @@ pub struct ConvSiluWebgpuRunner {
     conv_pipeline: wgpu::ComputePipeline,
     state_update_pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
-    conv_workgroup_count: u32,
-    state_update_workgroup_count: u32,
+    conv_dispatch_grid: (u32, u32),
+    state_update_dispatch_grid: (u32, u32),
     has_state_update: bool,
 }
 
@@ -287,11 +290,13 @@ impl ConvSiluWebgpuRunner {
     pub fn forward(&self, cpass: &mut wgpu::ComputePass<'_>) {
         cpass.set_pipeline(&self.conv_pipeline);
         cpass.set_bind_group(0, &self.bind_group, &[]);
-        cpass.dispatch_workgroups(self.conv_workgroup_count, 1, 1);
+        let (cx, cy) = self.conv_dispatch_grid;
+        cpass.dispatch_workgroups(cx, cy, 1);
         if self.has_state_update {
             cpass.set_pipeline(&self.state_update_pipeline);
             // Same bind group is still bound.
-            cpass.dispatch_workgroups(self.state_update_workgroup_count, 1, 1);
+            let (sx, sy) = self.state_update_dispatch_grid;
+            cpass.dispatch_workgroups(sx, sy, 1);
         }
     }
 }

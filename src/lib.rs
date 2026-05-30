@@ -1,4 +1,5 @@
 pub mod buffer_view;
+pub mod dispatch;
 pub mod embedding_lookup;
 pub mod gpu_sampler;
 pub mod kernels;

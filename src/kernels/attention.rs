@@ -235,10 +235,11 @@ impl CausalGqaNaiveAttentionWebgpu {
             ],
         });
         let workgroup_count = num_q_rows * self.num_q_heads as u32;
+        let dispatch_grid = crate::dispatch::split_1d_into_2d(workgroup_count);
         CausalGqaNaiveAttentionWebgpuRunner {
             pipeline: self.pipeline.clone(),
             bind_group,
-            workgroup_count,
+            dispatch_grid,
         }
     }
 }
@@ -246,14 +247,15 @@ impl CausalGqaNaiveAttentionWebgpu {
 pub struct CausalGqaNaiveAttentionWebgpuRunner {
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
-    workgroup_count: u32,
+    dispatch_grid: (u32, u32),
 }
 
 impl CausalGqaNaiveAttentionWebgpuRunner {
     pub fn forward(&self, cpass: &mut wgpu::ComputePass<'_>) {
         cpass.set_pipeline(&self.pipeline);
         cpass.set_bind_group(0, &self.bind_group, &[]);
-        cpass.dispatch_workgroups(self.workgroup_count, 1, 1);
+        let (x, y) = self.dispatch_grid;
+        cpass.dispatch_workgroups(x, y, 1);
     }
 }
 

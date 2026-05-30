@@ -35,12 +35,18 @@ var<workgroup> reduce_shmem: array<f32, workgroup_size * ROWS_PER_WG>;
 fn main(
     @builtin(workgroup_id)          wg_id:   vec3<u32>,
     @builtin(local_invocation_id)   local_id: vec3<u32>,
+    @builtin(num_workgroups)        num_wg:  vec3<u32>,
     @builtin(subgroup_id)           sg_id:   u32,
     @builtin(subgroup_invocation_id) sg_lane: u32,
     @builtin(subgroup_size)         sg_size: u32,
 ) {
     let thread_id    = local_id.x;
-    let wg_row_base  = wg_id.x * ROWS_PER_WG;
+    let linear_wg    = wg_id.y * num_wg.x + wg_id.x;
+    let wg_count_m   = (params.m + ROWS_PER_WG - 1u) / ROWS_PER_WG;
+    if (linear_wg >= wg_count_m) {
+        return;
+    }
+    let wg_row_base  = linear_wg * ROWS_PER_WG;
 
     // Every thread tracks ALL ROWS_PER_WG partials so subgroupAdd is correct
     // regardless of how threads are partitioned into subgroups.

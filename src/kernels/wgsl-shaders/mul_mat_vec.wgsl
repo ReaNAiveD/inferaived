@@ -26,8 +26,9 @@ var<workgroup> scratch: array<f32, workgroup_size>;
 
 @compute @workgroup_size(workgroup_size)
 fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
-        @builtin(local_invocation_id) local_id: vec3<u32>) {
-    let m_idx = wg_id.x;
+        @builtin(local_invocation_id) local_id: vec3<u32>,
+        @builtin(num_workgroups) num_wg: vec3<u32>) {
+    let m_idx = wg_id.y * num_wg.x + wg_id.x;
     if (m_idx >= params.m) {
         return;
     }

@@ -60,7 +60,7 @@
             }
         },
         {
-            "label": "run chat",
+            "label": "run chat qwen35",
             "type": "cargo",
             "command": "run",
             "args": [
@@ -68,7 +68,28 @@
                 "--package",
                 "inferaived",
                 "--example",
-                "chat"
+                "chat_qwen35"
+            ],
+            "env": {
+                "RUST_LOG": "info"
+            },
+            "group": "build",
+            "problemMatcher": ["$rustc"],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            }
+        },
+        {
+            "label": "run chat minicpm5",
+            "type": "cargo",
+            "command": "run",
+            "args": [
+                "--release",
+                "--package",
+                "inferaived",
+                "--example",
+                "chat_minicpm5"
             ],
             "env": {
                 "RUST_LOG": "info"

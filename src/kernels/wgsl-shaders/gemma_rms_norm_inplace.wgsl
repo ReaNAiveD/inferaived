@@ -1,3 +1,6 @@
+// Gemma-style in-place RMSNorm: gain is `1 + weight` (centered weights),
+// used by this repo's Qwen3.5 checkpoint. The plain-weight variant
+// (Llama / MiniCPM `LlamaRMSNorm`) lives in `rms_norm_inplace.wgsl`.
 struct Params {
     hidden_row_stride: u32,   // in elements
 

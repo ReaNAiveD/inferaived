@@ -8,7 +8,7 @@ use crate::{
         elementwise_add::{ElementwiseAddInplaceWebgpu, ElementwiseAddInplaceWebgpuRunner},
         gated_rms_norm::{GatedRmsNormInplaceWebgpu, GatedRmsNormWebgpuRunner},
         mul_mat::{MulMatWebgpu, MulMatWebgpuRunner},
-        norm::{RmsNormWebgpu, RmsNormWebgpuRunner},
+        norm::{GemmaRmsNormWebgpu, RmsNormWebgpuRunner},
     },
     layers::mlp::{MlpRunners, MultiLayerPerceptron},
     log_tensor,
@@ -30,7 +30,7 @@ pub struct LinearAttentionLayer {
     v_dim: usize,
     recurrent_state_size: usize,
     conv_state_size: usize,
-    input_layernorm: RmsNormWebgpu,
+    input_layernorm: GemmaRmsNormWebgpu,
     in_proj_qkv_mul_mat: MulMatWebgpu,
     in_proj_z_mul_mat: MulMatWebgpu,
     in_proj_a_mul_mat: MulMatWebgpu,
@@ -40,7 +40,7 @@ pub struct LinearAttentionLayer {
     gated_norm: GatedRmsNormInplaceWebgpu,
     out_proj_mat_mul: MulMatWebgpu,
     attn_residual_add: ElementwiseAddInplaceWebgpu,
-    post_attention_layernorm: RmsNormWebgpu,
+    post_attention_layernorm: GemmaRmsNormWebgpu,
     mlp: MultiLayerPerceptron,
     mlp_residual_add: ElementwiseAddInplaceWebgpu,
 }
@@ -64,7 +64,7 @@ impl LinearAttentionLayer {
             input_layernorm_weight_name
         ));
         log_tensor(&input_layernorm_weight_name, &input_layernorm_weight);
-        let input_layernorm = RmsNormWebgpu::new(device, queue, input_layernorm_weight);
+        let input_layernorm = GemmaRmsNormWebgpu::new(device, queue, input_layernorm_weight);
         let qkv_weight_name = format!("{}.linear_attn.in_proj_qkv.weight", weight_prefix);
         let qkv_weight = tensor
             .tensor(&qkv_weight_name)
@@ -218,7 +218,7 @@ impl LinearAttentionLayer {
                 post_attention_layernorm_weight_name
             ));
         let post_attention_layernorm =
-            RmsNormWebgpu::new(&device, &queue, post_attention_layernorm_weight);
+            GemmaRmsNormWebgpu::new(&device, &queue, post_attention_layernorm_weight);
         let mlp = MultiLayerPerceptron::new(
             device,
             queue,

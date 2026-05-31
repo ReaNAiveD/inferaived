@@ -4,7 +4,7 @@ use crate::{
     buffer_view::BufferView,
     embedding_lookup::EmbeddingLookupCpu,
     kernels::norm::RmsNormInplaceWebgpuRunner,
-    layers::layer_stack::{LayerStackRunner, LayerStackSession},
+    layers::qwen35_layer_stack::{LayerStackRunner, LayerStackSession},
     lm_head::LmHeadWebgpuRunner,
     sampling::{LogitsProcessor, SampledToken, Sampler, StoppingCriteria},
 };

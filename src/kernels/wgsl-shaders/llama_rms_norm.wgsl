@@ -1,3 +1,6 @@
+// Llama-style RMSNorm: gain is plain `weight` (Llama / MiniCPM
+// `LlamaRMSNorm`). The Gemma-style `1 + weight` variant lives in
+// `gemma_rms_norm.wgsl`.
 struct Params {
     input_row_stride: u32,    // in elements
     output_row_stride: u32,   // in elements
@@ -53,6 +56,6 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
 
     for (var i: u32 = local_id.x; i < params.hidden_size; i += workgroup_size) {
         let val = input[input_row_offset + i];
-        output[output_row_offset + i] = val * scale * (1.0 + weight[i]);
+        output[output_row_offset + i] = val * scale * weight[i];
     }
 }

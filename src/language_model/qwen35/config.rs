@@ -2,6 +2,8 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use super::super::ConfigLoadError;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum AttentionType {
     #[serde(rename = "linear_attention")]
@@ -99,44 +101,6 @@ pub struct Qwen35Config {
     pub video_token_id: u32,
     pub vision_start_token_id: u32,
     pub vision_end_token_id: u32,
-}
-
-/// Error returned by [`Qwen35Config::from_json`] /
-/// [`Qwen35Config::from_json_file`].
-#[derive(Debug)]
-pub enum ConfigLoadError {
-    Io(std::io::Error),
-    Json(serde_json::Error),
-}
-
-impl std::fmt::Display for ConfigLoadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "failed to read config.json: {e}"),
-            Self::Json(e) => write!(f, "failed to parse config.json: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for ConfigLoadError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(e) => Some(e),
-            Self::Json(e) => Some(e),
-        }
-    }
-}
-
-impl From<std::io::Error> for ConfigLoadError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-
-impl From<serde_json::Error> for ConfigLoadError {
-    fn from(e: serde_json::Error) -> Self {
-        Self::Json(e)
-    }
 }
 
 impl Qwen35Config {

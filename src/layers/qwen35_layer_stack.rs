@@ -7,17 +7,17 @@ use crate::{
             LinearAttentionConfig, LinearAttentionLayer, LinearAttentionLayerRunner,
             LinearAttentionLayerSession,
         },
-        self_attention::{
-            SelfAttentionConfig, SelfAttentionLayer, SelfAttentionLayerRunner,
-            SelfAttentionLayerSession,
+        qwen35_self_attention::{
+            Qwen35SelfAttentionConfig, Qwen35SelfAttentionLayer, Qwen35SelfAttentionLayerRunner,
+            Qwen35SelfAttentionLayerSession,
         },
     },
 };
 
-// TODO: consider unifying LinearAttentionLayer and SelfAttentionLayer into a single generic AttentionLayer with generic parameters for the various components
+// TODO: consider unifying LinearAttentionLayer and Qwen35SelfAttentionLayer into a single generic AttentionLayer with generic parameters for the various components
 pub enum AttentionLayer {
     Linear(LinearAttentionLayer),
-    Full(SelfAttentionLayer),
+    Full(Qwen35SelfAttentionLayer),
 }
 
 impl AttentionLayer {
@@ -31,7 +31,7 @@ impl AttentionLayer {
                 LinearAttentionLayerSession::new(layer, device, max_seq_len),
             ),
             AttentionLayer::Full(layer) => AttentionLayerSession::Full(
-                SelfAttentionLayerSession::new(layer, device, max_seq_len),
+                Qwen35SelfAttentionLayerSession::new(layer, device, max_seq_len),
             ),
         }
     }
@@ -44,7 +44,7 @@ impl AttentionLayer {
 /// access unrepresentable.
 pub enum AttentionLayerSession<'m> {
     Linear(LinearAttentionLayerSession<'m>),
-    Full(SelfAttentionLayerSession<'m>),
+    Full(Qwen35SelfAttentionLayerSession<'m>),
 }
 
 impl<'m> AttentionLayerSession<'m> {
@@ -81,7 +81,7 @@ impl<'m> AttentionLayerSession<'m> {
 /// Cached runners for one forward pass on a single transformer layer.
 pub enum AttentionLayerRunner {
     Linear(LinearAttentionLayerRunner),
-    Full(SelfAttentionLayerRunner),
+    Full(Qwen35SelfAttentionLayerRunner),
 }
 
 impl AttentionLayerRunner {
@@ -96,7 +96,7 @@ impl AttentionLayerRunner {
 #[derive(Debug, Clone, Copy)]
 pub enum LayerConfig {
     Linear(LinearAttentionConfig),
-    Full(SelfAttentionConfig),
+    Full(Qwen35SelfAttentionConfig),
 }
 
 #[derive(Debug, Clone)]
@@ -131,14 +131,16 @@ impl LayerStack {
                         linear_config,
                     ))
                 }
-                LayerConfig::Full(full_config) => AttentionLayer::Full(SelfAttentionLayer::new(
-                    device,
-                    queue,
-                    tensor,
-                    &layer_weight_prefix,
-                    hidden_size,
-                    full_config,
-                )),
+                LayerConfig::Full(full_config) => {
+                    AttentionLayer::Full(Qwen35SelfAttentionLayer::new(
+                        device,
+                        queue,
+                        tensor,
+                        &layer_weight_prefix,
+                        hidden_size,
+                        full_config,
+                    ))
+                }
             };
             layers.push(layer);
         }

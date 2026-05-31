@@ -3,6 +3,45 @@ use wgpu::{BindGroupLayout, Buffer, ComputePipeline};
 
 use crate::buffer_view::BufferView;
 
+// RMSNorm comes in two gain conventions that differ only in the per-channel
+// scale applied after normalization:
+//
+//   * Llama / MiniCPM (`LlamaRMSNorm`): `out = x_normed * weight`
+//   * Gemma-style centered weights (also this repo's Qwen3.5 checkpoint):
+//     `out = x_normed * (1 + weight)`
+//
+// Following the vLLM / HF Transformers pattern, each convention is its own
+// public type backed by its own shader, so the convention is visible at the
+// call site and there is no runtime branch. The shared dispatch boilerplate
+// lives in the private `*Impl` structs below.
+
+/// Decode a 1-D bf16 RMSNorm weight tensor into f32, validating its shape.
+fn load_norm_weight(weight: &TensorView<'_>, what: &str) -> Vec<f32> {
+    debug_assert_eq!(
+        weight.shape().len(),
+        1,
+        "{what} weight must be 1-D, got shape {:?}",
+        weight.shape(),
+    );
+    let norm_dim = weight.shape()[0] as usize;
+    let weight_f32: Vec<f32> = weight
+        .data()
+        .chunks_exact(2)
+        .map(|chunk| {
+            let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+            half::bf16::from_bits(bits).to_f32()
+        })
+        .collect();
+    debug_assert_eq!(
+        weight_f32.len(),
+        norm_dim,
+        "{what} weight data length ({} bf16 elements) does not match shape {:?}",
+        weight_f32.len(),
+        weight.shape(),
+    );
+    weight_f32
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RmsNormParams {
@@ -22,49 +61,31 @@ pub struct RmsNormInplaceParams {
     eps: f32,
 }
 
-pub struct RmsNormWebgpu {
+/// Shared out-of-place RMSNorm implementation. Both gain conventions use the
+/// identical 4-binding layout and dispatch; only the shader source differs.
+struct RmsNormOutOfPlaceImpl {
     bind_group_layout: BindGroupLayout,
     pipeline: ComputePipeline,
     weight_buffer: Buffer,
     norm_dim: usize,
 }
 
-impl RmsNormWebgpu {
-    pub fn new<'data>(
+impl RmsNormOutOfPlaceImpl {
+    fn new<'data>(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         weight: TensorView<'data>,
+        shader_source: &str,
+        label: &str,
     ) -> Self {
-        debug_assert_eq!(
-            weight.shape().len(),
-            1,
-            "RmsNormWebgpu weight must be 1-D, got shape {:?}",
-            weight.shape(),
-        );
-        let norm_dim = weight.shape()[0] as usize;
-        let weight_f32: Vec<f32> = weight
-            .data()
-            .chunks_exact(2)
-            .map(|chunk| {
-                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-                half::bf16::from_bits(bits).to_f32()
-            })
-            .collect();
-        debug_assert_eq!(
-            weight_f32.len(),
-            norm_dim,
-            "RmsNormWebgpu weight data length ({} bf16 elements) does not match shape {:?}",
-            weight_f32.len(),
-            weight.shape(),
-        );
+        let weight_f32 = load_norm_weight(&weight, label);
+        let norm_dim = weight_f32.len();
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rms_norm/shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "wgsl-shaders/rms_norm.wgsl"
-            ))),
+            label: Some(&format!("{label}/shader")),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(shader_source)),
         });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("rms_norm/bind_group_layout"),
+            label: Some(&format!("{label}/bind_group_layout")),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -109,12 +130,12 @@ impl RmsNormWebgpu {
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("rms_norm/pipeline_layout"),
+            label: Some(&format!("{label}/pipeline_layout")),
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("rms_norm/pipeline"),
+            label: Some(&format!("{label}/pipeline")),
             layout: Some(&pipeline_layout),
             module: &shader_module,
             entry_point: Some("main"),
@@ -125,7 +146,7 @@ impl RmsNormWebgpu {
             cache: None,
         });
         let weight_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rms_norm/weight_buffer"),
+            label: Some(&format!("{label}/weight_buffer")),
             size: (weight_f32.len() * std::mem::size_of::<f32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -139,9 +160,7 @@ impl RmsNormWebgpu {
         }
     }
 
-    /// Bake the per-buffer bindings into a [`RmsNormWebgpuRunner`]
-    /// for repeated dispatch into a caller-owned compute pass.
-    pub fn plan(
+    fn plan(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -198,6 +217,68 @@ impl RmsNormWebgpu {
     }
 }
 
+/// Out-of-place RMSNorm with plain `weight` gain (Llama / MiniCPM).
+pub struct LlamaRmsNormWebgpu(RmsNormOutOfPlaceImpl);
+
+impl LlamaRmsNormWebgpu {
+    pub fn new<'data>(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        weight: TensorView<'data>,
+    ) -> Self {
+        Self(RmsNormOutOfPlaceImpl::new(
+            device,
+            queue,
+            weight,
+            include_str!("wgsl-shaders/llama_rms_norm.wgsl"),
+            "llama_rms_norm",
+        ))
+    }
+
+    /// Bake the per-buffer bindings into a [`RmsNormWebgpuRunner`]
+    /// for repeated dispatch into a caller-owned compute pass.
+    pub fn plan(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input: BufferView<'_>,
+        dst: BufferView<'_>,
+    ) -> RmsNormWebgpuRunner {
+        self.0.plan(device, queue, input, dst)
+    }
+}
+
+/// Out-of-place RMSNorm with `1 + weight` gain (Gemma-style; Qwen3.5).
+pub struct GemmaRmsNormWebgpu(RmsNormOutOfPlaceImpl);
+
+impl GemmaRmsNormWebgpu {
+    pub fn new<'data>(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        weight: TensorView<'data>,
+    ) -> Self {
+        Self(RmsNormOutOfPlaceImpl::new(
+            device,
+            queue,
+            weight,
+            include_str!("wgsl-shaders/gemma_rms_norm.wgsl"),
+            "gemma_rms_norm",
+        ))
+    }
+
+    /// Bake the per-buffer bindings into a [`RmsNormWebgpuRunner`]
+    /// for repeated dispatch into a caller-owned compute pass.
+    pub fn plan(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input: BufferView<'_>,
+        dst: BufferView<'_>,
+    ) -> RmsNormWebgpuRunner {
+        self.0.plan(device, queue, input, dst)
+    }
+}
+
 pub struct RmsNormWebgpuRunner {
     pipeline: ComputePipeline,
     bind_group: wgpu::BindGroup,
@@ -212,49 +293,31 @@ impl RmsNormWebgpuRunner {
     }
 }
 
-pub struct RmsNormInplaceWebgpu {
+/// Shared in-place RMSNorm implementation. Both gain conventions use the
+/// identical 3-binding layout and dispatch; only the shader source differs.
+struct RmsNormInplaceImpl {
     bind_group_layout: BindGroupLayout,
     pipeline: ComputePipeline,
     weight_buffer: Buffer,
     norm_dim: usize,
 }
 
-impl RmsNormInplaceWebgpu {
-    pub fn new<'data>(
+impl RmsNormInplaceImpl {
+    fn new<'data>(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         weight: TensorView<'data>,
+        shader_source: &str,
+        label: &str,
     ) -> Self {
-        debug_assert_eq!(
-            weight.shape().len(),
-            1,
-            "RmsNormInplaceWebgpu weight must be 1-D, got shape {:?}",
-            weight.shape(),
-        );
-        let norm_dim = weight.shape()[0] as usize;
-        let weight_f32: Vec<f32> = weight
-            .data()
-            .chunks_exact(2)
-            .map(|chunk| {
-                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-                half::bf16::from_bits(bits).to_f32()
-            })
-            .collect();
-        debug_assert_eq!(
-            weight_f32.len(),
-            norm_dim,
-            "RmsNormInplaceWebgpu weight data length ({} bf16 elements) does not match shape {:?}",
-            weight_f32.len(),
-            weight.shape(),
-        );
+        let weight_f32 = load_norm_weight(&weight, label);
+        let norm_dim = weight_f32.len();
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rms_norm_inplace/shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "wgsl-shaders/rms_norm_inplace.wgsl"
-            ))),
+            label: Some(&format!("{label}/shader")),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(shader_source)),
         });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("rms_norm_inplace/bind_group_layout"),
+            label: Some(&format!("{label}/bind_group_layout")),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -289,12 +352,12 @@ impl RmsNormInplaceWebgpu {
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("rms_norm_inplace/pipeline_layout"),
+            label: Some(&format!("{label}/pipeline_layout")),
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("rms_norm_inplace/pipeline"),
+            label: Some(&format!("{label}/pipeline")),
             layout: Some(&pipeline_layout),
             module: &shader_module,
             entry_point: Some("main"),
@@ -305,7 +368,7 @@ impl RmsNormInplaceWebgpu {
             cache: None,
         });
         let weight_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rms_norm_inplace/weight_buffer"),
+            label: Some(&format!("{label}/weight_buffer")),
             size: (weight_f32.len() * std::mem::size_of::<f32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -319,9 +382,7 @@ impl RmsNormInplaceWebgpu {
         }
     }
 
-    /// Bake the per-buffer bindings into a [`RmsNormInplaceWebgpuRunner`]
-    /// for repeated dispatch into a caller-owned compute pass.
-    pub fn plan(
+    fn plan(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -367,6 +428,66 @@ impl RmsNormInplaceWebgpu {
     }
 }
 
+/// In-place RMSNorm with plain `weight` gain (Llama / MiniCPM).
+pub struct LlamaRmsNormInplaceWebgpu(RmsNormInplaceImpl);
+
+impl LlamaRmsNormInplaceWebgpu {
+    pub fn new<'data>(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        weight: TensorView<'data>,
+    ) -> Self {
+        Self(RmsNormInplaceImpl::new(
+            device,
+            queue,
+            weight,
+            include_str!("wgsl-shaders/llama_rms_norm_inplace.wgsl"),
+            "llama_rms_norm_inplace",
+        ))
+    }
+
+    /// Bake the per-buffer bindings into a [`RmsNormInplaceWebgpuRunner`]
+    /// for repeated dispatch into a caller-owned compute pass.
+    pub fn plan(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        hidden: BufferView<'_>,
+    ) -> RmsNormInplaceWebgpuRunner {
+        self.0.plan(device, queue, hidden)
+    }
+}
+
+/// In-place RMSNorm with `1 + weight` gain (Gemma-style; Qwen3.5).
+pub struct GemmaRmsNormInplaceWebgpu(RmsNormInplaceImpl);
+
+impl GemmaRmsNormInplaceWebgpu {
+    pub fn new<'data>(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        weight: TensorView<'data>,
+    ) -> Self {
+        Self(RmsNormInplaceImpl::new(
+            device,
+            queue,
+            weight,
+            include_str!("wgsl-shaders/gemma_rms_norm_inplace.wgsl"),
+            "gemma_rms_norm_inplace",
+        ))
+    }
+
+    /// Bake the per-buffer bindings into a [`RmsNormInplaceWebgpuRunner`]
+    /// for repeated dispatch into a caller-owned compute pass.
+    pub fn plan(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        hidden: BufferView<'_>,
+    ) -> RmsNormInplaceWebgpuRunner {
+        self.0.plan(device, queue, hidden)
+    }
+}
+
 pub struct RmsNormInplaceWebgpuRunner {
     pipeline: ComputePipeline,
     bind_group: wgpu::BindGroup,
@@ -393,6 +514,7 @@ mod tests {
         hidden_size: usize,
         seq_len: usize,
         eps: f32,
+        unit_offset: f32,
     ) -> Vec<f32> {
         let mut out = vec![0.0f32; seq_len * hidden_size];
         for t in 0..seq_len {
@@ -400,7 +522,7 @@ mod tests {
             let ss: f32 = row.iter().map(|x| x * x).sum();
             let scale = 1.0 / (ss / hidden_size as f32 + eps).sqrt();
             for i in 0..hidden_size {
-                out[t * hidden_size + i] = row[i] * scale * (1.0 + weight[i]);
+                out[t * hidden_size + i] = row[i] * scale * (unit_offset + weight[i]);
             }
         }
         out
@@ -431,9 +553,9 @@ mod tests {
             .chunks_exact(2)
             .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
             .collect();
-        let expected = cpu_rms_norm(&input, &weight_roundtrip, hidden_size, seq_len, 1e-6);
+        let expected = cpu_rms_norm(&input, &weight_roundtrip, hidden_size, seq_len, 1e-6, 1.0);
 
-        let gpu = RmsNormWebgpu::new(&device, &queue, tv);
+        let gpu = GemmaRmsNormWebgpu::new(&device, &queue, tv);
         let in_buf = upload_f32(&device, &input);
         let out_buf = create_f32_buffer(&device, seq_len * hidden_size);
         let elem_size = std::mem::size_of::<f32>() as u32;
@@ -488,9 +610,16 @@ mod tests {
 
         let sliced_input =
             &input_full[input_start_row * hidden_size..(input_start_row + num_rows) * hidden_size];
-        let expected = cpu_rms_norm(sliced_input, &weight_roundtrip, hidden_size, num_rows, 1e-6);
+        let expected = cpu_rms_norm(
+            sliced_input,
+            &weight_roundtrip,
+            hidden_size,
+            num_rows,
+            1e-6,
+            1.0,
+        );
 
-        let gpu = RmsNormWebgpu::new(&device, &queue, tv);
+        let gpu = GemmaRmsNormWebgpu::new(&device, &queue, tv);
         let in_buf = upload_f32(&device, &input_full);
         // Output buffer sized only for `num_rows` — the kernel must write
         // tight-packed from row 0 (not at the input offset, which would
@@ -509,7 +638,7 @@ mod tests {
         assert_approx_eq(&actual, &expected, 1e-4);
     }
 
-    /// CPU reference: hidden[t,i] = (hidden[t,i] / rms) * (1 + weight[i])
+    /// CPU reference: hidden[t,i] = (hidden[t,i] / rms) * (unit_offset + weight[i])
     fn cpu_rms_norm_inplace(
         hidden: &mut [f32],
         weight: &[f32],
@@ -518,6 +647,7 @@ mod tests {
         n_rows: usize,
         row_stride: usize,
         eps: f32,
+        unit_offset: f32,
     ) {
         for t in 0..n_rows {
             let base = offset + t * row_stride;
@@ -526,7 +656,7 @@ mod tests {
                 .sum();
             let scale = 1.0 / (ss / hidden_size as f32 + eps).sqrt();
             for i in 0..hidden_size {
-                hidden[base + i] = hidden[base + i] * scale * (1.0 + weight[i]);
+                hidden[base + i] = hidden[base + i] * scale * (unit_offset + weight[i]);
             }
         }
     }
@@ -565,9 +695,103 @@ mod tests {
             seq_len,
             hidden_size,
             1e-6,
+            1.0,
         );
 
-        let gpu = RmsNormInplaceWebgpu::new(&device, &queue, tv);
+        let gpu = GemmaRmsNormInplaceWebgpu::new(&device, &queue, tv);
+        let buf = upload_f32(&device, &data);
+        let elem_size = std::mem::size_of::<f32>() as u32;
+        let view = BufferView::new_2d_tight(&buf, seq_len as u32, hidden_size as u32, elem_size);
+        let runner = gpu.plan(&device, &queue, view);
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
+        let actual = download_f32(&device, &queue, &buf, seq_len * hidden_size);
+
+        assert_approx_eq(&actual, &expected, 1e-4);
+    }
+
+    #[tokio::test]
+    async fn test_llama_rms_norm_plain_gain() {
+        let (device, queue) = gpu_or_skip!();
+        let seq_len = 2;
+        let hidden_size = 32;
+        let input: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| ((i as f32) * 0.03).sin())
+            .collect();
+        let weight_f32: Vec<f32> = (0..hidden_size).map(|i| (i as f32) * 0.01 + 0.5).collect();
+
+        let weight_bf16_bytes: Vec<u8> = weight_f32
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+        let tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::BF16,
+            vec![hidden_size],
+            &weight_bf16_bytes,
+        )
+        .unwrap();
+        let weight_roundtrip: Vec<f32> = weight_bf16_bytes
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+            .collect();
+        // Plain gain: unit_offset = 0.0.
+        let expected = cpu_rms_norm(&input, &weight_roundtrip, hidden_size, seq_len, 1e-6, 0.0);
+
+        let gpu = LlamaRmsNormWebgpu::new(&device, &queue, tv);
+        let in_buf = upload_f32(&device, &input);
+        let out_buf = create_f32_buffer(&device, seq_len * hidden_size);
+        let elem_size = std::mem::size_of::<f32>() as u32;
+        let in_view =
+            BufferView::new_2d_tight(&in_buf, seq_len as u32, hidden_size as u32, elem_size);
+        let out_view =
+            BufferView::new_2d_tight(&out_buf, seq_len as u32, hidden_size as u32, elem_size);
+        let runner = gpu.plan(&device, &queue, in_view, out_view);
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
+        let actual = download_f32(&device, &queue, &out_buf, seq_len * hidden_size);
+
+        assert_approx_eq(&actual, &expected, 1e-4);
+    }
+
+    #[tokio::test]
+    async fn test_llama_rms_norm_inplace_plain_gain() {
+        let (device, queue) = gpu_or_skip!();
+        let seq_len = 3;
+        let hidden_size = 32;
+        let data: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| ((i as f32) * 0.07).cos())
+            .collect();
+        let weight_f32: Vec<f32> = (0..hidden_size)
+            .map(|i| (i as f32) * -0.005 + 1.0)
+            .collect();
+
+        let weight_bf16_bytes: Vec<u8> = weight_f32
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+        let weight_roundtrip: Vec<f32> = weight_bf16_bytes
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+            .collect();
+        let tv = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::BF16,
+            vec![hidden_size],
+            &weight_bf16_bytes,
+        )
+        .unwrap();
+
+        let mut expected = data.clone();
+        // Plain gain: unit_offset = 0.0.
+        cpu_rms_norm_inplace(
+            &mut expected,
+            &weight_roundtrip,
+            hidden_size,
+            0,
+            seq_len,
+            hidden_size,
+            1e-6,
+            0.0,
+        );
+
+        let gpu = LlamaRmsNormInplaceWebgpu::new(&device, &queue, tv);
         let buf = upload_f32(&device, &data);
         let elem_size = std::mem::size_of::<f32>() as u32;
         let view = BufferView::new_2d_tight(&buf, seq_len as u32, hidden_size as u32, elem_size);

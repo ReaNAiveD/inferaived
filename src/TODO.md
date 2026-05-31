@@ -21,7 +21,7 @@ Optimization directions for the Rust orchestration layer (kernels-side TODOs liv
 
 ## 4. bf16 / smaller KV cache and hidden states
 
-- `SelfAttentionLayerSession::{k_cache_buffer, v_cache_buffer}` are f32. At long context the KV cache dominates VRAM (24 layers × seq × 2 × kv_dim × 4 B). bf16 halves it for ~zero quality loss. Same applies to `hidden_states_buffer` and most scratch tensors.
+- `Qwen35SelfAttentionLayerSession::{k_cache_buffer, v_cache_buffer}` (and the equivalent `MiniCPM5SelfAttentionLayerSession` fields) are f32. At long context the KV cache dominates VRAM (24 layers × seq × 2 × kv_dim × 4 B). bf16 halves it for ~zero quality loss. Same applies to `hidden_states_buffer` and most scratch tensors.
 - Direction: change storage to bf16 (`vec2<u32>` packed in WGSL), upcast to f32 at the FMA boundary inside kernels. Touches every kernel that reads/writes these tensors — large, one-shot churn.
 
 ## 5. Chat template + multi-turn UX
@@ -92,7 +92,7 @@ Multi-model support, ordered by integration cost. Each step also exercises and h
 ## Done
 
 - **`BufferView` for strided / offset access** *(2025)* — Implemented as `BufferView` in [src/buffer_view.rs](buffer_view.rs), with `whole` / `rows` / `strided` constructors and an `as_binding()` that folds the byte offset into a `wgpu::BufferBinding`. All kernels (`norm`, `sigmoid_mul`, `silu_mul`, `binary`, `mul_mat`, `rope`, `attention`) take `BufferView` arguments; offset/length arithmetic moved out of every shader uniform and into one place. Q-extract motivation resolved: `RmsNormInplaceWebgpu` / `RopeInplaceWebgpu` / `CausalGqaNaiveAttentionWebgpu` now read Q directly from the fused `q_gate_proj_buffer` via a strided view; `SliceCopyWebgpu` and its WGSL shader are deleted.
-- **File-structure reorganization** — Kernels now live under [src/kernels/](kernels/) (one file per pipeline) with their shaders in [src/kernels/wgsl-shaders/](kernels/wgsl-shaders/). Layer-level orchestration lives under [src/layers/](layers/) (`layer_stack.rs`, `linear_attention.rs`, `self_attention.rs`, `mlp.rs`). The top level keeps model / session / sampler / config.
+- **File-structure reorganization** — Kernels now live under [src/kernels/](kernels/) (one file per pipeline) with their shaders in [src/kernels/wgsl-shaders/](kernels/wgsl-shaders/). Layer-level orchestration lives under [src/layers/](layers/) (`layer_stack.rs`, `linear_attention.rs`, `qwen35_self_attention.rs`, `minicpm5_self_attention.rs`, `mlp.rs`). The top level keeps model / session / sampler / config.
 - **Per-step Runner / bake pattern** *(commit `3b38d3c`)* — Every kernel and layer moved from an encoder-and-submit `forward(device, queue, ...)` convenience to a two-stage `plan(...) -> Runner` API. `Qwen35Session::new` builds the decode runner once via `DecodeRig::build`; `decode_step` is now `queue.write_buffer` + `runner.forward(cpass)` with **zero `create_buffer` calls per token**. This closes the original "ScratchArena" item ("240 buffer creates / token in decode"); the residual prefill-side cost is tracked separately as item 6.
 
 ## Dropped (no longer worth doing)

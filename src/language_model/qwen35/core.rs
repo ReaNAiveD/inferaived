@@ -1,11 +1,11 @@
 use safetensors::{SafeTensors, tensor::TensorView};
 
 use crate::{
-    kernels::norm::RmsNormInplaceWebgpu,
+    kernels::norm::GemmaRmsNormInplaceWebgpu,
     layers::{
-        layer_stack::{LayerConfig, LayerStack, LayerStackConfig},
         linear_attention::LinearAttentionConfig,
-        self_attention::SelfAttentionConfig,
+        qwen35_layer_stack::{LayerConfig, LayerStack, LayerStackConfig},
+        qwen35_self_attention::Qwen35SelfAttentionConfig,
     },
     lm_head::LmHeadWebgpu,
     log_tensor,
@@ -20,7 +20,7 @@ pub struct Qwen35ModelCore {
     pub hidden_size: usize,
     pub vocab_size: usize,
     pub layer_stack: LayerStack,
-    pub final_norm: RmsNormInplaceWebgpu,
+    pub final_norm: GemmaRmsNormInplaceWebgpu,
     pub lm_head: LmHeadWebgpu,
 }
 
@@ -33,7 +33,15 @@ impl Qwen35ModelCore {
         config: &Qwen35TextConfig,
         embed_tokens: TensorView<'data>,
     ) -> Self {
-        let self_attention_config = SelfAttentionConfig {
+        // The `Qwen35SelfAttentionLayer` bakes in the per-head Q/K norm and
+        // the sigmoid output gate; both are intrinsic to Qwen3.5. Guard
+        // against a checkpoint that disables the gate, which would need a
+        // different layer type rather than a silently-wrong `q_proj` shape.
+        assert!(
+            config.attn_output_gate,
+            "Qwen35SelfAttentionLayer requires attn_output_gate = true (got false)",
+        );
+        let self_attention_config = Qwen35SelfAttentionConfig {
             num_attention_heads: config.num_attention_heads,
             num_key_value_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
@@ -73,7 +81,7 @@ impl Qwen35ModelCore {
             final_norm_weight_name
         ));
         log_tensor(final_norm_weight_name, &final_norm_weight);
-        let final_norm = RmsNormInplaceWebgpu::new(device, queue, final_norm_weight);
+        let final_norm = GemmaRmsNormInplaceWebgpu::new(device, queue, final_norm_weight);
         let lm_head = LmHeadWebgpu::new(device, queue, embed_tokens);
         let vocab_size = lm_head.vocab_size();
         Self {

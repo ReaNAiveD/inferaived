@@ -2,6 +2,21 @@
 name = "inferaived"
 version = "0.1.0"
 edition = "2024"
+authors = ["Qinkai Wu <nice-die@live.com>"]
+description = "LLM inference engine in Rust using wgpu, with support for Qwen3.5 and MiniCPM5 models."
+license = "MIT"
+repository = "https://github.com/ReaNAiveD/inferaived"
+readme = "README.md"
+keywords = ["llm", "wgpu"]
+categories = ["science"]
+exclude = [
+    ".github/**",
+    ".vscode/**",
+    "docs/**",
+    "benches/**",
+    "model/**",
+    "**/TODO.md",
+]
 
 [lib]
 name = "inferaived"

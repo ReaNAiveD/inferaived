@@ -21,6 +21,7 @@ tracing = "0.1"
 wgpu = "29.0.3"
 
 [dev-dependencies]
+clap = { version = "4", features = ["derive"] }
 minijinja = "2"
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 tokenizers = "0.23.1"

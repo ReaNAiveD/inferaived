@@ -179,7 +179,7 @@ async fn main() {
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false);
 
-    let mut session = MiniCPM5GpuSession::new(&model, &device, &queue, max_context_tokens);
+    let mut session = model.new_session(&device, &queue, max_context_tokens);
     let params = SamplingParams::default();
 
     let mut messages: Vec<Message> = vec![Message {

@@ -6,6 +6,7 @@ pub mod elementwise_add;
 pub mod gated_rms_norm;
 pub mod get_rows;
 pub mod mamba_scan;
+pub mod masked_block_attention;
 pub mod mul_mat;
 pub mod norm;
 pub mod rope;

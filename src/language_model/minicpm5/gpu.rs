@@ -45,6 +45,15 @@ impl MiniCPM5GpuModel {
             sampler,
         }
     }
+
+    pub fn new_session<'m>(
+        &'m self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        max_seq_len: usize,
+    ) -> MiniCPM5GpuSession<'m> {
+        MiniCPM5GpuSession::new(self, device, queue, max_seq_len)
+    }
 }
 
 /// GPU-session runner: embed + layers + final_norm + lm_head + sampler
@@ -67,19 +76,149 @@ impl GpuModelRunner {
     }
 }
 
-/// Per-conversation mutable state for a [`MiniCPM5GpuModel`].
-pub struct MiniCPM5GpuSession<'m> {
+/// Persistent GPU resources a [`MiniCPM5GpuSession`] runs on top of.
+struct MiniCPM5GpuWorkspace<'m> {
     model: &'m MiniCPM5GpuModel,
     layer_session: MiniCPM5LayerStackSession<'m>,
+    /// 1 × u32, RoPE base position for the current dispatch.
     position_buffer: wgpu::Buffer,
-    /// 1 × u32. Sampler writes; decode embed reads. Persistent across the entire conversation.
+    /// 1 × vocab × f32. Sampler kernel reads this (no readback).
+    logits: wgpu::Buffer,
+}
+
+impl<'m> MiniCPM5GpuWorkspace<'m> {
+    fn new(model: &'m MiniCPM5GpuModel, device: &wgpu::Device, max_seq_len: usize) -> Self {
+        let layer_session =
+            MiniCPM5LayerStackSession::new(&model.core.layer_stack, device, max_seq_len);
+        let position_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("minicpm5_gpu_session/position"),
+            size: std::mem::size_of::<u32>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let f32_size_u64 = std::mem::size_of::<f32>() as wgpu::BufferAddress;
+        let vocab_size = model.core.vocab_size;
+        let logits = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("minicpm5_gpu_session/logits"),
+            size: vocab_size as wgpu::BufferAddress * f32_size_u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        Self {
+            model,
+            layer_session,
+            position_buffer,
+            logits,
+        }
+    }
+
+    /// Plan a sampling forward through the persistent context buffers, reading
+    /// `num_new` tokens from `input_token` into `input_hidden`, with the GPU-
+    /// sampled id written to `sampled_token`.
+    fn plan(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input_token: &wgpu::Buffer,
+        input_hidden: &wgpu::Buffer,
+        num_new: u32,
+        sampled_token: &wgpu::Buffer,
+    ) -> GpuModelRunner {
+        debug_assert!(num_new >= 1, "plan requires num_new >= 1");
+        let hidden_size = self.model.core.hidden_size as u32;
+        let vocab_size = self.model.core.vocab_size as u32;
+        let u32_size = std::mem::size_of::<u32>() as u32;
+        let f32_size = std::mem::size_of::<f32>() as u32;
+
+        let input_token_view = BufferView::new_1d(input_token, u32_size, num_new);
+        let input_hidden_view =
+            BufferView::new_2d_tight(input_hidden, num_new, hidden_size, f32_size);
+        let last_row = input_hidden_view.narrow(0, num_new - 1, 1);
+        let logits_view = BufferView::new_2d_tight(&self.logits, 1, vocab_size, f32_size);
+        let logits_1d = BufferView::new_1d(&self.logits, f32_size, vocab_size);
+        let sampled_token_view = BufferView::new_1d(sampled_token, u32_size, 1);
+
+        let embed_runner =
+            self.model
+                .embed
+                .plan(device, queue, input_token_view, input_hidden_view);
+        let stack_runner =
+            self.layer_session
+                .plan(device, queue, input_hidden_view, &self.position_buffer);
+        let final_norm_runner = self
+            .model
+            .core
+            .final_norm
+            .plan(device, queue, input_hidden_view);
+        let lm_head_runner = self
+            .model
+            .core
+            .lm_head
+            .plan(device, queue, last_row, logits_view);
+        let sampler_runner = self
+            .model
+            .sampler
+            .plan(device, queue, logits_1d, sampled_token_view);
+
+        GpuModelRunner {
+            embed_runner,
+            stack_runner,
+            final_norm_runner,
+            lm_head_runner,
+            sampler_runner,
+        }
+    }
+
+    /// Encode a layer-cache reset into `encoder`. Called by
+    /// [`MiniCPM5GpuSession::reset`].
+    fn reset_layers(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        self.layer_session.reset(encoder);
+    }
+
+    fn plan_prefill(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input_ids: &[u32],
+        sampled_token: &wgpu::Buffer,
+    ) -> GpuModelRunner {
+        let u32_size = std::mem::size_of::<u32>() as wgpu::BufferAddress;
+        let f32_size = std::mem::size_of::<f32>() as wgpu::BufferAddress;
+        let hidden_size = self.model.core.hidden_size;
+        let prefill_tokens = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("minicpm5_gpu_session/prefill_tokens"),
+            size: input_ids.len() as wgpu::BufferAddress * u32_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&prefill_tokens, 0, bytemuck::cast_slice(input_ids));
+        let prefill_hidden = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("minicpm5_gpu_session/prefill_hidden"),
+            size: (input_ids.len() * hidden_size) as wgpu::BufferAddress * f32_size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        self.plan(
+            device,
+            queue,
+            &prefill_tokens,
+            &prefill_hidden,
+            input_ids.len() as u32,
+            sampled_token,
+        )
+    }
+}
+
+/// Per-conversation streaming generator over a [`MiniCPM5GpuWorkspace`].
+pub struct MiniCPM5GpuSession<'m> {
+    workspace: MiniCPM5GpuWorkspace<'m>,
+    /// 1 × u32. Sampler writes; decode embed reads on the next step.
     current_token: wgpu::Buffer,
     /// 1 × u32, mappable. Copied from `current_token` each step.
     token_readback: wgpu::Buffer,
-    /// 1 × vocab × f32. Sampler kernel reads this (no readback).
-    logits: wgpu::Buffer,
     decode_runner: GpuModelRunner,
-    position: usize,
     max_seq_len: usize,
     tokens: Vec<u32>,
 }
@@ -92,97 +231,51 @@ impl<'m> MiniCPM5GpuSession<'m> {
         max_seq_len: usize,
     ) -> Self {
         debug_assert!(max_seq_len >= 1, "max_seq_len must be >= 1");
-        let layer_session =
-            MiniCPM5LayerStackSession::new(&model.core.layer_stack, device, max_seq_len);
-        let position_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("minicpm5_gpu_session/position"),
-            size: std::mem::size_of::<u32>() as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let hidden_size = model.core.hidden_size;
-        let vocab_size = model.core.vocab_size;
-        let f32_size_u64 = std::mem::size_of::<f32>() as wgpu::BufferAddress;
-        let u32_size_u64 = std::mem::size_of::<u32>() as wgpu::BufferAddress;
-
+        let workspace = MiniCPM5GpuWorkspace::new(model, device, max_seq_len);
+        let u32_size = std::mem::size_of::<u32>() as wgpu::BufferAddress;
+        let f32_size = std::mem::size_of::<f32>() as wgpu::BufferAddress;
         let current_token = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("minicpm5_gpu_session/current_token"),
-            size: u32_size_u64,
+            size: u32_size,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let decode_hidden = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("minicpm5_gpu_session/decode_hidden"),
+            size: model.core.hidden_size as wgpu::BufferAddress * f32_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let decode_runner = workspace.plan(
+            device,
+            queue,
+            &current_token,
+            &decode_hidden,
+            1,
+            &current_token,
+        );
         let token_readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("minicpm5_gpu_session/token_readback"),
-            size: u32_size_u64,
+            size: u32_size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let decode_hidden = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("minicpm5_gpu_session/decode_hidden"),
-            size: hidden_size as wgpu::BufferAddress * f32_size_u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let logits = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("minicpm5_gpu_session/logits"),
-            size: vocab_size as wgpu::BufferAddress * f32_size_u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let u32_size = std::mem::size_of::<u32>() as u32;
-        let f32_size = std::mem::size_of::<f32>() as u32;
-        // Decode-time runner: embed reads `current_token`, writes `decode_hidden`;
-        // sampler reads `logits`, writes `current_token`.
-        let current_token_view = BufferView::new_1d(&current_token, u32_size, 1);
-        let decode_hidden_view =
-            BufferView::new_2d_tight(&decode_hidden, 1, hidden_size as u32, f32_size);
-        let logits_view = BufferView::new_2d_tight(&logits, 1, vocab_size as u32, f32_size);
-        let embed_runner = model
-            .embed
-            .plan(device, queue, current_token_view, decode_hidden_view);
-        let stack_runner = layer_session.plan(device, queue, decode_hidden_view, &position_buffer);
-        let final_norm_runner = model
-            .core
-            .final_norm
-            .plan(device, queue, decode_hidden_view);
-        let lm_head_runner =
-            model
-                .core
-                .lm_head
-                .plan(device, queue, decode_hidden_view, logits_view);
-        let logits_1d = BufferView::new_1d(&logits, f32_size, vocab_size as u32);
-        let sampler_runner = model
-            .sampler
-            .plan(device, queue, logits_1d, current_token_view);
-        let decode_runner = GpuModelRunner {
-            embed_runner,
-            stack_runner,
-            final_norm_runner,
-            lm_head_runner,
-            sampler_runner,
-        };
-
         Self {
-            model,
-            layer_session,
-            position_buffer,
+            workspace,
             current_token,
             token_readback,
-            logits,
             decode_runner,
-            position: 0,
             max_seq_len,
             tokens: Vec::with_capacity(max_seq_len),
         }
     }
 
     pub fn position(&self) -> usize {
-        self.position
+        self.tokens.len()
     }
+
     pub fn max_seq_len(&self) -> usize {
         self.max_seq_len
     }
@@ -193,9 +286,8 @@ impl<'m> MiniCPM5GpuSession<'m> {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("minicpm5_gpu_session/reset_encoder"),
         });
-        self.layer_session.reset(&mut encoder);
+        self.workspace.reset_layers(&mut encoder);
         queue.submit(Some(encoder.finish()));
-        self.position = 0;
         self.tokens.clear();
     }
 
@@ -212,15 +304,15 @@ impl<'m> MiniCPM5GpuSession<'m> {
         let num_new = input_ids.len();
         debug_assert!(num_new >= 1, "step requires non-empty input_ids");
         debug_assert!(
-            self.position + num_new <= self.max_seq_len,
+            self.tokens.len() + num_new <= self.max_seq_len,
             "session overflow: position {} + {} new tokens exceeds max_seq_len {}",
-            self.position,
+            self.tokens.len(),
             num_new,
             self.max_seq_len,
         );
-        let prev_position = self.position;
+        let prev_position = self.tokens.len();
         queue.write_buffer(
-            &self.position_buffer,
+            &self.workspace.position_buffer,
             0,
             bytemuck::bytes_of(&(prev_position as u32)),
         );
@@ -230,13 +322,13 @@ impl<'m> MiniCPM5GpuSession<'m> {
             self.run_and_read_back_token(device, queue, &self.decode_runner)
                 .await
         } else {
-            // Prefill scratch (token + hidden staging) is allocated per call, sized to this turn's delta.
-            let runner = self.build_prefill_runner(device, queue, input_ids);
+            let runner = self
+                .workspace
+                .plan_prefill(device, queue, input_ids, &self.current_token);
             self.run_and_read_back_token(device, queue, &runner).await
         };
 
         self.tokens.extend_from_slice(input_ids);
-        self.position += num_new;
         SampledToken {
             id: token_id,
             logprob: f32::NAN,
@@ -291,7 +383,7 @@ impl<'m> MiniCPM5GpuSession<'m> {
         prev_sampled_id: u32,
         _params: &SamplingParams,
     ) -> SampledToken {
-        let prev_position = self.position;
+        let prev_position = self.tokens.len();
         debug_assert!(
             prev_position + 1 <= self.max_seq_len,
             "session overflow: position {} + 1 exceeds max_seq_len {}",
@@ -299,7 +391,7 @@ impl<'m> MiniCPM5GpuSession<'m> {
             self.max_seq_len,
         );
         queue.write_buffer(
-            &self.position_buffer,
+            &self.workspace.position_buffer,
             0,
             bytemuck::bytes_of(&(prev_position as u32)),
         );
@@ -308,7 +400,6 @@ impl<'m> MiniCPM5GpuSession<'m> {
             .await;
 
         self.tokens.push(prev_sampled_id);
-        self.position += 1;
         SampledToken {
             id: token_id,
             logprob: f32::NAN,
@@ -352,75 +443,5 @@ impl<'m> MiniCPM5GpuSession<'m> {
         drop(bytes);
         self.token_readback.unmap();
         token
-    }
-
-    fn build_prefill_runner(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        input_ids: &[u32],
-    ) -> GpuModelRunner {
-        let num_new = input_ids.len();
-        let hidden_size = self.model.core.hidden_size;
-        let vocab_size = self.model.core.vocab_size;
-        let f32_size = std::mem::size_of::<f32>() as u32;
-        let u32_size = std::mem::size_of::<u32>() as u32;
-
-        let prefill_tokens = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("minicpm5_gpu_session/prefill_tokens"),
-            size: num_new as wgpu::BufferAddress * u32_size as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&prefill_tokens, 0, bytemuck::cast_slice(input_ids));
-        let prefill_hidden = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("minicpm5_gpu_session/prefill_hidden"),
-            size: (num_new * hidden_size) as wgpu::BufferAddress * f32_size as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let new_tokens = BufferView::new_1d(&prefill_tokens, u32_size, num_new as u32);
-        let new_token_rows = BufferView::new_2d_tight(
-            &prefill_hidden,
-            num_new as u32,
-            hidden_size as u32,
-            f32_size,
-        );
-        let last_row = new_token_rows.narrow(0, num_new as u32 - 1, 1);
-        let logits_view = BufferView::new_2d_tight(&self.logits, 1, vocab_size as u32, f32_size);
-        let logits_1d = BufferView::new_1d(&self.logits, f32_size, vocab_size as u32);
-        let current_token_view = BufferView::new_1d(&self.current_token, u32_size, 1);
-
-        let embed_runner = self
-            .model
-            .embed
-            .plan(device, queue, new_tokens, new_token_rows);
-        let stack_runner =
-            self.layer_session
-                .plan(device, queue, new_token_rows, &self.position_buffer);
-        let final_norm_runner = self
-            .model
-            .core
-            .final_norm
-            .plan(device, queue, new_token_rows);
-        let lm_head_runner = self
-            .model
-            .core
-            .lm_head
-            .plan(device, queue, last_row, logits_view);
-        let sampler_runner = self
-            .model
-            .sampler
-            .plan(device, queue, logits_1d, current_token_view);
-        GpuModelRunner {
-            embed_runner,
-            stack_runner,
-            final_norm_runner,
-            lm_head_runner,
-            sampler_runner,
-        }
     }
 }

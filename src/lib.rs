@@ -6,6 +6,7 @@ pub mod kernels;
 pub mod language_model;
 pub mod layers;
 pub mod lm_head;
+pub mod parallel_window;
 pub mod sampling;
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 pub mod linear_attention;
 pub mod minicpm5_layer_stack;
+pub mod minicpm5_masked_layer_stack;
 pub mod minicpm5_self_attention;
 pub mod mlp;
 pub mod qwen35_layer_stack;

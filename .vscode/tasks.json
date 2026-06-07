@@ -100,6 +100,27 @@
                 "reveal": "always",
                 "panel": "dedicated"
             }
+        },
+        {
+            "label": "run parallel minicpm5",
+            "type": "cargo",
+            "command": "run",
+            "args": [
+                "--release",
+                "--package",
+                "inferaived",
+                "--example",
+                "parallel_minicpm5"
+            ],
+            "env": {
+                "RUST_LOG": "info"
+            },
+            "group": "build",
+            "problemMatcher": ["$rustc"],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            }
         }
     ]
 }

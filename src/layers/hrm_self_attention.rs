@@ -3,10 +3,12 @@ use safetensors::{SafeTensors, tensor::TensorView};
 use crate::{
     buffer_view::BufferView,
     kernels::{
-        attention::{CausalGqaNaiveAttentionWebgpu, CausalGqaNaiveAttentionWebgpuRunner},
         elementwise_add::{ElementwiseAddInplaceWebgpu, ElementwiseAddInplaceWebgpuRunner},
         mul_mat::{MulMatWebgpu, MulMatWebgpuRunner},
         norm::{ParameterlessRmsNormWebgpu, RmsNormWebgpuRunner},
+        prefix_gqa_naive_attention::{
+            PrefixGqaNaiveAttentionWebgpu, PrefixGqaNaiveAttentionWebgpuRunner,
+        },
         rope::{RopeInplaceWebgpu, RopeInplaceWebgpuRunner},
         scatter_row::{ScatterRowWebgpu, ScatterRowWebgpuRunner},
         sigmoid_mul::{SigmoidMulInplaceWebgpu, SigmoidMulInplaceWebgpuRunner},
@@ -45,8 +47,12 @@ fn bf16_row_slice<'data>(
     let data: &'data [u8] = weight.data();
     let start = start_row * row_bytes;
     let end = (start_row + num_rows) * row_bytes;
-    TensorView::new(safetensors::Dtype::BF16, vec![num_rows, cols], &data[start..end])
-        .expect("bf16_row_slice: valid sub-view")
+    TensorView::new(
+        safetensors::Dtype::BF16,
+        vec![num_rows, cols],
+        &data[start..end],
+    )
+    .expect("bf16_row_slice: valid sub-view")
 }
 
 /// Configuration for one HRM-Text transformer block (the shared design of both
@@ -74,7 +80,7 @@ pub struct HrmSelfAttentionLayer {
     v_proj_mul_mat: MulMatWebgpu,
     rope: RopeInplaceWebgpu,
     kv_scatter: ScatterRowWebgpu,
-    gqa_attention: CausalGqaNaiveAttentionWebgpu,
+    gqa_attention: PrefixGqaNaiveAttentionWebgpu,
     sigmoid_mul: SigmoidMulInplaceWebgpu,
     o_proj_mul_mat: MulMatWebgpu,
     attn_residual_add: ElementwiseAddInplaceWebgpu,
@@ -137,7 +143,7 @@ impl HrmSelfAttentionLayer {
             config.rope_theta,
             1.0,
         );
-        let gqa_attention = CausalGqaNaiveAttentionWebgpu::new(
+        let gqa_attention = PrefixGqaNaiveAttentionWebgpu::new(
             device,
             config.num_attention_heads,
             config.num_key_value_heads,
@@ -256,6 +262,7 @@ impl HrmSelfAttentionLayer {
         k_cache_view: BufferView<'_>,
         v_cache_view: BufferView<'_>,
         position_buffer: &wgpu::Buffer,
+        prefix_buffer: &wgpu::Buffer,
     ) -> HrmSelfAttentionLayerRunner {
         let num_new_tokens = residual_slot.shape[0] as usize;
         debug_assert!(
@@ -268,8 +275,14 @@ impl HrmSelfAttentionLayer {
         let sz = std::mem::size_of::<f32>() as u32;
         let num_new_u32 = num_new_tokens as u32;
         let hidden_size = self.hidden_size as u32;
-        debug_assert_eq!(k_cache_view.rank, 3, "hrm_self_attention: k_cache must be rank-3");
-        debug_assert_eq!(v_cache_view.rank, 3, "hrm_self_attention: v_cache must be rank-3");
+        debug_assert_eq!(
+            k_cache_view.rank, 3,
+            "hrm_self_attention: k_cache must be rank-3"
+        );
+        debug_assert_eq!(
+            v_cache_view.rank, 3,
+            "hrm_self_attention: v_cache must be rank-3"
+        );
         debug_assert_eq!(
             k_cache_view.shape[1] as usize, self.num_key_value_heads,
             "hrm_self_attention: k_cache shape[1] ({}) must equal num_key_value_heads ({})",
@@ -302,12 +315,16 @@ impl HrmSelfAttentionLayer {
             })
         };
 
-        let normed_buffer =
-            make_storage("hrm_self_attention/normed_buffer", num_new_tokens * self.hidden_size);
+        let normed_buffer = make_storage(
+            "hrm_self_attention/normed_buffer",
+            num_new_tokens * self.hidden_size,
+        );
         let normed = BufferView::new_2d_tight(&normed_buffer, num_new_u32, hidden_size, sz);
 
-        let gate_proj_buffer =
-            make_storage("hrm_self_attention/gate_proj_buffer", num_new_tokens * q_dim);
+        let gate_proj_buffer = make_storage(
+            "hrm_self_attention/gate_proj_buffer",
+            num_new_tokens * q_dim,
+        );
         let gate_view = BufferView::new_3d_tight(
             &gate_proj_buffer,
             num_new_u32,
@@ -326,8 +343,10 @@ impl HrmSelfAttentionLayer {
             sz,
         );
 
-        let attn_output_buffer =
-            make_storage("hrm_self_attention/attn_output_buffer", num_new_tokens * q_dim);
+        let attn_output_buffer = make_storage(
+            "hrm_self_attention/attn_output_buffer",
+            num_new_tokens * q_dim,
+        );
         let attn_out_view = BufferView::new_3d_tight(
             &attn_output_buffer,
             num_new_u32,
@@ -336,18 +355,27 @@ impl HrmSelfAttentionLayer {
             sz,
         );
 
-        let o_proj_buffer =
-            make_storage("hrm_self_attention/o_proj_buffer", num_new_tokens * self.hidden_size);
+        let o_proj_buffer = make_storage(
+            "hrm_self_attention/o_proj_buffer",
+            num_new_tokens * self.hidden_size,
+        );
         let o_proj_view = BufferView::new_2d_tight(&o_proj_buffer, num_new_u32, hidden_size, sz);
 
-        let mlp_output_buffer =
-            make_storage("hrm_self_attention/mlp_output_buffer", num_new_tokens * self.hidden_size);
-        let mlp_out_view = BufferView::new_2d_tight(&mlp_output_buffer, num_new_u32, hidden_size, sz);
+        let mlp_output_buffer = make_storage(
+            "hrm_self_attention/mlp_output_buffer",
+            num_new_tokens * self.hidden_size,
+        );
+        let mlp_out_view =
+            BufferView::new_2d_tight(&mlp_output_buffer, num_new_u32, hidden_size, sz);
 
-        let decode_k_new_buffer =
-            make_storage("hrm_self_attention/decode_k_new_buffer", num_new_tokens * kv_dim);
-        let decode_v_new_buffer =
-            make_storage("hrm_self_attention/decode_v_new_buffer", num_new_tokens * kv_dim);
+        let decode_k_new_buffer = make_storage(
+            "hrm_self_attention/decode_k_new_buffer",
+            num_new_tokens * kv_dim,
+        );
+        let decode_v_new_buffer = make_storage(
+            "hrm_self_attention/decode_v_new_buffer",
+            num_new_tokens * kv_dim,
+        );
         let decode_k_new_view = BufferView::new_3d_tight(
             &decode_k_new_buffer,
             num_new_u32,
@@ -365,7 +393,9 @@ impl HrmSelfAttentionLayer {
 
         // Attention sub-layer (pre-norm): normed = rms_norm(residual).
         let input_layernorm_runner = self.rms_norm.plan(device, queue, residual_slot, normed);
-        let gate_proj_runner = self.gate_proj_mul_mat.plan(device, queue, normed, gate_view);
+        let gate_proj_runner = self
+            .gate_proj_mul_mat
+            .plan(device, queue, normed, gate_view);
         let q_proj_runner = self.q_proj_mul_mat.plan(device, queue, normed, q_view);
         let k_proj_runner = self
             .k_proj_mul_mat
@@ -376,12 +406,20 @@ impl HrmSelfAttentionLayer {
         let rope_runner = self
             .rope
             .plan(device, queue, q_view, decode_k_new_view, position_buffer);
-        let scatter_k_runner =
-            self.kv_scatter
-                .plan(device, queue, decode_k_new_view, k_cache_view, position_buffer);
-        let scatter_v_runner =
-            self.kv_scatter
-                .plan(device, queue, decode_v_new_view, v_cache_view, position_buffer);
+        let scatter_k_runner = self.kv_scatter.plan(
+            device,
+            queue,
+            decode_k_new_view,
+            k_cache_view,
+            position_buffer,
+        );
+        let scatter_v_runner = self.kv_scatter.plan(
+            device,
+            queue,
+            decode_v_new_view,
+            v_cache_view,
+            position_buffer,
+        );
         let attn_runner = self.gqa_attention.plan(
             device,
             queue,
@@ -390,9 +428,12 @@ impl HrmSelfAttentionLayer {
             v_cache_view,
             attn_out_view,
             position_buffer,
+            prefix_buffer,
         );
         // Sigmoid output gate: attn_out *= sigmoid(gate).
-        let sigmoid_mul_runner = self.sigmoid_mul.plan(device, queue, attn_out_view, gate_view);
+        let sigmoid_mul_runner = self
+            .sigmoid_mul
+            .plan(device, queue, attn_out_view, gate_view);
         let o_proj_runner = self
             .o_proj_mul_mat
             .plan(device, queue, attn_out_view, o_proj_view);
@@ -439,7 +480,7 @@ pub struct HrmSelfAttentionLayerRunner {
     rope_runner: RopeInplaceWebgpuRunner,
     scatter_k_runner: ScatterRowWebgpuRunner,
     scatter_v_runner: ScatterRowWebgpuRunner,
-    attn_runner: CausalGqaNaiveAttentionWebgpuRunner,
+    attn_runner: PrefixGqaNaiveAttentionWebgpuRunner,
     sigmoid_mul_runner: SigmoidMulInplaceWebgpuRunner,
     o_proj_runner: MulMatWebgpuRunner,
     attn_residual_runner: ElementwiseAddInplaceWebgpuRunner,
@@ -510,7 +551,11 @@ impl<'m> HrmSelfAttentionLayerSession<'m> {
         }
     }
 
-    fn kv_cache_view<'a>(buffer: &'a wgpu::Buffer, max_seq_len: usize, layer: &HrmSelfAttentionLayer) -> BufferView<'a> {
+    fn kv_cache_view<'a>(
+        buffer: &'a wgpu::Buffer,
+        max_seq_len: usize,
+        layer: &HrmSelfAttentionLayer,
+    ) -> BufferView<'a> {
         let sz = std::mem::size_of::<f32>() as u32;
         BufferView::new_3d_tight(
             buffer,
@@ -528,10 +573,18 @@ impl<'m> HrmSelfAttentionLayerSession<'m> {
         queue: &wgpu::Queue,
         residual_slot: BufferView<'_>,
         position_buffer: &wgpu::Buffer,
+        prefix_buffer: &wgpu::Buffer,
     ) -> HrmSelfAttentionLayerRunner {
         let k_cache_view = Self::kv_cache_view(&self.k_cache_buffer, self.max_seq_len, self.layer);
         let v_cache_view = Self::kv_cache_view(&self.v_cache_buffer, self.max_seq_len, self.layer);
-        self.layer
-            .plan(device, queue, residual_slot, k_cache_view, v_cache_view, position_buffer)
+        self.layer.plan(
+            device,
+            queue,
+            residual_slot,
+            k_cache_view,
+            v_cache_view,
+            position_buffer,
+            prefix_buffer,
+        )
     }
 }

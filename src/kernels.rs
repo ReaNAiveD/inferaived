@@ -9,6 +9,7 @@ pub mod mamba_scan;
 pub mod masked_block_attention;
 pub mod mul_mat;
 pub mod norm;
+pub mod prefix_gqa_naive_attention;
 pub mod rope;
 pub mod scalar_mul;
 pub mod scatter_row;

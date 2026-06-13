@@ -114,6 +114,7 @@ struct HrmTextGpuWorkspace<'m> {
     h_sessions: Vec<HrmLayerStackSession<'m>>,
     l_sessions: Vec<HrmLayerStackSession<'m>>,
     position_buffer: wgpu::Buffer,
+    prefix_buffer: wgpu::Buffer,
     logits: wgpu::Buffer,
 }
 
@@ -133,6 +134,12 @@ impl<'m> HrmTextGpuWorkspace<'m> {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let prefix_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hrm_text_gpu_session/prefix"),
+            size: std::mem::size_of::<u32>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let f32_size = std::mem::size_of::<f32>() as wgpu::BufferAddress;
         let logits = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("hrm_text_gpu_session/logits"),
@@ -145,6 +152,7 @@ impl<'m> HrmTextGpuWorkspace<'m> {
             h_sessions,
             l_sessions,
             position_buffer,
+            prefix_buffer,
             logits,
         }
     }
@@ -186,10 +194,7 @@ impl<'m> HrmTextGpuWorkspace<'m> {
         let z_l_init = BufferView::from_raw(&core.z_l_init, 0, 2, zli_shape, zli_stride, f32_size);
 
         // z_H = embed(input_ids) * embedding_scale
-        let embed_runner = self
-            .model
-            .embed
-            .plan(device, queue, input_token_view, z_h);
+        let embed_runner = self.model.embed.plan(device, queue, input_token_view, z_h);
         let embed_scale_runner = self.model.embed_scale.plan(device, queue, z_h);
 
         // Recurrent schedule (reference `HierarchicalReasoningModel.forward`):
@@ -202,13 +207,17 @@ impl<'m> HrmTextGpuWorkspace<'m> {
         for h in 0..core.h_cycles {
             for l in 0..core.l_cycles {
                 let slow_inject = if h == 0 && l == 0 { z_l_init } else { z_l };
-                let inject_runner = self
-                    .model
-                    .inject_add
-                    .plan(device, queue, work, slow_inject, z_h);
-                let stack_runner =
-                    self.l_sessions[h * core.l_cycles + l]
-                        .plan(device, queue, work, &self.position_buffer);
+                let inject_runner =
+                    self.model
+                        .inject_add
+                        .plan(device, queue, work, slow_inject, z_h);
+                let stack_runner = self.l_sessions[h * core.l_cycles + l].plan(
+                    device,
+                    queue,
+                    work,
+                    &self.position_buffer,
+                    &self.prefix_buffer,
+                );
                 let norm_runner = core.norm_f.plan(device, queue, work, z_l);
                 cycle_runners.push(CycleRunner {
                     inject_runner,
@@ -216,12 +225,14 @@ impl<'m> HrmTextGpuWorkspace<'m> {
                     norm_runner,
                 });
             }
-            let inject_runner = self
-                .model
-                .inject_add
-                .plan(device, queue, work, z_h, z_l);
-            let stack_runner =
-                self.h_sessions[h].plan(device, queue, work, &self.position_buffer);
+            let inject_runner = self.model.inject_add.plan(device, queue, work, z_h, z_l);
+            let stack_runner = self.h_sessions[h].plan(
+                device,
+                queue,
+                work,
+                &self.position_buffer,
+                &self.prefix_buffer,
+            );
             let norm_runner = core.norm_f.plan(device, queue, work, z_h);
             cycle_runners.push(CycleRunner {
                 inject_runner,
@@ -235,9 +246,7 @@ impl<'m> HrmTextGpuWorkspace<'m> {
         let logits_view = BufferView::new_2d_tight(&self.logits, 1, vocab, f32_size);
         let logits_1d = BufferView::new_1d(&self.logits, f32_size, vocab);
         let sampled_token_view = BufferView::new_1d(sampled_token, u32_size, 1);
-        let lm_head_runner = core
-            .lm_head
-            .plan(device, queue, last_row, logits_view);
+        let lm_head_runner = core.lm_head.plan(device, queue, last_row, logits_view);
         let sampler_runner = self
             .model
             .sampler
@@ -396,6 +405,13 @@ impl<'m> HrmTextGpuSession<'m> {
             self.max_seq_len,
         );
         let prev_position = self.tokens.len();
+        if prev_position == 0 {
+            queue.write_buffer(
+                &self.workspace.prefix_buffer,
+                0,
+                bytemuck::bytes_of(&(num_new as u32)),
+            );
+        }
         queue.write_buffer(
             &self.workspace.position_buffer,
             0,
@@ -432,7 +448,10 @@ impl<'m> HrmTextGpuSession<'m> {
         stopping: &'a [StoppingCriteria],
     ) -> impl Stream<Item = SampledToken> + Send + 'a {
         debug_assert!(max_tokens >= 1, "generate: max_tokens must be >= 1");
-        debug_assert!(!input_ids.is_empty(), "generate: input_ids must be non-empty");
+        debug_assert!(
+            !input_ids.is_empty(),
+            "generate: input_ids must be non-empty"
+        );
         let params = *params;
         stream! {
             let mut tok = self.step(device, queue, input_ids, &params).await;

@@ -262,7 +262,10 @@ pub struct ParameterlessRmsNormWebgpu(RmsNormOutOfPlaceImpl);
 
 impl ParameterlessRmsNormWebgpu {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, norm_dim: usize) -> Self {
-        debug_assert!(norm_dim >= 1, "parameterless_rms_norm: norm_dim must be >= 1");
+        debug_assert!(
+            norm_dim >= 1,
+            "parameterless_rms_norm: norm_dim must be >= 1"
+        );
         Self(RmsNormOutOfPlaceImpl::from_weight_f32(
             device,
             queue,

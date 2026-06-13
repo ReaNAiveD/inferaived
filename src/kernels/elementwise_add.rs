@@ -324,7 +324,6 @@ impl ElementwiseAddWebgpuRunner {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

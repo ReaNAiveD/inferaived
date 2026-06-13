@@ -74,11 +74,14 @@ impl<'m> HrmLayerStackSession<'m> {
         queue: &wgpu::Queue,
         residual_slot: BufferView<'_>,
         position_buffer: &wgpu::Buffer,
+        prefix_buffer: &wgpu::Buffer,
     ) -> HrmLayerStackRunner {
         let runners = self
             .sessions
             .iter()
-            .map(|session| session.plan(device, queue, residual_slot, position_buffer))
+            .map(|session| {
+                session.plan(device, queue, residual_slot, position_buffer, prefix_buffer)
+            })
             .collect();
         HrmLayerStackRunner { runners }
     }

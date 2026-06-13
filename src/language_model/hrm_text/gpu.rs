@@ -305,10 +305,11 @@ impl<'m> HrmTextGpuWorkspace<'m> {
 
 /// Per-conversation streaming generator over a [`HrmTextGpuWorkspace`].
 ///
-/// NOTE: attention is currently pure causal. HRM-Text was pre-trained with a
-/// PrefixLM mask (bidirectional prompt, causal completion); matching it is a
-/// follow-up. Causal decoding is the documented fallback and produces coherent
-/// but slightly off-distribution logits versus the reference.
+/// Attention uses the naive PrefixLM mask: the initial prompt is one
+/// bidirectional prefix block (`prefix_len` is pinned to the prompt length on
+/// the first step) and all subsequently generated tokens are causal. Single-row
+/// decode is identical to causal attention, so only prefill differs from a
+/// plain causal model — matching the reference's `causal=False` KV-cache path.
 pub struct HrmTextGpuSession<'m> {
     workspace: HrmTextGpuWorkspace<'m>,
     /// 1 × u32. Sampler writes; decode embed reads on the next step.

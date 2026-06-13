@@ -17,9 +17,10 @@
 //!
 //! ## Caveats (this engine)
 //!
-//!   * Attention is **causal only**. HRM-Text trained with a PrefixLM mask
-//!     (bidirectional prompt, causal completion); matching it is a follow-up.
-//!     Causal is the documented fallback — coherent but off-distribution.
+//!   * Naive PrefixLM attention: the whole prompt is one bidirectional prefix
+//!     block, generated tokens are causal — matching the reference's
+//!     `token_type_ids = ones` inference setup. General per-token
+//!     `token_type_ids` are not supported.
 //!   * Greedy (argmax) decoding only.
 //!   * Not yet numerically verified against the HF reference.
 

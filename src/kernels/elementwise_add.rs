@@ -367,4 +367,82 @@ mod tests {
 
         assert_approx_eq(&actual, &expected, 1e-5);
     }
+
+    /// Out-of-place add: `dst[t,i] = a[t,i] + b[t,i]` with independent tight
+    /// operands.
+    #[tokio::test]
+    async fn test_elementwise_add_out_of_place() {
+        let (device, queue) = gpu_or_skip!();
+        let seq_len = 3;
+        let hidden_size = 16;
+        let a: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32) * 0.1)
+            .collect();
+        let b: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32) * -0.05 + 1.0)
+            .collect();
+        let expected: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
+
+        let gpu = ElementwiseAddWebgpu::new(&device, hidden_size);
+        let a_buf = upload_f32(&device, &a);
+        let b_buf = upload_f32(&device, &b);
+        let dst_buf = create_f32_buffer(&device, seq_len * hidden_size);
+        let elem_size = std::mem::size_of::<f32>() as u32;
+        let dst_view =
+            BufferView::new_2d_tight(&dst_buf, seq_len as u32, hidden_size as u32, elem_size);
+        let a_view =
+            BufferView::new_2d_tight(&a_buf, seq_len as u32, hidden_size as u32, elem_size);
+        let b_view =
+            BufferView::new_2d_tight(&b_buf, seq_len as u32, hidden_size as u32, elem_size);
+        let runner = gpu.plan(&device, &queue, dst_view, a_view, b_view);
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
+        let actual = download_f32(&device, &queue, &dst_buf, seq_len * hidden_size);
+
+        assert_approx_eq(&actual, &expected, 1e-5);
+    }
+
+    /// Broadcast add: operand `b` is a single `[hidden]` row injected across
+    /// every token via a zero outer stride (HRM-Text's `z_L_init` injection).
+    #[tokio::test]
+    async fn test_elementwise_add_out_broadcast() {
+        use crate::buffer_view::MAX_DIMS;
+        let (device, queue) = gpu_or_skip!();
+        let seq_len = 4;
+        let hidden_size = 16;
+        let a: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32) * 0.1)
+            .collect();
+        // Single broadcast row.
+        let b_row: Vec<f32> = (0..hidden_size).map(|i| (i as f32) * 0.5 - 2.0).collect();
+
+        let mut expected = vec![0.0f32; seq_len * hidden_size];
+        for t in 0..seq_len {
+            for i in 0..hidden_size {
+                expected[t * hidden_size + i] = a[t * hidden_size + i] + b_row[i];
+            }
+        }
+
+        let gpu = ElementwiseAddWebgpu::new(&device, hidden_size);
+        let a_buf = upload_f32(&device, &a);
+        let b_buf = upload_f32(&device, &b_row);
+        let dst_buf = create_f32_buffer(&device, seq_len * hidden_size);
+        let elem_size = std::mem::size_of::<f32>() as u32;
+        let dst_view =
+            BufferView::new_2d_tight(&dst_buf, seq_len as u32, hidden_size as u32, elem_size);
+        let a_view =
+            BufferView::new_2d_tight(&a_buf, seq_len as u32, hidden_size as u32, elem_size);
+        // `[seq_len, hidden]` view over a single row: zero outer stride.
+        let mut shape = [1u32; MAX_DIMS];
+        let mut stride = [0u32; MAX_DIMS];
+        shape[0] = seq_len as u32;
+        shape[1] = hidden_size as u32;
+        stride[0] = 0;
+        stride[1] = 1;
+        let b_view = BufferView::from_raw(&b_buf, 0, 2, shape, stride, elem_size);
+        let runner = gpu.plan(&device, &queue, dst_view, a_view, b_view);
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
+        let actual = download_f32(&device, &queue, &dst_buf, seq_len * hidden_size);
+
+        assert_approx_eq(&actual, &expected, 1e-5);
+    }
 }

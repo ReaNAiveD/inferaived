@@ -137,3 +137,52 @@ impl ScalarMulInplaceWebgpuRunner {
         cpass.dispatch_workgroups(self.seq_len, 1, 1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu_test_utils::*;
+
+    /// Multi-token prefill shape: a tight `[seq, hidden]` view scaled in place.
+    #[tokio::test]
+    async fn test_scalar_mul_prefill() {
+        let (device, queue) = gpu_or_skip!();
+        let seq_len = 3;
+        let hidden_size = 16;
+        let scalar = 39.191_837_f32;
+        let data: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32) * 0.1 - 1.0)
+            .collect();
+        let expected: Vec<f32> = data.iter().map(|x| x * scalar).collect();
+
+        let gpu = ScalarMulInplaceWebgpu::new(&device, hidden_size, scalar);
+        let buf = upload_f32(&device, &data);
+        let elem_size = std::mem::size_of::<f32>() as u32;
+        let view = BufferView::new_2d_tight(&buf, seq_len as u32, hidden_size as u32, elem_size);
+        let runner = gpu.plan(&device, &queue, view);
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
+        let actual = download_f32(&device, &queue, &buf, seq_len * hidden_size);
+
+        assert_approx_eq(&actual, &expected, 1e-3);
+    }
+
+    /// Single-token decode shape: a `[1, hidden]` view must scale identically.
+    #[tokio::test]
+    async fn test_scalar_mul_decode_single_row() {
+        let (device, queue) = gpu_or_skip!();
+        let hidden_size = 16;
+        let scalar = -2.5f32;
+        let data: Vec<f32> = (0..hidden_size).map(|i| (i as f32) * 0.25).collect();
+        let expected: Vec<f32> = data.iter().map(|x| x * scalar).collect();
+
+        let gpu = ScalarMulInplaceWebgpu::new(&device, hidden_size, scalar);
+        let buf = upload_f32(&device, &data);
+        let elem_size = std::mem::size_of::<f32>() as u32;
+        let view = BufferView::new_2d_tight(&buf, 1, hidden_size as u32, elem_size);
+        let runner = gpu.plan(&device, &queue, view);
+        run_blocking_compute(&device, &queue, |cp| runner.forward(cp));
+        let actual = download_f32(&device, &queue, &buf, hidden_size);
+
+        assert_approx_eq(&actual, &expected, 1e-5);
+    }
+}

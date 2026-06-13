@@ -74,11 +74,7 @@ struct Qwen35GpuWorkspace<'m> {
 }
 
 impl<'m> Qwen35GpuWorkspace<'m> {
-    fn new(
-        model: &'m Qwen35GpuModel,
-        device: &wgpu::Device,
-        max_seq_len: usize,
-    ) -> Self {
+    fn new(model: &'m Qwen35GpuModel, device: &wgpu::Device, max_seq_len: usize) -> Self {
         let layer_session = LayerStackSession::new(&model.core.layer_stack, device, max_seq_len);
         let position_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("qwen35_gpu_session/position"),
@@ -128,14 +124,18 @@ impl<'m> Qwen35GpuWorkspace<'m> {
         let logits_1d = BufferView::new_1d(&self.logits, f32_size, vocab_size);
         let sampled_token_view = BufferView::new_1d(sampled_token, u32_size, 1);
 
-        let embed_runner = self
-            .model
-            .embed
-            .plan(device, queue, input_token_view, input_hidden_view);
+        let embed_runner =
+            self.model
+                .embed
+                .plan(device, queue, input_token_view, input_hidden_view);
         let stack_runner =
             self.layer_session
                 .plan(device, queue, input_hidden_view, &self.position_buffer);
-        let final_norm_runner = self.model.core.final_norm.plan(device, queue, input_hidden_view);
+        let final_norm_runner = self
+            .model
+            .core
+            .final_norm
+            .plan(device, queue, input_hidden_view);
         let lm_head_runner = self
             .model
             .core
@@ -410,13 +410,7 @@ impl<'m> Qwen35GpuSession<'m> {
             });
             runner.forward(&mut cpass);
         }
-        encoder.copy_buffer_to_buffer(
-            &self.current_token,
-            0,
-            &self.token_readback,
-            0,
-            u32_size,
-        );
+        encoder.copy_buffer_to_buffer(&self.current_token, 0, &self.token_readback, 0, u32_size);
         let submission = queue.submit(Some(encoder.finish()));
 
         let slice = self.token_readback.slice(..);

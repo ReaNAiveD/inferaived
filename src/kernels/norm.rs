@@ -79,6 +79,16 @@ impl RmsNormOutOfPlaceImpl {
         label: &str,
     ) -> Self {
         let weight_f32 = load_norm_weight(&weight, label);
+        Self::from_weight_f32(device, queue, weight_f32, shader_source, label)
+    }
+
+    fn from_weight_f32(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        weight_f32: Vec<f32>,
+        shader_source: &str,
+        label: &str,
+    ) -> Self {
         let norm_dim = weight_f32.len();
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(&format!("{label}/shader")),
@@ -237,6 +247,34 @@ impl LlamaRmsNormWebgpu {
 
     /// Bake the per-buffer bindings into a [`RmsNormWebgpuRunner`]
     /// for repeated dispatch into a caller-owned compute pass.
+    pub fn plan(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input: BufferView<'_>,
+        dst: BufferView<'_>,
+    ) -> RmsNormWebgpuRunner {
+        self.0.plan(device, queue, input, dst)
+    }
+}
+
+pub struct ParameterlessRmsNormWebgpu(RmsNormOutOfPlaceImpl);
+
+impl ParameterlessRmsNormWebgpu {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, norm_dim: usize) -> Self {
+        debug_assert!(
+            norm_dim >= 1,
+            "parameterless_rms_norm: norm_dim must be >= 1"
+        );
+        Self(RmsNormOutOfPlaceImpl::from_weight_f32(
+            device,
+            queue,
+            vec![1.0f32; norm_dim],
+            include_str!("wgsl-shaders/llama_rms_norm.wgsl"),
+            "parameterless_rms_norm",
+        ))
+    }
+
     pub fn plan(
         &self,
         device: &wgpu::Device,

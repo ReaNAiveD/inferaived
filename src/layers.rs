@@ -1,3 +1,5 @@
+pub mod hrm_layer_stack;
+pub mod hrm_self_attention;
 pub mod linear_attention;
 pub mod minicpm5_layer_stack;
 pub mod minicpm5_masked_layer_stack;

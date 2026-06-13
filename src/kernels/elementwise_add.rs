@@ -154,6 +154,177 @@ impl ElementwiseAddInplaceWebgpuRunner {
     }
 }
 
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct ElementwiseAddOutParams {
+    dst_token_stride: u32,
+    a_token_stride: u32,
+    b_token_stride: u32,
+    hidden_size: u32,
+    seq_len: u32,
+}
+
+/// Out-of-place elementwise add: `dst[t, i] = a[t, i] + b[t, i]`, honoring each
+/// operand's per-token (outer) stride independently. A zero stride on an
+/// operand broadcasts its single row across all tokens — HRM-Text uses this to
+/// inject the `[hidden]` `z_L_init` vector across the whole sequence.
+pub struct ElementwiseAddWebgpu {
+    bind_group_layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::ComputePipeline,
+    hidden_size: usize,
+}
+
+impl ElementwiseAddWebgpu {
+    pub fn new(device: &wgpu::Device, hidden_size: usize) -> Self {
+        let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("elementwise_add_out/shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("wgsl-shaders/elementwise_add_out.wgsl").into(),
+            ),
+        });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("elementwise_add_out/bind_group_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("elementwise_add_out/pipeline_layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("elementwise_add_out/pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader_module,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &[("workgroup_size", 256.0f64)],
+                ..Default::default()
+            },
+            cache: None,
+        });
+        Self {
+            bind_group_layout,
+            pipeline,
+            hidden_size,
+        }
+    }
+
+    /// Bake the per-buffer bindings into an [`ElementwiseAddWebgpuRunner`].
+    /// `a` and `b` may have a zero outer stride to broadcast a single row.
+    pub fn plan(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        dst: BufferView<'_>,
+        a: BufferView<'_>,
+        b: BufferView<'_>,
+    ) -> ElementwiseAddWebgpuRunner {
+        debug_assert_eq!(dst.shape[1] as usize, self.hidden_size);
+        debug_assert_eq!(a.shape[1] as usize, self.hidden_size);
+        debug_assert_eq!(b.shape[1] as usize, self.hidden_size);
+        debug_assert_eq!(dst.shape[0], a.shape[0]);
+        debug_assert_eq!(dst.shape[0], b.shape[0]);
+        let seq_len = dst.shape[0];
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("elementwise_add_out_runner/uniform_buffer"),
+            size: std::mem::size_of::<ElementwiseAddOutParams>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let uniform = ElementwiseAddOutParams {
+            dst_token_stride: dst.stride[0],
+            a_token_stride: a.stride[0],
+            b_token_stride: b.stride[0],
+            hidden_size: self.hidden_size as u32,
+            seq_len,
+        };
+        queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("elementwise_add_out_runner/bind_group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: dst.as_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: a.as_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: b.as_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        ElementwiseAddWebgpuRunner {
+            pipeline: self.pipeline.clone(),
+            bind_group,
+            seq_len,
+        }
+    }
+}
+
+pub struct ElementwiseAddWebgpuRunner {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    seq_len: u32,
+}
+
+impl ElementwiseAddWebgpuRunner {
+    pub fn forward(&self, cpass: &mut wgpu::ComputePass<'_>) {
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(self.seq_len, 1, 1);
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,4 +1,4 @@
-use safetensors::SafeTensors;
+use safetensors::{SafeTensors, tensor::TensorView};
 
 use crate::{
     buffer_view::BufferView,
@@ -84,6 +84,58 @@ impl MultiLayerPerceptron {
             mlp_down_proj_weight_name
         );
         let mlp_down_proj_mul_mat = MulMatWebgpu::new(&device, &queue, mlp_down_proj_weight);
+        Self {
+            intermediate_size,
+            mlp_gate_proj_mul_mat,
+            mlp_up_proj_mul_mat,
+            mlp_silu_mul,
+            mlp_down_proj_mul_mat,
+        }
+    }
+
+    pub fn from_weights<'data>(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        gate_proj_weight: TensorView<'data>,
+        up_proj_weight: TensorView<'data>,
+        down_proj_weight: TensorView<'data>,
+        hidden_size: usize,
+        intermediate_size: usize,
+    ) -> Self {
+        debug_assert_eq!(
+            gate_proj_weight.shape()[0],
+            intermediate_size,
+            "mlp gate_proj height does not match intermediate_size",
+        );
+        debug_assert_eq!(
+            gate_proj_weight.shape()[1],
+            hidden_size,
+            "mlp gate_proj width does not match hidden_size",
+        );
+        let mlp_gate_proj_mul_mat = MulMatWebgpu::new(device, queue, gate_proj_weight);
+        debug_assert_eq!(
+            up_proj_weight.shape()[0],
+            intermediate_size,
+            "mlp up_proj height does not match intermediate_size",
+        );
+        debug_assert_eq!(
+            up_proj_weight.shape()[1],
+            hidden_size,
+            "mlp up_proj width does not match hidden_size",
+        );
+        let mlp_up_proj_mul_mat = MulMatWebgpu::new(device, queue, up_proj_weight);
+        let mlp_silu_mul = SiluMulInplaceWebgpu::new(device, intermediate_size);
+        debug_assert_eq!(
+            down_proj_weight.shape()[0],
+            hidden_size,
+            "mlp down_proj height does not match hidden_size",
+        );
+        debug_assert_eq!(
+            down_proj_weight.shape()[1],
+            intermediate_size,
+            "mlp down_proj width does not match intermediate_size",
+        );
+        let mlp_down_proj_mul_mat = MulMatWebgpu::new(device, queue, down_proj_weight);
         Self {
             intermediate_size,
             mlp_gate_proj_mul_mat,
